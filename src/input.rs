@@ -39,14 +39,23 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.diff_view
                 .move_file(&app.runs, mouse.kind == MouseEventKind::ScrollDown);
         }
+        if matches!(target, Some(ClickTarget::DiffBody)) {
+            app.diff_view
+                .scroll(mouse.kind == MouseEventKind::ScrollDown, 3);
+        }
         return;
     }
     match target {
+        Some(ClickTarget::DiffBody) => {
+            app.editing = false;
+            app.focus = Focus::Workspace;
+            app.diff_view.file_focus = false;
+        }
         Some(ClickTarget::DiffFile(index)) => {
             app.editing = false;
             app.focus = Focus::Workspace;
             app.diff_view.select_file(index);
-            app.diff_view.file_focus = false;
+            app.diff_view.file_focus = true;
         }
         Some(ClickTarget::Pane(focus)) => {
             app.editing = false;
@@ -154,7 +163,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.diff_view.move_file(&app.runs, false);
                     return;
                 }
-                KeyCode::Enter | KeyCode::Esc => {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                     app.diff_view.file_focus = false;
                     return;
                 }
@@ -162,6 +171,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         match key.code {
+            KeyCode::Right | KeyCode::Char('l')
+                if !app.diff_view.file_focus && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                app.diff_view.file_focus = true;
+                return;
+            }
             KeyCode::Char('f') => {
                 app.diff_view.file_focus = !app.diff_view.file_focus;
                 return;
@@ -320,6 +335,30 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrows_move_between_diff_and_persistent_file_list() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            ..Default::default()
+        };
+        app.diff_view.file_focus = true;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!app.diff_view.file_focus);
+        assert!(app.focus == Focus::Workspace);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.diff_view.file_focus);
+        assert!(app.focus == Focus::Workspace);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert!(app.diff_view.file_focus);
+    }
 
     #[test]
     fn control_arrows_jump_words_while_typing_without_changing_the_draft() {

@@ -171,13 +171,22 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         && !patch.files.is_empty()
     {
         app.diff_view.file = app.diff_view.file.min(patch.files.len() - 1);
-        if app.diff_view.file_focus {
+        let [diff_area, files_area] =
+            Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .areas(inner);
+        let files_block = super::ui::panel(
+            " Files ",
+            app.focus == Focus::Workspace && app.diff_view.file_focus,
+        );
+        let files_inner = files_block.inner(files_area);
+        frame.render_widget(files_block, files_area);
+        {
             let [heading, list, footer] = Layout::vertical([
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(0),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ])
-            .areas(inner);
+            .areas(files_inner);
             frame.render_widget(
                 Paragraph::new(format!(
                     "{} changed files · {}/{}",
@@ -208,7 +217,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Style::default().fg(Color::Gray)
                 };
-                let counts = format!(" +{} -{}", file.added, file.removed);
+                let counts = if list.width >= 24 {
+                    format!(" +{} -{}", file.added, file.removed)
+                } else {
+                    String::new()
+                };
                 let available = list.width.saturating_sub(counts.len() as u16 + 2) as usize;
                 let name = short_path(&file.name, available);
                 let padding =
@@ -222,11 +235,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                         padding = padding
                     )),
                     Span::styled(
-                        format!(" +{}", file.added),
+                        if counts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" +{}", file.added)
+                        },
                         Style::default().fg(Color::Green),
                     ),
                     Span::styled(
-                        format!(" -{}", file.removed),
+                        if counts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -{}", file.removed)
+                        },
                         Style::default().fg(Color::Red),
                     ),
                 ])
@@ -237,20 +258,26 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     .push((row, crate::app::ClickTarget::DiffFile(index)));
             }
             frame.render_widget(
-                Paragraph::new("↑↓/jk: select · Enter/click: open\n[/]: run · Tab: pane")
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new("←/h: diff").style(Style::default().fg(Color::DarkGray)),
                 footer,
             );
-            return;
         }
+        let diff_block = super::ui::panel(
+            " Patch ",
+            app.focus == Focus::Workspace && !app.diff_view.file_focus,
+        );
+        let diff_inner = diff_block.inner(diff_area);
+        frame.render_widget(diff_block, diff_area);
+        app.click_targets
+            .push((diff_area, crate::app::ClickTarget::DiffBody));
         let [heading, body] =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(diff_inner);
         frame.render_widget(
             Paragraph::new(format!(
-                "{}\nf/Esc: files · {}/{}",
+                "{}\n+{} -{} · →/l: files",
                 patch.files[app.diff_view.file].name,
-                app.diff_view.file + 1,
-                patch.files.len()
+                patch.files[app.diff_view.file].added,
+                patch.files[app.diff_view.file].removed
             ))
             .style(Style::default().fg(Color::Cyan)),
             heading,
@@ -347,7 +374,7 @@ mod tests {
         };
         assert!(content(&terminal).contains("2 changed files"));
         assert!(content(&terminal).contains("one.rs"));
-        assert!(!content(&terminal).contains("FIRST_ONLY"));
+        assert!(content(&terminal).contains("FIRST_ONLY"));
         assert!(!content(&terminal).contains("SECOND_ONLY"));
         let row = app
             .click_targets

@@ -33,9 +33,11 @@ Clicking the message box highlights it; Enter or `i` still starts typing.
 
 The Diffs tab shows the latest completed run's checkpoint patch from T3, with green
 additions, red deletions, and yellow hunk headers. While focused on the panel, use
-`[`/`]` to browse completed runs. Each run opens a full-height file list with
-addition/deletion counts. Use Up/Down, `j/k`, or the wheel to select a file;
-Enter or a click opens only that file's diff. Press `f` or Esc to return to the list.
+`[`/`]` to browse completed runs. A full-height file list stays visible to the right of the
+selected file's patch. Use Up/Down, `j/k`, or the wheel over the list to select a file.
+Left/`h` or Enter focuses the patch; Right/`l` returns to the file list. Clicking
+either side focuses it. `f` or Esc also returns from the patch to the list.
+Line counts appear beside files when space permits and above the selected patch.
 Long paths shorten from the left to keep the filename visible.
 Use Page Up/Down or Shift+Up/Down to scroll,
 Home/End to jump, and Shift+Left/Right to pan long lines. The mouse wheel scrolls
@@ -185,7 +187,7 @@ The composer uses character wrapping with a cursor-following viewport. Backspace
 and Delete remove whole Unicode characters including combined accents and emoji;
 pasted line endings are normalized and tabs expand to four spaces.
 
-The composer shows its target thread. Each thread keeps its own draft in memory
+The Chat header shows the selected thread. Each thread keeps its own draft in memory
 while you switch between conversations. Sending requires a selected thread and an
 authenticated connection. Acknowledgements clear only the submitted text; edits
 made while sending and drafts in other threads are preserved.

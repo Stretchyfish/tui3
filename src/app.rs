@@ -23,6 +23,7 @@ pub enum Focus {
 
 #[derive(Clone, Copy)]
 pub enum ClickTarget {
+    DiffBody,
     DiffFile(usize),
     Pane(Focus),
     Workspace(usize),

@@ -216,27 +216,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .as_ref()
             .and_then(|id| app.send_status.get(id).map(String::as_str))
     });
-    let target = app
-        .draft_thread
-        .as_ref()
-        .and_then(|id| {
-            app.catalog
-                .as_ref()?
-                .threads
-                .iter()
-                .find(|thread| &thread.id == id)
-        })
-        .map(|thread| thread.title.as_str());
     let composer_title = format!(
-        " Message{}: {} ",
+        " Message{} ",
         if app.editing {
             " (typing)"
         } else if app.focus == Focus::Composer {
             " (Enter or i to type)"
         } else {
             ""
-        },
-        target.unwrap_or("select a thread")
+        }
     );
     let composer_block = panel(&composer_title, app.focus == Focus::Composer);
     let composer_block = if let Some(status) = status {
@@ -290,9 +278,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             && app.workspace_tab == 0
             && app.diff_view.file_focus
         {
-            " ↑↓/jk: file | Enter/click: open | [/]: run | Tab: pane | h: chat "
+            " ↑↓/jk: file | ←/h/Enter: patch | [/]: run | Tab: pane "
         } else if app.focus == Focus::Workspace {
-            " f/Esc: files | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↓: tools "
+            " →/l: files | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↓: tools "
         } else if app.focus == Focus::WorkspaceTabs {
             " ←→/hl: highlight | Enter: activate | ↑/k: panel | Tab: pane | q: quit "
         } else if app.focus == Focus::Projects {

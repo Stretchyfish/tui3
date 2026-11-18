@@ -39,6 +39,7 @@
 - [x] Jump between word starts with Ctrl+Left/Right while typing in the Message box.
 - [x] Keep draft wrapping, cursor placement, and scrolling consistent; delete Unicode graphemes and normalize pasted control characters.
 - [x] Show send status only in the Message box, removing its duplicate in the chat.
+- [x] Keep the thread title in the Chat header without repeating it in the Message header.
 
 ## Right-side workspace panel
 
@@ -68,7 +69,7 @@ between workspace tools. Build each feature incrementally.
 
 - [x] Display T3 checkpoint diffs for completed runs with colored additions/deletions, keyboard/mouse scrolling, horizontal panning, and run selection.
 - [x] Select individual changed files by keyboard or mouse and show only that file's colored diff.
-- [x] Use a full-height changed-file browser with counts, readable path truncation, and Enter/click to open a file; f/Esc returns to the browser.
+- [x] Keep a full-height file browser to the right of the selected diff, with counts and readable path truncation; Left/Right or h/l moves between the browser and patch.
 - [x] Cache parsed patches and wrapped chat content, reflow only changed chat lines, and eliminate repeated history scans during navigation.
 - [x] Add a repeatable release performance test with a 17 ms p95 redraw budget for large histories, diffs, and streaming updates.
 - [ ] Refresh diffs as workspace changes arrive and open a changed file in the code view.
