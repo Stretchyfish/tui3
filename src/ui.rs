@@ -103,12 +103,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .unwrap_or_else(|| " Chat ".into());
         let content = match (&app.transcript, &app.history_error) {
             (Some(history), error) => {
-                let mut text = crate::chat::conversation(
-                    history,
-                    &app.runs,
-                    app.thinking_since.map(|start| start.elapsed()),
-                    &app.run_diffs,
-                );
+                let elapsed = app.thinking_since.map(|start| start.elapsed());
+                let tick = elapsed.map(|duration| duration.as_secs());
+                if !app
+                    .chat_cache
+                    .as_ref()
+                    .is_some_and(|(revision, cached_tick, _)| {
+                        *revision == app.chat_revision && *cached_tick == tick
+                    })
+                {
+                    let text =
+                        crate::chat::conversation(history, &app.runs, elapsed, &app.run_diffs);
+                    app.chat_cache = Some((app.chat_revision, tick, text));
+                }
+                let mut text = app.chat_cache.as_ref().unwrap().2.clone();
                 if let Some(error) = error {
                     crate::chat::notice(
                         &mut text,
@@ -140,20 +148,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     if !app.activity.is_empty() {
         crate::chat::notice(&mut content, "Agent activity", Color::Cyan);
+        let phase = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            % 1200;
+        let brightness = if phase < 600 { phase } else { 1200 - phase };
+        let running_color = Color::Rgb(
+            255,
+            (170 + brightness * 85 / 600) as u8,
+            (40 + brightness * 80 / 600) as u8,
+        );
+        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(phase / 120) as usize];
         for activity in app.activity.iter().rev().take(5).rev() {
+            let running = activity.summary.ends_with("· in progress")
+                || activity.summary == "Agent · Working";
             crate::chat::notice(
                 &mut content,
-                format!("  • {}", activity.summary),
-                Color::DarkGray,
+                format!(
+                    "  {} {}",
+                    if running { spinner } else { "•" },
+                    activity.summary
+                ),
+                if running {
+                    running_color
+                } else {
+                    Color::DarkGray
+                },
             );
         }
-    }
-    if let Some(status) = app
-        .history_thread
-        .as_ref()
-        .and_then(|id| app.send_status.get(id))
-    {
-        crate::chat::notice(&mut content, status.clone(), Color::DarkGray);
     }
     if app.models.notice_thread.as_deref() == app.selected_thread_id()
         && let Some(notice) = &app.models.notice
@@ -162,16 +185,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let block = panel(&title, app.focus == Focus::Chat);
     let inner = block.inner(chat);
-    let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
-    app.chat_max_scroll = paragraph
-        .line_count(inner.width)
-        .saturating_sub(usize::from(inner.height))
-        .min(usize::from(u16::MAX)) as u16;
+    if !app
+        .chat_viewport
+        .as_ref()
+        .is_some_and(|cache| cache.buffer.area.width == inner.width && cache.content == content)
+    {
+        if let Some(viewport) = &mut app.chat_viewport {
+            viewport.update(content, inner.width);
+        } else {
+            app.chat_viewport = Some(crate::chat::Viewport::new(content, inner.width));
+        }
+    }
+    let viewport = app.chat_viewport.as_ref().unwrap();
+    app.chat_max_scroll = viewport.buffer.area.height.saturating_sub(inner.height);
     if app.follow_chat {
         app.chat_scroll = app.chat_max_scroll;
     }
     app.chat_scroll = app.chat_scroll.min(app.chat_max_scroll);
-    frame.render_widget(paragraph.scroll((app.chat_scroll, 0)).block(block), chat);
+    frame.render_widget(block, chat);
+    for y in 0..inner.height {
+        for x in 0..inner.width {
+            if let Some(cell) = viewport.buffer.cell((x, y.saturating_add(app.chat_scroll))) {
+                frame.buffer_mut()[(inner.x + x, inner.y + y)] = cell.clone();
+            }
+        }
+    }
     let draft = &app.draft;
     let status = app.send_notice.as_deref().or_else(|| {
         app.draft_thread
@@ -206,44 +244,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         composer_block
     };
-    let draft_paragraph = Paragraph::new(draft.as_str()).wrap(Wrap { trim: false });
-    let composer_inner = composer_block.inner(composer);
-    let draft_scroll = draft_paragraph
-        .line_count(composer_inner.width)
-        .saturating_sub(usize::from(composer_inner.height))
-        .min(usize::from(u16::MAX)) as u16;
-    frame.render_widget(
-        draft_paragraph
-            .scroll((draft_scroll, 0))
-            .block(composer_block),
+    crate::composer::draw(
+        frame,
+        draft,
+        app.draft_cursor,
+        app.editing,
+        composer_block,
         composer,
     );
-    if app.editing && composer_inner.width > 0 && composer_inner.height > 0 {
-        use unicode_width::UnicodeWidthChar;
-        let mut line = 0usize;
-        let mut column = 0usize;
-        for ch in app.draft.chars().take(app.draft_cursor) {
-            if ch == '\n' {
-                line += 1;
-                column = 0;
-            } else {
-                column += ch.width().unwrap_or(0);
-                if column >= usize::from(composer_inner.width) {
-                    line += 1;
-                    column = 0;
-                }
-            }
-        }
-        let visible_line = line.saturating_sub(usize::from(draft_scroll));
-        if visible_line < usize::from(composer_inner.height) {
-            frame.set_cursor_position((
-                composer_inner
-                    .x
-                    .saturating_add(column.min(usize::from(composer_inner.width - 1)) as u16),
-                composer_inner.y.saturating_add(visible_line as u16),
-            ));
-        }
-    }
     let current = app
         .current_model()
         .map(|selection| selection.model.clone())
@@ -278,8 +286,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             " SETTINGS | Esc/s: close | Ctrl+Q: quit "
         } else if app.editing {
             " TYPING | Enter: send | Alt+Enter: newline | Esc: navigate | Ctrl+Q: quit "
+        } else if app.focus == Focus::Workspace
+            && app.workspace_tab == 0
+            && app.diff_view.file_focus
+        {
+            " ↑↓/jk: file | Enter/click: open | [/]: run | Tab: pane | h: chat "
         } else if app.focus == Focus::Workspace {
-            " ↓/j: tools | ←/h: chat | Tab: pane | s: settings | q: quit "
+            " f/Esc: files | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↓: tools "
         } else if app.focus == Focus::WorkspaceTabs {
             " ←→/hl: highlight | Enter: activate | ↑/k: panel | Tab: pane | q: quit "
         } else if app.focus == Focus::Projects {
@@ -367,17 +380,21 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let letters = ["D", "C", "F", "T", "G", "S"];
     let [content, selector] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
-    frame.render_widget(
-        Paragraph::new(letters[app.workspace_tab])
-            .centered()
-            .block(panel(
-                names[app.workspace_tab],
-                app.focus == Focus::Workspace,
-            )),
-        content,
-    );
     app.click_targets
         .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
+    if app.workspace_tab == 0 {
+        crate::diff::draw(frame, app, content);
+    } else {
+        frame.render_widget(
+            Paragraph::new(letters[app.workspace_tab])
+                .centered()
+                .block(panel(
+                    names[app.workspace_tab],
+                    app.focus == Focus::Workspace,
+                )),
+            content,
+        );
+    }
     let boxes = Layout::horizontal([Constraint::Ratio(1, 6); 6])
         .spacing(1)
         .split(selector);
@@ -550,7 +567,7 @@ fn selector_box(frame: &mut Frame, area: Rect, label: &str, active: bool, highli
     );
 }
 
-fn panel(title: &str, focused: bool) -> Block<'_> {
+pub(crate) fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered()
         .title(title)
         .border_style(Style::default().fg(if focused {
@@ -564,6 +581,100 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    #[ignore = "performance benchmark; run with --release --ignored --nocapture"]
+    fn performance_large_thread_navigation() {
+        use std::time::{Duration, Instant};
+        let mut app = App {
+            focus: Focus::Workspace,
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        for n in 0..200 {
+            let id = format!("r{n}");
+            app.runs.insert(
+                id.clone(),
+                serde_json::from_value(
+                    serde_json::json!({"id":id,"ordinal":n+1,"status":"completed"}),
+                )
+                .unwrap(),
+            );
+            for m in 0..5 {
+                items.push(serde_json::json!({"position":n*10+m,"item":{"id":format!("m{n}-{m}"),"type":"assistant_message","runId":id,"text":"Progress message with enough text to wrap across several terminal lines.\nSecond line of content."}}));
+                items.push(serde_json::json!({"position":n*10+m+5,"item":{"id":format!("f{n}-{m}"),"type":"file_change","runId":id,"fileName":format!("src/file{m}.rs")}}));
+            }
+            app.run_diffs
+                .insert(id, [("src/main.rs".into(), (5, 2))].into());
+        }
+        app.transcript = Some(
+            serde_json::from_value(
+                serde_json::json!({"threadId":"t1","title":"Large thread","items":items}),
+            )
+            .unwrap(),
+        );
+        app.history_thread = Some("t1".into());
+        let patch = (0..100).map(|n| format!("diff --git a/file{n}.rs b/file{n}.rs\n--- a/file{n}.rs\n+++ b/file{n}.rs\n@@ -1,100 +1,100 @@\n{}", "-old\n+new\n".repeat(100))).collect::<String>();
+        app.diff_view.patches.insert("r199".into(), patch.into());
+        let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..35 {
+            let started = Instant::now();
+            app.diff_view.scroll(true, 1);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            times.push(started.elapsed());
+            app.diff_view.file_focus = false; // Benchmark actual diff scrolling after the list opens.
+        }
+        times.remove(0); // Measure interaction after the initial projection is cached.
+        times.sort();
+        let p95 = times[times.len() * 95 / 100];
+        println!(
+            "large-thread redraw: median {:?}, p95 {:?}, max {:?}",
+            times[times.len() / 2],
+            p95,
+            times.last().unwrap()
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                p95 < Duration::from_millis(17),
+                "p95 frame budget exceeded: {p95:?}"
+            );
+        }
+        let mut streaming = Vec::new();
+        for n in 0..20 {
+            let started = Instant::now();
+            let item = app
+                .transcript
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.item.kind == "assistant_message")
+                .unwrap();
+            item.item.text = Some(format!(
+                "Streaming update {n}\n{}",
+                "New output. ".repeat(n + 1)
+            ));
+            item.item.streaming = true;
+            app.chat_revision += 1;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            streaming.push(started.elapsed());
+        }
+        streaming.sort();
+        let streaming_p95 = streaming[streaming.len() * 95 / 100];
+        println!(
+            "streaming reflow: median {:?}, p95 {:?}",
+            streaming[streaming.len() / 2],
+            streaming_p95
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                streaming_p95 < Duration::from_millis(17),
+                "streaming frame budget exceeded: {streaming_p95:?}"
+            );
+        }
+    }
 
     #[test]
     fn mouse_activates_rendered_selectors_and_settings_blocks_background_clicks() {

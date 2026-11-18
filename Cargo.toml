@@ -16,3 +16,4 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "macros", "
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 uuid = { version = "1.29.3", features = ["v4"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"

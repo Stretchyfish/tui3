@@ -1,6 +1,8 @@
 mod app;
 mod catalog;
 mod chat;
+mod composer;
+mod diff;
 mod history;
 mod input;
 mod message;
@@ -70,11 +72,19 @@ fn run(
                     run_id,
                     result,
                 } => {
-                    if app.history_thread.as_deref() == Some(&thread_id)
-                        && !app.run_diffs.contains_key(&run_id)
-                        && let Ok(counts) = result
-                    {
-                        app.run_diffs.insert(run_id, counts);
+                    if app.history_thread.as_deref() == Some(&thread_id) {
+                        match result {
+                            Ok(patch) => {
+                                app.chat_revision = app.chat_revision.wrapping_add(1);
+                                app.run_diffs
+                                    .entry(run_id.clone())
+                                    .or_insert_with(|| crate::history::diff_counts(&patch));
+                                app.diff_view.patches.insert(run_id, patch.into());
+                            }
+                            Err(error) => {
+                                app.diff_view.errors.insert(run_id, error);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -178,6 +188,20 @@ fn run(
         if app.authenticated
             && let Some(thread) = app.history_thread.as_ref()
         {
+            let viewed = if app.workspace_tab == 0 {
+                app.diff_view.run_id(&app.runs).map(str::to_owned)
+            } else {
+                None
+            };
+            let missing: std::collections::HashSet<_> = app
+                .transcript
+                .as_ref()
+                .into_iter()
+                .flat_map(|history| history.items.iter())
+                .filter(|entry| entry.item.kind == "file_change")
+                .filter_map(|entry| entry.item.run_id.as_ref())
+                .filter(|id| !app.run_diffs.contains_key(*id))
+                .collect();
             for run in app.runs.values() {
                 if run.status != "completed" || app.diff_requested.contains(&run.id) {
                     continue;
@@ -185,13 +209,7 @@ fn run(
                 let Some(ordinal) = run.ordinal else {
                     continue;
                 };
-                let needs_counts = app.transcript.as_ref().is_some_and(|history| {
-                    history.items.iter().any(|entry| {
-                        entry.item.kind == "file_change"
-                            && entry.item.run_id.as_ref() == Some(&run.id)
-                    })
-                });
-                if needs_counts
+                if (viewed.as_ref() == Some(&run.id) || missing.contains(&run.id))
                     && backend
                         .diffs
                         .try_send((thread.clone(), run.id.clone(), ordinal))

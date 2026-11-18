@@ -19,8 +19,8 @@ Clicking a typing-style box activates and saves it immediately.
 
 ## Workspace panel
 
-The right-side workspace panel currently shows letter placeholders for Diffs (D),
-Code (C), Files (F), Terminal (T), Git (G), and Side chat (S).
+The right-side workspace panel includes a live Diffs viewer. Code (C), Files (F),
+Terminal (T), Git (G), and Side chat (S) currently show letter placeholders.
 From chat or the message panel in navigation mode, press Right or `l` to focus it.
 Down or `j` in the workspace panel focuses the boxed tool selector
 underneath; all six boxes stay on one row, progressively shortening their names as
@@ -30,6 +30,30 @@ shown with a green inner outline. Up or `k` returns to the
 panel, then Left or `h` returns to chat. Tab/Shift+Tab also cycle through these panes.
 You can also click panes to focus them, or click a tool box to activate it directly.
 Clicking the message box highlights it; Enter or `i` still starts typing.
+
+The Diffs tab shows the latest completed run's checkpoint patch from T3, with green
+additions, red deletions, and yellow hunk headers. While focused on the panel, use
+`[`/`]` to browse completed runs. Each run opens a full-height file list with
+addition/deletion counts. Use Up/Down, `j/k`, or the wheel to select a file;
+Enter or a click opens only that file's diff. Press `f` or Esc to return to the list.
+Long paths shorten from the left to keep the filename visible.
+Use Page Up/Down or Shift+Up/Down to scroll,
+Home/End to jump, and Shift+Left/Right to pan long lines. The mouse wheel scrolls
+when hovering over the viewer. Down/`j` still focuses the tool selector.
+Diff loading runs in the background. Empty diffs and unavailable checkpoints have
+explicit states; `r` retries a failed fetch. These are per-run diffs, not current
+uncommitted Git changes. Editing remains planned.
+
+For the smoothest normal use, run `cargo run --release`. The repeatable rendering
+stress test uses 1,000 messages, 200 runs, and a 100-file patch, measuring both
+navigation redraws and streaming updates at 160×48 terminal cells:
+
+```sh
+cargo test --release performance_large_thread_navigation -- --ignored --nocapture
+```
+
+It enforces a 17 ms p95 frame budget in release builds. Measurements cover app
+rendering on the test machine; terminal rendering and server latency are separate.
 
 ## Connecting to T3
 
@@ -153,8 +177,13 @@ While typing, **Enter sends** and **Alt+Enter** adds a newline (Shift+Enter also
 in terminals that report it). Arrow keys move the cursor; Up/Down keep its column
 when moving between lines. Home/End move to the current line's start/end, and Delete
 removes the character after the cursor. Backspace removes the character before it.
+Ctrl+Left/Right jumps to the previous/next word start, skipping punctuation and
+whitespace across lines; at either end it stops at the draft boundary.
 Esc returns to navigation. Bracketed paste inserts at the cursor and preserves
 multiline text without submitting it.
+The composer uses character wrapping with a cursor-following viewport. Backspace
+and Delete remove whole Unicode characters including combined accents and emoji;
+pasted line endings are normalized and tabs expand to four spaces.
 
 The composer shows its target thread. Each thread keeps its own draft in memory
 while you switch between conversations. Sending requires a selected thread and an

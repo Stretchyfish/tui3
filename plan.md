@@ -29,11 +29,16 @@
 - [x] Keep working until T3 reports the run has ended, and show its duration once above the final AGENT message header.
 - [x] Show a recent activity feed for run, command, file, and search progress.
 - [x] Remove activity entries when they finish, showing only ongoing work.
+- [x] Animate running activity with a pulsing amber color and spinner.
 - [x] Show changed files beneath agent replies, grouped by run, with server-reported addition/deletion counts.
 - [x] Use T3 checkpoint file summaries for chat file lists and counts, replacing intermediate tool edits completely.
 - [x] Render changed files inside the green AGENT message block with matching borders and text styling.
+- [x] Label file summaries as "Changing X files" while counts are unknown, and "X changed files" once counts are available.
 - [x] Fetch completed runs' checkpoint diffs asynchronously when complete checkpoint summaries are unavailable.
 - [x] Improve prompt editing with cursor movement and Delete/Home/End.
+- [x] Jump between word starts with Ctrl+Left/Right while typing in the Message box.
+- [x] Keep draft wrapping, cursor placement, and scrolling consistent; delete Unicode graphemes and normalize pasted control characters.
+- [x] Show send status only in the Message box, removing its duplicate in the chat.
 
 ## Right-side workspace panel
 
@@ -61,7 +66,11 @@ between workspace tools. Build each feature incrementally.
 
 ### Diffs
 
-- [ ] List changed files and show readable diffs with additions and deletions highlighted.
+- [x] Display T3 checkpoint diffs for completed runs with colored additions/deletions, keyboard/mouse scrolling, horizontal panning, and run selection.
+- [x] Select individual changed files by keyboard or mouse and show only that file's colored diff.
+- [x] Use a full-height changed-file browser with counts, readable path truncation, and Enter/click to open a file; f/Esc returns to the browser.
+- [x] Cache parsed patches and wrapped chat content, reflow only changed chat lines, and eliminate repeated history scans during navigation.
+- [x] Add a repeatable release performance test with a 17 ms p95 redraw budget for large histories, diffs, and streaming updates.
 - [ ] Refresh diffs as workspace changes arrive and open a changed file in the code view.
 
 ### Files and code

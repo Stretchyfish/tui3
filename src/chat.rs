@@ -5,6 +5,85 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
+/// Cache wrapped conversation cells so scrolling never reflows the entire history.
+pub struct Viewport {
+    pub content: Text<'static>,
+    pub buffer: ratatui::buffer::Buffer,
+    heights: Vec<usize>,
+}
+
+impl Viewport {
+    pub fn new(content: Text<'static>, width: u16) -> Self {
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let paragraph = Paragraph::new(content.clone()).wrap(Wrap { trim: false });
+        let height = if width == 0 {
+            0
+        } else {
+            paragraph.line_count(width).min(u16::MAX as usize) as u16
+        };
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let heights = content
+            .lines
+            .iter()
+            .map(|line| {
+                Paragraph::new(Text::from(line.clone()))
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+            })
+            .collect();
+        Self {
+            content,
+            buffer,
+            heights,
+        }
+    }
+
+    pub fn update(&mut self, content: Text<'static>, width: u16) {
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        if self.buffer.area.width != width {
+            *self = Self::new(content, width);
+            return;
+        }
+        if self.content == content {
+            return;
+        }
+        let prefix = if self.content.style == content.style {
+            self.content
+                .lines
+                .iter()
+                .zip(&content.lines)
+                .take_while(|(a, b)| a == b)
+                .count()
+        } else {
+            0
+        };
+        let row = self.heights[..prefix]
+            .iter()
+            .sum::<usize>()
+            .min(u16::MAX as usize);
+        self.heights.truncate(prefix);
+        self.heights
+            .extend(content.lines[prefix..].iter().map(|line| {
+                Paragraph::new(Text::from(line.clone()))
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+            }));
+        let height = self.heights.iter().sum::<usize>().min(u16::MAX as usize) as u16;
+        self.buffer
+            .resize(ratatui::layout::Rect::new(0, 0, width, height));
+        let offset = (row * width as usize).min(self.buffer.content.len());
+        self.buffer.content[offset..].fill(ratatui::buffer::Cell::EMPTY);
+        let area =
+            ratatui::layout::Rect::new(0, row as u16, width, height.saturating_sub(row as u16));
+        Paragraph::new(Text::from(content.lines[prefix..].to_vec()))
+            .wrap(Wrap { trim: false })
+            .render(area, &mut self.buffer);
+        self.content = content;
+    }
+}
+
 pub fn conversation(
     history: &Transcript,
     runs: &std::collections::HashMap<String, crate::history::Run>,
@@ -16,6 +95,12 @@ pub fn conversation(
         return Text::from("No chat messages in this thread yet.");
     }
     let mut lines = Vec::new();
+    let last_by_run: std::collections::HashMap<_, _> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.item.kind == "assistant_message")
+        .map(|(index, entry)| (entry.item.run_id.as_deref(), index))
+        .collect();
     let working_message = messages.iter().rposition(|entry| {
         entry.item.kind == "assistant_message"
             && (entry.item.streaming
@@ -46,9 +131,7 @@ pub fn conversation(
             ));
         }
         if item.kind == "assistant_message"
-            && !messages[index + 1..].iter().any(|later| {
-                later.item.kind == "assistant_message" && later.item.run_id == item.run_id
-            })
+            && last_by_run.get(&item.run_id.as_deref()) == Some(&index)
             && let Some(run) = item.run_id.as_ref().and_then(|id| runs.get(id))
             && !run.active()
             && let Some(duration) = run.duration()
@@ -86,10 +169,7 @@ pub fn conversation(
         }
         if item.kind == "assistant_message"
             && let Some(run_id) = item.run_id.as_deref()
-            && !messages[index + 1..].iter().any(|later| {
-                later.item.kind == "assistant_message"
-                    && later.item.run_id.as_deref() == Some(run_id)
-            })
+            && last_by_run.get(&Some(run_id)) == Some(&index)
         {
             changed_files(&mut lines, history, run_id, diffs.get(run_id));
         }
@@ -120,20 +200,22 @@ fn changed_files(
     diff: Option<&crate::history::FileCounts>,
 ) {
     let mut files = std::collections::BTreeMap::<&str, (Option<u64>, Option<u64>)>::new();
-    for entry in &history.items {
-        let item = &entry.item;
-        if item.kind != "file_change"
-            || item.run_id.as_deref() != Some(run_id)
-            || matches!(
-                item.status.as_deref(),
-                Some("failed" | "cancelled" | "interrupted")
-            )
-        {
-            continue;
-        }
-        if let Some(path) = item.file_name.as_deref() {
-            let counts = files.entry(path).or_default();
-            *counts = (None, None);
+    if diff.is_none() {
+        for entry in &history.items {
+            let item = &entry.item;
+            if item.kind != "file_change"
+                || item.run_id.as_deref() != Some(run_id)
+                || matches!(
+                    item.status.as_deref(),
+                    Some("failed" | "cancelled" | "interrupted")
+                )
+            {
+                continue;
+            }
+            if let Some(path) = item.file_name.as_deref() {
+                let counts = files.entry(path).or_default();
+                *counts = (None, None);
+            }
         }
     }
     if let Some(diff) = diff {
@@ -146,18 +228,22 @@ fn changed_files(
         return;
     }
     lines.push(Line::styled("│", Style::default().fg(Color::Green)));
+    let complete = files
+        .values()
+        .all(|(added, removed)| added.is_some() && removed.is_some());
     let mut heading = vec![Span::styled(
         format!(
-            "│ {} changed file{}",
-            files.len(),
+            "│ {} file{}",
+            if complete {
+                format!("{} changed", files.len())
+            } else {
+                format!("Changing {}", files.len())
+            },
             if files.len() == 1 { "" } else { "s" }
         ),
         Style::default().fg(Color::Green),
     )];
-    if files
-        .values()
-        .all(|(added, removed)| added.is_some() && removed.is_some())
-    {
+    if complete {
         let added = files.values().fold(0u64, |total, counts| {
             total.saturating_add(counts.0.unwrap_or_default())
         });
@@ -215,6 +301,28 @@ pub fn notice(content: &mut Text<'static>, message: impl Into<String>, color: Co
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incremental_wrapping_matches_full_render_after_edits_and_resize() {
+        use ratatui::text::Text;
+        let mut cache = super::Viewport::new(
+            Text::from("Header\nlong line with wrapping and 世界\nold tail"),
+            12,
+        );
+        for (text, width) in [
+            (
+                "Header\nlong line with wrapping and 世界\nnew tail with more text",
+                12,
+            ),
+            ("Header\nshort", 12),
+            ("Header\nshort", 5),
+            ("", 5),
+        ] {
+            let content = Text::from(text);
+            cache.update(content.clone(), width);
+            let fresh = super::Viewport::new(content, width);
+            assert_eq!(cache.buffer, fresh.buffer);
+        }
+    }
     #[test]
     fn changed_files_are_grouped_by_run_and_paths_are_unique() {
         let history = serde_json::from_value(serde_json::json!({

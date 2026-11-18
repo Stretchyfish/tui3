@@ -26,9 +26,28 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         if matches!(target, Some(ClickTarget::Pane(Focus::Chat))) {
             app.scroll_chat(mouse.kind == MouseEventKind::ScrollDown, 3);
         }
+        if matches!(target, Some(ClickTarget::Pane(Focus::Workspace))) && app.workspace_tab == 0 {
+            if app.diff_view.file_focus {
+                app.diff_view
+                    .move_file(&app.runs, mouse.kind == MouseEventKind::ScrollDown);
+            } else {
+                app.diff_view
+                    .scroll(mouse.kind == MouseEventKind::ScrollDown, 3);
+            }
+        }
+        if matches!(target, Some(ClickTarget::DiffFile(_))) {
+            app.diff_view
+                .move_file(&app.runs, mouse.kind == MouseEventKind::ScrollDown);
+        }
         return;
     }
     match target {
+        Some(ClickTarget::DiffFile(index)) => {
+            app.editing = false;
+            app.focus = Focus::Workspace;
+            app.diff_view.select_file(index);
+            app.diff_view.file_focus = false;
+        }
         Some(ClickTarget::Pane(focus)) => {
             app.editing = false;
             app.focus = focus;
@@ -54,6 +73,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(key.code, KeyCode::Char('c' | 'q')) {
             app.quit = true;
+        } else if app.editing && !app.settings_open && !app.models.open {
+            match key.code {
+                KeyCode::Left => app.move_draft_word(false),
+                KeyCode::Right => app.move_draft_word(true),
+                _ => (),
+            }
         }
         return;
     }
@@ -117,6 +142,81 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             _ => (),
         }
         return;
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 0 {
+        if app.diff_view.file_focus {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.diff_view.move_file(&app.runs, true);
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.diff_view.move_file(&app.runs, false);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    app.diff_view.file_focus = false;
+                    return;
+                }
+                _ => (),
+            }
+        }
+        match key.code {
+            KeyCode::Char('f') => {
+                app.diff_view.file_focus = !app.diff_view.file_focus;
+                return;
+            }
+            KeyCode::Esc => {
+                app.diff_view.file_focus = true;
+                return;
+            }
+            KeyCode::PageDown => {
+                app.diff_view.scroll(true, 10);
+                return;
+            }
+            KeyCode::PageUp => {
+                app.diff_view.scroll(false, 10);
+                return;
+            }
+            KeyCode::Home => {
+                app.diff_view.scroll = 0;
+                return;
+            }
+            KeyCode::End => {
+                app.diff_view.scroll = app.diff_view.max_scroll;
+                return;
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.diff_view.scroll(true, 1);
+                return;
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.diff_view.scroll(false, 1);
+                return;
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.diff_view.horizontal = app.diff_view.horizontal.saturating_add(4);
+                return;
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.diff_view.horizontal = app.diff_view.horizontal.saturating_sub(4);
+                return;
+            }
+            KeyCode::Char('[' | ']') => {
+                app.diff_view
+                    .select_run(&app.runs, key.code == KeyCode::Char(']'));
+                return;
+            }
+            KeyCode::Char('r') => {
+                if let Some(id) = app.diff_view.run_id(&app.runs).map(str::to_owned) {
+                    app.diff_requested.remove(&id);
+                    app.diff_view.errors.remove(&id);
+                    app.diff_view.patches.remove(&id);
+                }
+                return;
+            }
+            _ => (),
+        }
     }
     match key.code {
         KeyCode::Char('s') => {
@@ -220,6 +320,55 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_arrows_jump_words_while_typing_without_changing_the_draft() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            ..Default::default()
+        };
+        app.insert_draft("héllo, rust\nworld");
+        for expected in [12, 7, 0, 0] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.draft_cursor, expected);
+        }
+        for expected in [7, 12, 17, 17] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.draft_cursor, expected);
+        }
+        assert_eq!(app.draft, "héllo, rust\nworld");
+        assert!(app.focus == Focus::Composer && app.editing && !app.quit);
+        app.editing = false;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft_cursor, 17);
+    }
+
+    #[test]
+    fn deleting_unicode_graphemes_and_stale_cursors_cannot_leave_draft_text_stuck() {
+        let mut app = App::default();
+        app.insert_draft("e\u{301}👩‍💻");
+        app.backspace_draft();
+        assert_eq!(app.draft, "e\u{301}");
+        app.backspace_draft();
+        assert!(app.draft.is_empty());
+        app.insert_draft("abc");
+        app.draft_cursor = 999;
+        app.backspace_draft();
+        assert_eq!(app.draft, "ab");
+        assert_eq!(app.draft_cursor, 2);
+        app.insert_draft("\r\nnext\tline");
+        assert_eq!(app.draft, "ab\nnext    line");
+    }
 
     #[test]
     fn wheel_over_chat_scrolls_without_interrupting_typing_and_resumes_follow_at_bottom() {

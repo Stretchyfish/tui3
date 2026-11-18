@@ -23,12 +23,17 @@ pub enum Focus {
 
 #[derive(Clone, Copy)]
 pub enum ClickTarget {
+    DiffFile(usize),
     Pane(Focus),
     Workspace(usize),
     TypingStyle(crate::preferences::TypingStyle),
 }
 
 pub struct App {
+    pub chat_revision: u64,
+    pub chat_cache: Option<(u64, Option<u64>, ratatui::text::Text<'static>)>,
+    pub chat_viewport: Option<crate::chat::Viewport>,
+    pub diff_view: crate::diff::DiffView,
     pub run_diffs: HashMap<String, crate::history::FileCounts>,
     pub diff_requested: std::collections::HashSet<String>,
     pub click_targets: Vec<(ratatui::layout::Rect, ClickTarget)>,
@@ -79,6 +84,10 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            chat_revision: 0,
+            chat_cache: None,
+            chat_viewport: None,
+            diff_view: Default::default(),
             run_diffs: HashMap::new(),
             diff_requested: Default::default(),
             click_targets: Vec::new(),
@@ -148,7 +157,6 @@ impl App {
                     .map(|file| (file.path, (file.additions, file.deletions)))
                     .collect(),
             );
-            self.diff_requested.insert(run);
         }
     }
     fn record_activity(&mut self, id: String, summary: String) {
@@ -186,51 +194,88 @@ impl App {
         }
     }
 
+    fn draft_byte_cursor(&mut self) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let target = self.draft_cursor;
+        let mut chars = 0;
+        for (byte, grapheme) in self.draft.grapheme_indices(true) {
+            let next = chars + grapheme.chars().count();
+            if target < next {
+                self.draft_cursor = chars;
+                return byte;
+            }
+            chars = next;
+        }
+        self.draft_cursor = chars;
+        self.draft.len()
+    }
+
     pub fn insert_draft(&mut self, text: &str) {
-        let byte = self
-            .draft
-            .char_indices()
-            .nth(self.draft_cursor)
-            .map_or(self.draft.len(), |(i, _)| i);
-        self.draft.insert_str(byte, text);
+        let byte = self.draft_byte_cursor();
+        let text = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        let text: String = text
+            .chars()
+            .filter(|ch| *ch == '\n' || !ch.is_control())
+            .collect();
+        self.draft.insert_str(byte, &text);
         self.draft_cursor += text.chars().count();
     }
 
+    pub fn move_draft_word(&mut self, right: bool) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = self.draft_byte_cursor();
+        let destination = if right {
+            self.draft
+                .unicode_word_indices()
+                .find(|(start, _)| *start > byte)
+                .map_or(self.draft.len(), |(start, _)| start)
+        } else {
+            self.draft
+                .unicode_word_indices()
+                .rev()
+                .find(|(start, _)| *start < byte)
+                .map_or(0, |(start, _)| start)
+        };
+        self.draft_cursor = self.draft[..destination].chars().count();
+    }
+
     pub fn backspace_draft(&mut self) {
-        if self.draft_cursor == 0 {
-            return;
+        use unicode_segmentation::UnicodeSegmentation;
+        let end = self.draft_byte_cursor();
+        if let Some((start, _)) = self.draft[..end].grapheme_indices(true).next_back() {
+            let removed = self.draft[start..end].chars().count();
+            self.draft.drain(start..end);
+            self.draft_cursor -= removed;
         }
-        let start = self
-            .draft
-            .char_indices()
-            .nth(self.draft_cursor - 1)
-            .map_or(0, |(i, _)| i);
-        let end = self
-            .draft
-            .char_indices()
-            .nth(self.draft_cursor)
-            .map_or(self.draft.len(), |(i, _)| i);
-        self.draft.drain(start..end);
-        self.draft_cursor -= 1;
     }
 
     pub fn delete_draft(&mut self) {
-        if let Some((start, _)) = self.draft.char_indices().nth(self.draft_cursor) {
-            let end = self
-                .draft
-                .char_indices()
-                .nth(self.draft_cursor + 1)
-                .map_or(self.draft.len(), |(i, _)| i);
+        use unicode_segmentation::UnicodeSegmentation;
+        let start = self.draft_byte_cursor();
+        if let Some(grapheme) = self.draft[start..].graphemes(true).next() {
+            let end = start + grapheme.len();
             self.draft.drain(start..end);
         }
     }
 
     pub fn move_draft_cursor(&mut self, code: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
-        let len = self.draft.chars().count();
+        use unicode_segmentation::UnicodeSegmentation;
+        let byte = self.draft_byte_cursor();
         match code {
-            KeyCode::Left => self.draft_cursor = self.draft_cursor.saturating_sub(1),
-            KeyCode::Right => self.draft_cursor = (self.draft_cursor + 1).min(len),
+            KeyCode::Left => {
+                if let Some(grapheme) = self.draft[..byte].graphemes(true).next_back() {
+                    self.draft_cursor -= grapheme.chars().count();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(grapheme) = self.draft[byte..].graphemes(true).next() {
+                    self.draft_cursor += grapheme.chars().count();
+                }
+            }
             KeyCode::Home => {
                 let before = self
                     .draft
@@ -545,8 +590,10 @@ impl App {
         self.worked_duration = None;
         self.runs.clear();
         self.run_diffs.clear();
+        self.diff_view = Default::default();
         self.diff_requested.clear();
         self.transcript = None;
+        self.chat_revision = self.chat_revision.wrapping_add(1);
         self.history_error = None;
         self.chat_scroll = 0;
         self.chat_max_scroll = 0;
@@ -563,6 +610,7 @@ impl App {
         if self.history_thread.as_deref() != Some(thread_id) {
             return;
         }
+        self.chat_revision = self.chat_revision.wrapping_add(1);
         let update = match result {
             Ok(update) => update,
             Err(error) => {
@@ -738,6 +786,7 @@ impl App {
         if self.history_thread.as_deref() != Some(thread_id) {
             return;
         }
+        self.chat_revision = self.chat_revision.wrapping_add(1);
         match result {
             Ok(transcript) => {
                 self.transcript = Some(transcript);

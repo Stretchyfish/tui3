@@ -2535,6 +2535,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]

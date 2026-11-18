@@ -29,7 +29,7 @@ pub enum Update {
     RunDiff {
         thread_id: String,
         run_id: String,
-        result: Result<crate::history::FileCounts, String>,
+        result: Result<String, String>,
     },
     Ready(Connection),
     Failed(String),
@@ -640,7 +640,7 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
                         response = client.rpc("orchestration.getTurnDiff", payload.clone()).await;
                     }
                     response.map_err(|error| error.message).and_then(|value| {
-                    value.get("diff").and_then(|diff| diff.as_str()).map(crate::history::diff_counts).ok_or("T3 returned no diff.".into())
+                    value.get("diff").and_then(|diff| diff.as_str()).map(str::to_owned).ok_or("T3 returned no diff.".into())
                     })
                 },
                 Err(error) => Err(error),
