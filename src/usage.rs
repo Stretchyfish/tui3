@@ -1,0 +1,322 @@
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsage {
+    pub instance_id: String,
+    enabled: bool,
+    installed: bool,
+    availability: Option<String>,
+    auth: Auth,
+    usage_limits: Option<Limits>,
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct Auth {
+    status: String,
+    email: Option<String>,
+    profile_id: Option<String>,
+    workspace_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Limits {
+    credential_fingerprint: Option<String>,
+    #[serde(default)]
+    windows: Vec<Window>,
+    unavailable: Option<Unavailable>,
+}
+#[derive(Deserialize)]
+struct Unavailable {
+    reason: String,
+}
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Window {
+    id: String,
+    kind: String,
+    label: String,
+    used_percent: f64,
+}
+
+#[derive(Default)]
+pub struct UsageState {
+    providers: HashMap<String, ProviderUsage>,
+    pub loaded: bool,
+    pub error: Option<String>,
+}
+
+pub struct Remaining {
+    pub percent: f64,
+    pub stale: bool,
+}
+
+impl UsageState {
+    pub fn apply(&mut self, providers: Vec<ProviderUsage>) {
+        self.providers = providers
+            .into_iter()
+            .map(|mut provider| {
+                if provider.enabled
+                    && provider.installed
+                    && provider.auth.status != "unauthenticated"
+                    && provider.availability.as_deref() != Some("unavailable")
+                    && let Some(limits) = &mut provider.usage_limits
+                    && limits.windows.is_empty()
+                    && limits
+                        .unavailable
+                        .as_ref()
+                        .is_some_and(|unavailable| unavailable.reason == "probeFailed")
+                    && let Some(previous) = self.providers.get(&provider.instance_id)
+                    && let Some(old_limits) = &previous.usage_limits
+                {
+                    let same_credentials =
+                        limits
+                            .credential_fingerprint
+                            .as_ref()
+                            .is_some_and(|fingerprint| {
+                                old_limits.credential_fingerprint.as_ref() == Some(fingerprint)
+                            });
+                    let same_account = limits.credential_fingerprint.is_none()
+                        && old_limits.credential_fingerprint.is_none()
+                        && (provider.auth.email.is_some() || provider.auth.profile_id.is_some())
+                        && provider.auth == previous.auth;
+                    if same_credentials || same_account {
+                        limits.windows.clone_from(&old_limits.windows);
+                    }
+                }
+                (provider.instance_id.clone(), provider)
+            })
+            .collect();
+        self.loaded = true;
+        self.error = None;
+    }
+
+    pub fn remaining(&self, instance: &str, model: &str, kind: &str) -> Option<Remaining> {
+        let provider = self.providers.get(instance)?;
+        if !provider.enabled
+            || !provider.installed
+            || provider.auth.status == "unauthenticated"
+            || provider.availability.as_deref() == Some("unavailable")
+        {
+            return None;
+        }
+        let limits = provider.usage_limits.as_ref()?;
+        let reason = limits
+            .unavailable
+            .as_ref()
+            .map(|unavailable| unavailable.reason.as_str());
+        if reason == Some("unsupported") {
+            return None;
+        }
+        let candidates: Vec<_> = limits
+            .windows
+            .iter()
+            .filter(|window| {
+                window.kind == kind
+                    && window.used_percent.is_finite()
+                    && (0.0..=100.0).contains(&window.used_percent)
+            })
+            .collect();
+        let family = ["opus", "sonnet", "haiku", "gemini", "gpt"]
+            .into_iter()
+            .find(|family| model.to_lowercase().contains(family));
+        let applicable: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|window| {
+                let general = matches!(
+                    window.id.as_str(),
+                    "primary" | "secondary" | "five_hour" | "seven_day" | "session" | "weekly"
+                );
+                let scoped = family.is_some_and(|family| {
+                    window.label.to_lowercase().contains(family)
+                        || window.id.to_lowercase().contains(family)
+                });
+                general || scoped || candidates.len() == 1
+            })
+            .collect();
+        // Where a provider reports both a general and a model-specific allowance,
+        // the more restrictive applicable window determines how much remains.
+        let used = applicable
+            .into_iter()
+            .map(|window| window.used_percent)
+            .reduce(f64::max)?;
+        Some(Remaining {
+            percent: 100.0 - used,
+            stale: self.error.is_some() || reason == Some("probeFailed"),
+        })
+    }
+}
+
+pub fn from_config_event(value: Value) -> Result<Option<Vec<ProviderUsage>>, String> {
+    let providers = match value.get("type").and_then(Value::as_str) {
+        Some("snapshot") => &value["config"]["providers"],
+        Some("providerStatuses") => &value["payload"]["providers"],
+        _ => return Ok(None),
+    };
+    serde_json::from_value(providers.clone())
+        .map(Some)
+        .map_err(|_| "Invalid T3 usage snapshot.".into())
+}
+
+pub fn circle(percent: f64) -> &'static str {
+    if percent <= 0.0 {
+        "○"
+    } else if percent < 37.5 {
+        "◔"
+    } else if percent < 62.5 {
+        "◑"
+    } else if percent < 87.5 {
+        "◕"
+    } else {
+        "●"
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use serde_json::json;
+
+    pub fn snapshot() -> Value {
+        json!({"type":"snapshot","config":{"providers":[
+            {"instanceId":"codex","enabled":true,"installed":true,"auth":{"status":"authenticated"},"usageLimits":{"windows":[
+                {"id":"primary","kind":"session","label":"Session","usedPercent":25.0},
+                {"id":"secondary","kind":"weekly","label":"Weekly","usedPercent":100.0}
+            ]}},
+            {"instanceId":"claude","enabled":true,"installed":true,"auth":{"status":"authenticated"},"usageLimits":{"windows":[
+                {"id":"five_hour","kind":"session","label":"Session","usedPercent":0.0},
+                {"id":"seven_day","kind":"weekly","label":"Weekly","usedPercent":30.0},
+                {"id":"seven_day_sonnet","kind":"weekly","label":"Weekly · Sonnet","usedPercent":95.0}
+            ]}}
+        ]}})
+    }
+
+    #[test]
+    fn converts_used_to_remaining_and_keeps_accounts_and_scoped_budgets_separate() {
+        let mut state = UsageState::default();
+        state.apply(from_config_event(snapshot()).unwrap().unwrap());
+        assert_eq!(
+            state
+                .remaining("codex", "gpt-test", "session")
+                .unwrap()
+                .percent,
+            75.0
+        );
+        assert_eq!(
+            state
+                .remaining("codex", "gpt-test", "weekly")
+                .unwrap()
+                .percent,
+            0.0
+        );
+        assert_eq!(
+            state
+                .remaining("claude", "claude-opus", "weekly")
+                .unwrap()
+                .percent,
+            70.0
+        );
+        assert_eq!(
+            state
+                .remaining("claude", "claude-sonnet", "weekly")
+                .unwrap()
+                .percent,
+            5.0
+        );
+        assert!(
+            state
+                .remaining("other-account", "gpt-test", "session")
+                .is_none()
+        );
+        assert_eq!(circle(0.0), "○");
+        assert_eq!(circle(100.0), "●");
+        assert_eq!(circle(75.0), "◕");
+    }
+
+    #[test]
+    fn unavailable_and_invalid_data_are_not_shown_as_full_or_empty_allowances() {
+        for replacement in [
+            json!({"windows":[]}),
+            json!({"windows":[{"id":"primary","kind":"session","label":"Session","usedPercent":101.0}]}),
+            json!({"unavailable":{"reason":"unsupported"},"windows":[]}),
+        ] {
+            let mut value = snapshot();
+            value["config"]["providers"][0]["usageLimits"] = replacement;
+            let mut state = UsageState::default();
+            state.apply(from_config_event(value).unwrap().unwrap());
+            assert!(state.remaining("codex", "gpt-test", "session").is_none());
+        }
+        let mut value = snapshot();
+        value["config"]["providers"][0]["auth"]["status"] = json!("unauthenticated");
+        let mut state = UsageState::default();
+        state.apply(from_config_event(value).unwrap().unwrap());
+        assert!(state.remaining("codex", "gpt-test", "session").is_none());
+    }
+
+    #[test]
+    fn failed_probes_keep_known_account_data_but_never_reuse_it_for_new_credentials() {
+        let mut initial = snapshot();
+        initial["config"]["providers"][0]["usageLimits"]["credentialFingerprint"] =
+            json!("account-a");
+        let mut state = UsageState::default();
+        state.apply(from_config_event(initial.clone()).unwrap().unwrap());
+        initial["config"]["providers"][0]["usageLimits"]["windows"] = json!([]);
+        initial["config"]["providers"][0]["usageLimits"]["unavailable"] =
+            json!({"reason":"probeFailed"});
+        state.apply(from_config_event(initial.clone()).unwrap().unwrap());
+        let remaining = state.remaining("codex", "gpt-test", "session").unwrap();
+        assert_eq!(remaining.percent, 75.0);
+        assert!(remaining.stale);
+        initial["config"]["providers"][0]["usageLimits"]["credentialFingerprint"] =
+            json!("account-b");
+        state.apply(from_config_event(initial).unwrap().unwrap());
+        assert!(state.remaining("codex", "gpt-test", "session").is_none());
+    }
+
+    #[test]
+    fn retains_but_marks_stale_data_and_replaces_it_on_new_provider_snapshots() {
+        let mut state = UsageState::default();
+        state.apply(from_config_event(snapshot()).unwrap().unwrap());
+        state.error = Some("connection lost".into());
+        assert!(
+            state
+                .remaining("codex", "gpt-test", "session")
+                .unwrap()
+                .stale
+        );
+        let mut value = snapshot();
+        value["config"]["providers"][0]["usageLimits"]["unavailable"] =
+            json!({"reason":"probeFailed"});
+        state.apply(from_config_event(value.clone()).unwrap().unwrap());
+        assert!(
+            state
+                .remaining("codex", "gpt-test", "session")
+                .unwrap()
+                .stale
+        );
+        value["config"]["providers"][0]["usageLimits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unavailable");
+        let providers = value["config"]["providers"].clone();
+        state.apply(
+            from_config_event(json!({"type":"providerStatuses","payload":{"providers":providers}}))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            !state
+                .remaining("codex", "gpt-test", "session")
+                .unwrap()
+                .stale
+        );
+        assert!(
+            from_config_event(json!({"type":"settingsUpdated","payload":{}}))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
