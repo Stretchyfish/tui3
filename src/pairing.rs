@@ -116,6 +116,10 @@ pub async fn local_credential(origin: &Url) -> Result<String, String> {
             "orchestration:read",
             "--scope",
             "orchestration:operate",
+            "--scope",
+            "filesystem:read",
+            "--scope",
+            "source-control:write",
             "--base-dir",
         ])
         .arg(base)

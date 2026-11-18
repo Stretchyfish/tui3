@@ -26,6 +26,15 @@ pub struct Connection {
 }
 
 pub enum Update {
+    Git {
+        request: crate::git::Request,
+        result: Result<crate::git::Snapshot, String>,
+    },
+    GitProgress {
+        id: String,
+        cwd: String,
+        message: String,
+    },
     RunDiff {
         thread_id: String,
         run_id: String,
@@ -431,6 +440,121 @@ impl T3Client {
             .map_err(|_| crate::message::SendFailure::uncertain("T3 acknowledgement timed out. Delivery is uncertain; check history before retrying."))?
     }
 
+    async fn git_request(
+        &self,
+        request: &crate::git::Request,
+        updates: &mpsc::Sender<Update>,
+    ) -> Result<crate::git::Snapshot, String> {
+        use crate::git::Operation;
+        match &request.operation {
+            Operation::Refresh | Operation::Generate(_) => (),
+            Operation::Switch(_) => {
+                self.rpc("vcs.switchRef", request.payload())
+                    .await
+                    .map_err(|error| error.message)?;
+            }
+            Operation::Commit(_) | Operation::Push => {
+                let mut completed = None;
+                let stream = self.stream_rpc(
+                    "git.runStackedAction",
+                    request.payload(),
+                    updates,
+                    |value| {
+                        if value["actionId"].as_str() != Some(&request.id) {
+                            return Ok(None);
+                        }
+                        match value["kind"].as_str() {
+                            Some("action_finished") => completed = Some(Ok(())),
+                            Some("action_failed") => {
+                                completed = Some(Err(value["message"]
+                                    .as_str()
+                                    .unwrap_or("Git action failed.")
+                                    .to_owned()))
+                            }
+                            Some("phase_started") => {
+                                return Ok(Some(Update::GitProgress {
+                                    id: request.id.clone(),
+                                    cwd: request.cwd.clone(),
+                                    message: value["label"].as_str().unwrap_or("Working…").into(),
+                                }));
+                            }
+                            _ => (),
+                        }
+                        Ok(None)
+                    },
+                );
+                let ended = tokio::time::timeout(Duration::from_secs(180), stream).await;
+                match completed {
+                    Some(result) => result?,
+                    None => {
+                        return Err(format!(
+                            "{} Check the repository before retrying; the action may have completed.",
+                            match ended {
+                                Ok(Err(error)) => error,
+                                _ => "Git action ended without a completion result.".into(),
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        let status = self
+            .rpc("vcs.refreshStatus", serde_json::json!({"cwd":request.cwd}))
+            .await
+            .map_err(|error| error.message)?;
+        let status = serde_json::from_value::<crate::git::Status>(status)
+            .map_err(|_| "Invalid T3 repository status.".to_owned())?;
+        let mut branches = Vec::new();
+        if status.is_repo {
+            let mut cursor = 0;
+            loop {
+                let value = self.rpc("vcs.listRefs", serde_json::json!({"cwd":request.cwd,"refKind":"local","limit":200,"cursor":cursor})).await.map_err(|error| error.message)?;
+                if let Some(refs) = value["refs"].as_array() {
+                    branches.extend(
+                        refs.iter()
+                            .filter_map(|entry| entry["name"].as_str().map(str::to_owned)),
+                    );
+                }
+                match value["nextCursor"].as_u64() {
+                    Some(next) if next > cursor => cursor = next,
+                    _ => break,
+                }
+            }
+        }
+        let generated_message = if matches!(request.operation, Operation::Generate(_)) {
+            if status.working_tree.files.is_empty() {
+                return Err("No changes to describe.".into());
+            }
+            let value = self.rpc("review.getDiffPreview", serde_json::json!({
+                "cwd":request.cwd, "sourceKind":"working-tree", "trackedOnly":false, "metadataOnly":false, "ignoreWhitespace":false
+            })).await.map_err(|error| format!("{} If access was denied, press p in Git to refresh pairing permissions, then Generate again.", error.message))?;
+            let patch = value["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|source| source["kind"] == "working-tree")
+                .filter_map(|source| source["diff"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if patch.trim().is_empty() {
+                return Err("T3 returned no text diff to summarize. Your draft is kept.".into());
+            }
+            let prompt = crate::commit_message::prompt(
+                status.ref_name.as_deref(),
+                &status.working_tree.files,
+                &patch,
+            );
+            Some(crate::commit_message::generate(&prompt).await?)
+        } else {
+            None
+        };
+        Ok(crate::git::Snapshot {
+            status,
+            branches,
+            generated_message,
+        })
+    }
+
     async fn available_models(&self) -> Result<Vec<crate::models::ModelChoice>, String> {
         let config = self
             .rpc("server.getConfig", serde_json::json!({}))
@@ -607,6 +731,7 @@ impl T3Client {
 }
 
 pub struct Backend {
+    pub git: tokio::sync::mpsc::Sender<crate::git::Request>,
     pub diffs: tokio::sync::mpsc::Sender<(String, String, u64)>,
     pub updates: mpsc::Receiver<Update>,
     pub pairing: tokio::sync::mpsc::Sender<()>,
@@ -622,6 +747,24 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
     let history_sender = sender.clone();
     let (credentials, mut authorization) = tokio::sync::watch::channel::<Option<Config>>(None);
     let mut usage_authorization = authorization.clone();
+    let git_auth = authorization.clone();
+    let git_updates = sender.clone();
+    let (git, mut git_requests) = tokio::sync::mpsc::channel::<crate::git::Request>(4);
+    runtime.spawn(async move {
+        while let Some(request) = git_requests.recv().await {
+            let config = git_auth.borrow().clone();
+            let result = match config
+                .ok_or("Sign in to T3 first.".to_owned())
+                .and_then(T3Client::new)
+            {
+                Ok(client) => client.git_request(&request, &git_updates).await,
+                Err(error) => Err(error),
+            };
+            if git_updates.send(Update::Git { request, result }).is_err() {
+                break;
+            }
+        }
+    });
     let diff_auth = authorization.clone();
     let diff_updates = sender.clone();
     let (diffs, mut diff_requests) = tokio::sync::mpsc::channel::<(String, String, u64)>(32);
@@ -803,6 +946,7 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         }
     });
     Backend {
+        git,
         diffs,
         updates: receiver,
         pairing: commands,
@@ -1116,6 +1260,105 @@ mod tests {
                 .any(|thread| thread.model_selection.is_some())
         );
         println!("Available configured models: {}", models.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running T3 server paired with filesystem:read; reads status, branches, and working-tree diff"]
+    async fn live_server_git_status() {
+        let mut client = T3Client::new(Config::load().unwrap()).unwrap();
+        assert!(client.check().await.unwrap().authenticated);
+        let catalog = client.catalog().await.unwrap();
+        let project = catalog
+            .projects
+            .iter()
+            .find(|project| {
+                project.workspace_root == std::env::current_dir().unwrap().to_string_lossy()
+            })
+            .unwrap();
+        let request = crate::git::Request {
+            id: "read-only-check".into(),
+            cwd: project.workspace_root.clone(),
+            operation: crate::git::Operation::Refresh,
+        };
+        let (sender, _) = mpsc::channel();
+        let snapshot = client.git_request(&request, &sender).await.unwrap();
+        assert!(snapshot.status.is_repo);
+        assert!(!snapshot.branches.is_empty());
+        if !snapshot.status.working_tree.files.is_empty() {
+            let preview = client.rpc("review.getDiffPreview", serde_json::json!({
+                "cwd":request.cwd,"sourceKind":"working-tree","trackedOnly":false,"metadataOnly":false,"ignoreWhitespace":false
+            })).await.unwrap();
+            assert!(
+                preview["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|source| source["kind"] == "working-tree"
+                        && source["diff"].as_str().is_some_and(|diff| !diff.is_empty()))
+            );
+        }
+        println!(
+            "Read-only Git status: {} local branches, {} changed files",
+            snapshot.branches.len(),
+            snapshot.status.working_tree.files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_commit_stream_acknowledges_progress_then_refreshes_repository() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            for method in ["git.runStackedAction", "vcs.refreshStatus", "vcs.listRefs"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(
+                    &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["tag"], method);
+                assert_eq!(request["payload"]["cwd"], "/worktree");
+                let value = if method == "git.runStackedAction" {
+                    assert_eq!(request["payload"]["action"], "commit");
+                    assert_eq!(request["payload"]["commitMessage"], "Fix UI");
+                    assert_eq!(request["payload"]["featureBranch"], false);
+                    socket.send(Message::Text(serde_json::json!({"_tag":"Chunk","requestId":"1","values":[
+                        {"kind":"phase_started","actionId":"test-action","label":"Committing"},
+                        {"kind":"action_finished","actionId":"test-action"}
+                    ]}).to_string().into())).await.unwrap();
+                    let ack: serde_json::Value = serde_json::from_str(
+                        &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(ack["_tag"], "Ack");
+                    serde_json::Value::Null
+                } else if method == "vcs.refreshStatus" {
+                    crate::git::tests::status()
+                } else {
+                    serde_json::json!({"refs":[{"name":"main"}],"nextCursor":null})
+                };
+                socket.send(Message::Text(serde_json::json!({"_tag":"Exit","requestId":"1","exit":{"_tag":"Success","value":value}}).to_string().into())).await.unwrap();
+            }
+        });
+        let client = T3Client::new(Config {
+            origin,
+            access_token: Some("test-token".into()),
+            bootstrap_token: None,
+        })
+        .unwrap();
+        let request = crate::git::Request {
+            id: "test-action".into(),
+            cwd: "/worktree".into(),
+            operation: crate::git::Operation::Commit("Fix UI".into()),
+        };
+        let (updates, received) = mpsc::channel();
+        let snapshot = client.git_request(&request, &updates).await.unwrap();
+        assert_eq!(snapshot.status.ref_name.as_deref(), Some("main"));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::GitProgress { .. }
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

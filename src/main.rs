@@ -1,8 +1,10 @@
 mod app;
 mod catalog;
 mod chat;
+mod commit_message;
 mod composer;
 mod diff;
+mod git;
 mod history;
 mod input;
 mod message;
@@ -67,6 +69,18 @@ fn run(
     while !app.quit {
         while let Ok(update) = backend.updates.try_recv() {
             let update = match update {
+                t3::Update::Git { request, result } => {
+                    app.git.finish(&request, result);
+                    continue;
+                }
+                t3::Update::GitProgress { id, cwd, message } => {
+                    if app.git.pending.as_deref() == Some(&id)
+                        && app.git.cwd.as_deref() == Some(&cwd)
+                    {
+                        app.git.notice = message;
+                    }
+                    continue;
+                }
                 t3::Update::RunDiff {
                     thread_id,
                     run_id,
@@ -178,6 +192,8 @@ fn run(
                 | t3::Update::Live { .. }
                 | t3::Update::Usage(_)
                 | t3::Update::Models(_)
+                | t3::Update::Git { .. }
+                | t3::Update::GitProgress { .. }
                 | t3::Update::RunDiff { .. }
                 | t3::Update::ModelChanged { .. } => {
                     unreachable!()
@@ -185,6 +201,15 @@ fn run(
             };
         }
         app.sync_history_selection();
+        git::sync(&mut app);
+        if let Some(request) = app.git.request.take()
+            && backend.git.try_send(request.clone()).is_err()
+        {
+            app.git.finish(
+                &request,
+                Err("Git worker unavailable. Press r to retry.".into()),
+            );
+        }
         if app.authenticated
             && let Some(thread) = app.history_thread.as_ref()
         {
@@ -241,6 +266,13 @@ fn run(
             match next {
                 Event::Key(key) => input::handle_key(&mut app, key),
                 Event::Mouse(mouse) => input::handle_mouse(&mut app, mouse),
+                Event::Paste(text)
+                    if app.git.editing
+                        && app.focus == app::Focus::Workspace
+                        && app.workspace_tab == 4 =>
+                {
+                    app.git.message.push_str(&text.replace(['\r', '\n'], " "))
+                }
                 Event::Paste(text) if app.editing => app.insert_draft(&text),
                 _ => (),
             }

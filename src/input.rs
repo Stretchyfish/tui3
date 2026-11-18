@@ -46,6 +46,17 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         return;
     }
     match target {
+        Some(ClickTarget::GitControl(index)) => {
+            app.editing = false;
+            app.focus = Focus::Workspace;
+            app.git.row = index;
+            if index != 1 {
+                app.git.editing = false;
+            }
+            if index == 4 {
+                crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+        }
         Some(ClickTarget::DiffBody) => {
             app.editing = false;
             app.focus = Focus::Workspace;
@@ -118,6 +129,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('r') if !app.models.loading => app.request_models(),
             _ => (),
         }
+        return;
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 4 && crate::git::key(app, key) {
         return;
     }
     if app.editing {

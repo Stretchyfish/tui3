@@ -19,8 +19,8 @@ Clicking a typing-style box activates and saves it immediately.
 
 ## Workspace panel
 
-The right-side workspace panel includes a live Diffs viewer. Code (C), Files (F),
-Terminal (T), Git (G), and Side chat (S) currently show letter placeholders.
+The right-side workspace panel includes Diffs and Git tools. Code (C), Files (F),
+Terminal (T), and Side chat (S) currently show letter placeholders.
 From chat or the message panel in navigation mode, press Right or `l` to focus it.
 Down or `j` in the workspace panel focuses the boxed tool selector
 underneath; all six boxes stay on one row, progressively shortening their names as
@@ -57,6 +57,36 @@ cargo test --release performance_large_thread_navigation -- --ignored --nocaptur
 It enforces a 17 ms p95 frame budget in release builds. Measurements cover app
 rendering on the test machine; terminal rendering and server latency are separate.
 
+## Git panel
+
+Choose Git in the workspace selector. The panel uses T3's Git operations in the
+selected thread's worktree, or the project's workspace when there is no worktree.
+It shows the current branch, ahead/behind counts, and changed files, refreshing
+every ten seconds while open (or immediately with `r`).
+
+Use Up/Down or `j/k` to highlight a control and Enter to open it:
+
+- **Branch:** choose a local branch with Up/Down, then Enter to review the switch.
+- **Commit message:** type a message; Enter or Esc finishes text entry.
+- **Generate:** click the button beside the message, press `g`, or highlight it
+  with Right/`l` from the message field and press Enter. It refreshes T3's file list
+  and generates an AI subject/body from the actual working-tree diff fetched through
+  T3. Generation uses the installed, signed-in `codex` CLI in an ephemeral read-only
+  temporary workspace, with structured output. It requires local Codex CLI access;
+  it does not reuse T3's source-control writer configuration. The resulting draft
+  remains editable, and its full body appears in the commit confirmation.
+  Generate never stages, commits, or pushes. Failures preserve the existing draft.
+  If an older TUI3 pairing cannot read diffs, press `p` in the Git panel once to
+  refresh pairing with filesystem-read and source-control-write access, then generate again.
+- **Commit all changes:** review and confirm with Enter. This includes tracked and
+  untracked changes, using T3's normal staging and commit behavior.
+- **Push:** review and confirm with Enter to push the current branch through T3.
+
+Esc cancels a confirmation. Controls can also be highlighted with the mouse.
+Operations run asynchronously, show progress/errors, and refresh status afterward.
+Git writes are never automatically retried if the connection drops; check the
+repository before retrying. Branch creation and individual staging are future work.
+
 ## Connecting to T3
 
 Start T3 Code, then launch tui3. By default, tui3 reads the server origin from
@@ -79,8 +109,9 @@ The app runs T3's supported local pairing command in the background, exchanges
 its one-time credential, and saves your session automatically. There are no tokens
 to copy and no browser is needed for this local flow. Press Esc first if typing.
 
-The pairing is labeled `tui3` and requests only `orchestration:read` and
-`orchestration:operate` for the planned project and chat workflow. The local runtime
+The pairing is labeled `tui3` and requests `orchestration:read`,
+`orchestration:operate`, `filesystem:read`, and `source-control:write` for chat,
+diff reads, and Git controls. The local runtime
 must match the configured server origin; this flow never pairs with a different
 server or reuses the desktop GUI's private session. Pairing times out after 20 seconds
 and can be retried with **p**. T3's connection policy may prevent pairing.

@@ -274,6 +274,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             " SETTINGS | Esc/s: close | Ctrl+Q: quit "
         } else if app.editing {
             " TYPING | Enter: send | Alt+Enter: newline | Esc: navigate | Ctrl+Q: quit "
+        } else if app.focus == Focus::Workspace && app.workspace_tab == 4 {
+            " GIT | ↑↓/jk: control | Enter: open/confirm | Esc: cancel | r: refresh | Tab: pane "
         } else if app.focus == Focus::Workspace
             && app.workspace_tab == 0
             && app.diff_view.file_focus
@@ -372,6 +374,8 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
     if app.workspace_tab == 0 {
         crate::diff::draw(frame, app, content);
+    } else if app.workspace_tab == 4 {
+        crate::git::draw(frame, app, content);
     } else {
         frame.render_widget(
             Paragraph::new(letters[app.workspace_tab])

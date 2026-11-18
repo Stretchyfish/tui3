@@ -15,6 +15,7 @@ pub struct Project {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
+    pub worktree_path: Option<String>,
     pub id: String,
     pub project_id: String,
     pub title: String,

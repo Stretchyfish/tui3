@@ -23,6 +23,7 @@ pub enum Focus {
 
 #[derive(Clone, Copy)]
 pub enum ClickTarget {
+    GitControl(usize),
     DiffBody,
     DiffFile(usize),
     Pane(Focus),
@@ -31,6 +32,7 @@ pub enum ClickTarget {
 }
 
 pub struct App {
+    pub git: crate::git::GitState,
     pub chat_revision: u64,
     pub chat_cache: Option<(u64, Option<u64>, ratatui::text::Text<'static>)>,
     pub chat_viewport: Option<crate::chat::Viewport>,
@@ -85,6 +87,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            git: Default::default(),
             chat_revision: 0,
             chat_cache: None,
             chat_viewport: None,
