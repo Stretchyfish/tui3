@@ -7,6 +7,30 @@ and model selection.
 Run with `cargo run`. Use arrows or `h/j/k/l` to switch panes, Enter or `i` in the
 composer to type, Esc to return to navigation, and Ctrl+Q to quit.
 
+Press `s` in navigation mode to open Settings. Use Left/Right or `h/l` to choose
+Regular, Vim, or Helix typing style; all three appear in adjacent boxes with the
+highlighted option outlined in blue outside the box and the active option outlined in green. Enter or
+Space activates the highlighted style. The preference
+is saved automatically in `ui-state.json`. Vim/Helix editing behavior is future work;
+this setting currently records your preferred style. The panel also shows the connection
+and model. Press Esc or `s` to close it and
+return to the same pane. While typing a prompt, `s` inserts text normally.
+Clicking a typing-style box activates and saves it immediately.
+
+## Workspace panel
+
+The right-side workspace panel currently shows letter placeholders for Diffs (D),
+Code (C), Files (F), Terminal (T), Git (G), and Side chat (S).
+From chat or the message panel in navigation mode, press Right or `l` to focus it.
+Down or `j` in the workspace panel focuses the boxed tool selector
+underneath; all six boxes stay on one row, progressively shortening their names as
+space shrinks and showing full names when they fit.
+Left/Right or `h/l` moves the blue outer outline; Enter or Space activates the tool,
+shown with a green inner outline. Up or `k` returns to the
+panel, then Left or `h` returns to chat. Tab/Shift+Tab also cycle through these panes.
+You can also click panes to focus them, or click a tool box to activate it directly.
+Clicking the message box highlights it; Enter or `i` still starts typing.
+
 ## Connecting to T3
 
 Start T3 Code, then launch tui3. By default, tui3 reads the server origin from
@@ -88,14 +112,24 @@ events. Entries disappear when they finish. Attachments show a placeholder rathe
 **YOU** headers for your prompts, green **AGENT** headers for replies, and yellow
 system headers. Labels and borders distinguish speakers even without color.
 Message bodies remain plain text, preserving whitespace and code indentation.
+Changed-file summaries appear inside each run's latest green AGENT message block, listing
+paths with green additions and red deletions. File lists and counts come from T3's
+checkpoint summaries, matching the source used by its chat cards. Individual tool
+edits are not summed. If no complete checkpoint summary is available, the app
+requests the run's checkpoint diff in the background and uses its full file list.
+Until that data is available, file-event paths can appear with unknown counts.
+An empty checkpoint summary removes files that were edited but ultimately reverted.
+Opening diffs is planned for the workspace panel.
 
 Threads open at the latest message. In the chat pane, use Shift+J/Shift+K or
+the mouse wheel over the chat to scroll (three lines per wheel step).
+Wheel scrolling keeps your current input focus. You can also use
 Shift+Up/Down to scroll one line, Page Up/Down to move ten lines, Home to jump to the
 start, and End to return to the latest messages. Use Down or `j` to highlight the composer, then Enter or `i` to type.
 Use Up or `k` in the composer to return to chat, or `h` to return to the sidebar.
 
 Replies update as the agent generates them. While a run is active, the chat shows an
-animated **AGENT · working for Ns** indicator with a continuously updated elapsed
+gray **Working for Ns** line above the green AGENT header with a continuously updated elapsed
 timer. When the run finishes, **Worked for Ns** appears once above its final green
 AGENT message header, using T3's run timestamps, including after reopening a thread.
 Finishing an individual progress message does not end the working indicator;

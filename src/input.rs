@@ -1,6 +1,52 @@
 use crate::app::{App, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    use crate::app::ClickTarget;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+    ) {
+        return;
+    }
+    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+    let target = app
+        .click_targets
+        .iter()
+        .rev()
+        .find(|(area, _)| area.contains(position))
+        .map(|(_, target)| *target);
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        if matches!(target, Some(ClickTarget::Pane(Focus::Chat))) {
+            app.scroll_chat(mouse.kind == MouseEventKind::ScrollDown, 3);
+        }
+        return;
+    }
+    match target {
+        Some(ClickTarget::Pane(focus)) => {
+            app.editing = false;
+            app.focus = focus;
+        }
+        Some(ClickTarget::Workspace(index)) => {
+            app.editing = false;
+            app.focus = Focus::WorkspaceTabs;
+            app.workspace_highlight = index;
+            app.workspace_tab = index;
+        }
+        Some(ClickTarget::TypingStyle(style)) => {
+            app.style_highlight = style;
+            app.typing_style = style;
+        }
+        None => (),
+    }
+}
+
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
@@ -8,6 +54,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(key.code, KeyCode::Char('c' | 'q')) {
             app.quit = true;
+        }
+        return;
+    }
+    if app.settings_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
+            KeyCode::Right | KeyCode::Char('l') => {
+                app.style_highlight = app.style_highlight.cycle(true);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                app.style_highlight = app.style_highlight.cycle(false)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => app.typing_style = app.style_highlight,
+            _ => (),
         }
         return;
     }
@@ -59,7 +119,36 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
+        KeyCode::Char('s') => {
+            app.style_highlight = app.typing_style;
+            app.settings_open = true;
+        }
         KeyCode::Char('m') => app.focus = Focus::Model,
+        KeyCode::Right | KeyCode::Char('l')
+            if app.focus == Focus::Chat || app.focus == Focus::Model =>
+        {
+            app.focus = Focus::Workspace;
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Workspace => {
+            app.focus = Focus::WorkspaceTabs;
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::WorkspaceTabs => {
+            app.focus = Focus::Workspace;
+        }
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::WorkspaceTabs => {
+            app.workspace_highlight = (app.workspace_highlight + 1) % 6;
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::WorkspaceTabs => {
+            app.workspace_highlight = (app.workspace_highlight + 5) % 6;
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.focus == Focus::WorkspaceTabs => {
+            app.workspace_tab = app.workspace_highlight;
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Workspace => {
+            app.focus = Focus::Chat;
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k')
+            if matches!(app.focus, Focus::Workspace | Focus::WorkspaceTabs) => {}
         KeyCode::Enter if app.focus == Focus::Model => app.open_models(),
         KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Composer => {
             app.focus = Focus::Model
@@ -68,7 +157,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.focus = Focus::Composer
         }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Composer => {
-            app.focus = Focus::Model
+            app.focus = Focus::Workspace
         }
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Model => {
             app.focus = Focus::Composer
@@ -133,6 +222,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wheel_over_chat_scrolls_without_interrupting_typing_and_resumes_follow_at_bottom() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            chat_scroll: 10,
+            chat_max_scroll: 10,
+            ..Default::default()
+        };
+        app.click_targets.push((
+            ratatui::layout::Rect::new(10, 1, 40, 20),
+            crate::app::ClickTarget::Pane(Focus::Chat),
+        ));
+        let mut wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, wheel);
+        assert_eq!(app.chat_scroll, 7);
+        assert!(!app.follow_chat);
+        assert!(app.editing && app.focus == Focus::Composer);
+        wheel.kind = MouseEventKind::ScrollDown;
+        handle_mouse(&mut app, wheel);
+        assert_eq!(app.chat_scroll, 10);
+        assert!(app.follow_chat);
+        wheel.kind = MouseEventKind::ScrollUp;
+        wheel.column = 0;
+        handle_mouse(&mut app, wheel);
+        assert_eq!(app.chat_scroll, 10);
+    }
+
+    #[test]
+    fn workspace_selector_switches_tools_without_editing_the_prompt() {
+        let mut app = App {
+            focus: Focus::Chat,
+            ..App::default()
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Workspace);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.focus == Focus::WorkspaceTabs);
+        for index in 1..=6 {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            );
+            assert_eq!(app.workspace_highlight, index % 6);
+            assert_eq!(app.workspace_tab, 0);
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.workspace_highlight, 5);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.workspace_tab, 5);
+        assert!(!app.editing);
+        assert!(app.draft.is_empty());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Chat);
+    }
+
+    #[test]
+    fn settings_style_changes_only_when_confirmed() {
+        let mut app = App::default();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.typing_style, crate::preferences::TypingStyle::Regular);
+        assert_eq!(app.style_highlight, crate::preferences::TypingStyle::Vim);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.typing_style, crate::preferences::TypingStyle::Vim);
+    }
+
+    #[test]
     fn model_box_is_focusable_and_popup_keys_do_not_edit_or_send_prompt() {
         let mut app = App {
             focus: Focus::Composer,
@@ -145,7 +311,7 @@ mod tests {
         app.move_selection(true);
         app.sync_history_selection();
         app.models.choices = crate::models::choices(crate::models::tests::catalog()).unwrap();
-        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(app.focus == Focus::Model);
         assert!(!app.editing);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

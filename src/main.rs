@@ -12,7 +12,10 @@ mod ui;
 mod usage;
 
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event,
+    },
     execute,
 };
 use std::{io, time::Duration};
@@ -22,13 +25,29 @@ fn main() -> io::Result<()> {
     let backend = t3::start(&runtime);
     let mut resume = preferences::ResumeStore::load();
     let mut terminal = ratatui::init();
-    let result = execute!(terminal.backend_mut(), EnableBracketedPaste)
-        .and_then(|_| run(&mut terminal, backend, &mut resume));
-    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+    let result = execute!(
+        terminal.backend_mut(),
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .and_then(|_| {
+        // Keep click reporting, but disable Crossterm's pointer-motion reporting.
+        #[cfg(not(windows))]
+        execute!(
+            terminal.backend_mut(),
+            crossterm::style::Print("\x1b[?1003l\x1b[?1002l\x1b[?1000h")
+        )?;
+        run(&mut terminal, backend, &mut resume)
+    });
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     resume.flush();
     if let Some(warning) = resume.warning {
-        eprintln!("Could not remember the last selection: {warning}");
+        eprintln!("Could not save UI preferences: {warning}");
     }
     runtime.shutdown_timeout(Duration::from_millis(100));
     result
@@ -39,10 +58,26 @@ fn run(
     backend: t3::Backend,
     resume: &mut preferences::ResumeStore,
 ) -> io::Result<()> {
-    let mut app = app::App::default();
+    let mut app = app::App {
+        typing_style: resume.typing_style(),
+        ..app::App::default()
+    };
     while !app.quit {
         while let Ok(update) = backend.updates.try_recv() {
             let update = match update {
+                t3::Update::RunDiff {
+                    thread_id,
+                    run_id,
+                    result,
+                } => {
+                    if app.history_thread.as_deref() == Some(&thread_id)
+                        && !app.run_diffs.contains_key(&run_id)
+                        && let Ok(counts) = result
+                    {
+                        app.run_diffs.insert(run_id, counts);
+                    }
+                    continue;
+                }
                 t3::Update::Usage(result) => {
                     match result {
                         Ok(providers) if app.authenticated => app.usage.apply(providers),
@@ -133,12 +168,39 @@ fn run(
                 | t3::Update::Live { .. }
                 | t3::Update::Usage(_)
                 | t3::Update::Models(_)
+                | t3::Update::RunDiff { .. }
                 | t3::Update::ModelChanged { .. } => {
                     unreachable!()
                 }
             };
         }
         app.sync_history_selection();
+        if app.authenticated
+            && let Some(thread) = app.history_thread.as_ref()
+        {
+            for run in app.runs.values() {
+                if run.status != "completed" || app.diff_requested.contains(&run.id) {
+                    continue;
+                }
+                let Some(ordinal) = run.ordinal else {
+                    continue;
+                };
+                let needs_counts = app.transcript.as_ref().is_some_and(|history| {
+                    history.items.iter().any(|entry| {
+                        entry.item.kind == "file_change"
+                            && entry.item.run_id.as_ref() == Some(&run.id)
+                    })
+                });
+                if needs_counts
+                    && backend
+                        .diffs
+                        .try_send((thread.clone(), run.id.clone(), ordinal))
+                        .is_ok()
+                {
+                    app.diff_requested.insert(run.id.clone());
+                }
+            }
+        }
         backend.selected_thread.send_if_modified(|selected| {
             if *selected == app.history_thread {
                 false
@@ -150,8 +212,17 @@ fn run(
         resume.remember(&app);
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
+            // Discard unused motion/release events in a batch instead of rendering
+            // the full transcript for each queued pointer event.
+            let mut next = event::read()?;
+            let mut ignored = 0;
+            while !useful_input(&next) && ignored < 256 && event::poll(Duration::ZERO)? {
+                next = event::read()?;
+                ignored += 1;
+            }
+            match next {
                 Event::Key(key) => input::handle_key(&mut app, key),
+                Event::Mouse(mouse) => input::handle_mouse(&mut app, mouse),
                 Event::Paste(text) if app.editing => app.insert_draft(&text),
                 _ => (),
             }
@@ -206,4 +277,19 @@ fn run(
     }
     resume.remember(&app);
     Ok(())
+}
+
+fn useful_input(event: &Event) -> bool {
+    use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
+    match event {
+        Event::Mouse(mouse) => matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ),
+        Event::Key(key) => key.kind != KeyEventKind::Release,
+        Event::FocusGained | Event::FocusLost => false,
+        _ => true,
+    }
 }

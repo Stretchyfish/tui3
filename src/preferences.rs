@@ -3,6 +3,33 @@ use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TypingStyle {
+    #[default]
+    Regular,
+    Vim,
+    Helix,
+}
+
+impl TypingStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Regular => "Regular",
+            Self::Vim => "Vim",
+            Self::Helix => "Helix",
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Regular, true) | (Self::Helix, false) => Self::Vim,
+            (Self::Vim, true) | (Self::Regular, false) => Self::Helix,
+            _ => Self::Regular,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
@@ -13,6 +40,8 @@ pub struct Location {
 
 #[derive(Default, Deserialize, Serialize)]
 struct Preferences {
+    #[serde(default)]
+    typing_style: TypingStyle,
     #[serde(default)]
     locations: BTreeMap<String, Location>,
 }
@@ -26,6 +55,9 @@ pub struct ResumeStore {
 }
 
 impl ResumeStore {
+    pub fn typing_style(&self) -> TypingStyle {
+        self.preferences.typing_style
+    }
     pub fn load() -> Self {
         let path = crate::pairing::session_path()
             .ok()
@@ -59,6 +91,11 @@ impl ResumeStore {
     }
 
     pub fn remember(&mut self, app: &crate::app::App) {
+        if self.preferences.typing_style != app.typing_style {
+            self.preferences.typing_style = app.typing_style;
+            self.dirty = true;
+            self.flush();
+        }
         let (Some(environment), Some(location)) = (&self.environment, app.selected_location())
         else {
             return;
@@ -122,6 +159,24 @@ impl ResumeStore {
 mod tests {
     use super::*;
     use crate::{app::App, catalog::Selection};
+
+    #[test]
+    fn typing_style_is_saved_without_a_server_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ui-state.json");
+        let mut store = ResumeStore::at(Some(path.clone()));
+        assert_eq!(store.typing_style(), TypingStyle::Regular);
+        let app = App {
+            typing_style: TypingStyle::Helix,
+            ..App::default()
+        };
+        store.remember(&app);
+        assert!(store.warning.is_none());
+        assert_eq!(
+            ResumeStore::at(Some(path)).typing_style(),
+            TypingStyle::Helix
+        );
+    }
 
     fn catalog() -> crate::catalog::Catalog {
         let mut catalog = crate::catalog::tests::snapshot();

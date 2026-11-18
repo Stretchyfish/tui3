@@ -4,10 +4,11 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::Text,
-    widgets::{Block, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.click_targets.clear();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -18,8 +19,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(format!(" tui3 | {}", app.connection)).bold(),
         header,
     );
-    let [sidebar, main] =
-        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+    let [sidebar, main, workspace] = Layout::horizontal([
+        Constraint::Percentage(20),
+        Constraint::Percentage(48),
+        Constraint::Percentage(32),
+    ])
+    .areas(body);
+    workspace_panel(frame, app, workspace);
     let project_list = sidebar;
     let [chat, composer, controls] = Layout::vertical([
         Constraint::Min(3),
@@ -33,6 +39,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Percentage(30),
     ])
     .areas(controls);
+    for (area, focus) in [
+        (sidebar, Focus::Projects),
+        (chat, Focus::Chat),
+        (composer, Focus::Composer),
+        (model, Focus::Model),
+    ] {
+        app.click_targets
+            .push((area, crate::app::ClickTarget::Pane(focus)));
+    }
     let title = if app.catalog_error.is_some() {
         " Projects / threads (refresh failed) "
     } else {
@@ -88,7 +103,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .unwrap_or_else(|| " Chat ".into());
         let content = match (&app.transcript, &app.history_error) {
             (Some(history), error) => {
-                let mut text = crate::chat::conversation(history, &app.runs);
+                let mut text = crate::chat::conversation(
+                    history,
+                    &app.runs,
+                    app.thinking_since.map(|start| start.elapsed()),
+                    &app.run_diffs,
+                );
                 if let Some(error) = error {
                     crate::chat::notice(
                         &mut text,
@@ -127,28 +147,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Color::DarkGray,
             );
         }
-    }
-    if app.thinking_since.is_some() {
-        let elapsed = app
-            .thinking_since
-            .map_or_else(
-                || app.worked_duration.unwrap_or_default(),
-                |start| start.elapsed(),
-            )
-            .as_secs();
-        let timer = if elapsed >= 3600 {
-            format!(
-                "{:02}:{:02}:{:02}",
-                elapsed / 3600,
-                elapsed / 60 % 60,
-                elapsed % 60
-            )
-        } else {
-            format!("{:02}:{:02}", elapsed / 60, elapsed % 60)
-        };
-        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(elapsed as usize) % 10];
-        let label = format!("{spinner} AGENT · working for {timer}");
-        crate::chat::notice(&mut content, label, Color::Green);
     }
     if let Some(status) = app
         .history_thread
@@ -276,21 +274,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     usage_panel(frame, session, " Session left ", app, "session");
     usage_panel(frame, weekly, " Week left ", app, "weekly");
     frame.render_widget(
-        Paragraph::new(if app.editing {
+        Paragraph::new(if app.settings_open {
+            " SETTINGS | Esc/s: close | Ctrl+Q: quit "
+        } else if app.editing {
             " TYPING | Enter: send | Alt+Enter: newline | Esc: navigate | Ctrl+Q: quit "
+        } else if app.focus == Focus::Workspace {
+            " ↓/j: tools | ←/h: chat | Tab: pane | s: settings | q: quit "
+        } else if app.focus == Focus::WorkspaceTabs {
+            " ←→/hl: highlight | Enter: activate | ↑/k: panel | Tab: pane | q: quit "
         } else if app.focus == Focus::Projects {
-            " ↑↓/jk: select | →/l/Enter: details | Tab: pane | p: pair | q: quit "
+            " ↑↓/jk: select | →/l/Enter: details | Tab: pane | s: settings | q: quit "
         } else if app.focus == Focus::Chat {
-            " ↓/j: prompt | m: model | Shift+j/k/↑↓: scroll | PgUp/PgDn: scroll | q: quit "
+            " ↓/j: prompt | m: model | Shift+j/k/↑↓: scroll | s: settings | q: quit "
         } else if app.focus == Focus::Model {
-            " Enter: choose model | k/↑: prompt | Tab: pane | q: quit "
+            " Enter: choose model | k/↑: prompt | Tab: pane | s: settings | q: quit "
         } else {
-            " ↓/j: model | ↑/k: chat | Enter/i: type | m: model | Tab: next | q: quit "
+            " ↓/j: model | ↑/k: chat | Enter/i: type | m: model | s: settings | q: quit "
         })
         .style(Style::default().fg(Color::DarkGray)),
         footer,
     );
+    if app.settings_open {
+        app.click_targets.clear();
+        settings_panel(frame, app);
+    }
     if app.models.open {
+        app.click_targets.clear();
         let [_, center, _] = Layout::vertical([
             Constraint::Percentage(15),
             Constraint::Percentage(70),
@@ -353,6 +362,106 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    let names = ["Diffs", "Code", "Files", "Terminal", "Git", "Side chat"];
+    let letters = ["D", "C", "F", "T", "G", "S"];
+    let [content, selector] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(letters[app.workspace_tab])
+            .centered()
+            .block(panel(
+                names[app.workspace_tab],
+                app.focus == Focus::Workspace,
+            )),
+        content,
+    );
+    app.click_targets
+        .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
+    let boxes = Layout::horizontal([Constraint::Ratio(1, 6); 6])
+        .spacing(1)
+        .split(selector);
+    for (index, rect) in boxes.iter().enumerate() {
+        app.click_targets
+            .push((*rect, crate::app::ClickTarget::Workspace(index)));
+        let selected = app.workspace_tab == index;
+        let available = rect.width.saturating_sub(4) as usize;
+        let label = if available >= names[index].len() {
+            names[index].to_owned()
+        } else if available > 2 {
+            format!(
+                "{}…",
+                names[index].chars().take(available - 1).collect::<String>()
+            )
+        } else {
+            names[index].chars().take(available).collect()
+        };
+        selector_box(
+            frame,
+            *rect,
+            &label,
+            selected,
+            app.workspace_highlight == index && app.focus == Focus::WorkspaceTabs,
+        );
+    }
+}
+
+fn settings_panel(frame: &mut Frame, app: &mut App) {
+    let [_, center, _] = Layout::vertical([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .areas(frame.area());
+    let [_, area, _] = Layout::horizontal([
+        Constraint::Percentage(10),
+        Constraint::Percentage(80),
+        Constraint::Percentage(10),
+    ])
+    .areas(center);
+    frame.render_widget(Clear, area);
+    let block = panel(" Settings ", true)
+        .title_bottom(" Esc/s: close ")
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [heading, selector, details] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new("Typing style"), heading);
+    let options = Layout::horizontal([Constraint::Ratio(1, 3); 3])
+        .spacing(1)
+        .split(selector);
+    use crate::preferences::TypingStyle;
+    for (style, option) in [TypingStyle::Regular, TypingStyle::Vim, TypingStyle::Helix]
+        .into_iter()
+        .zip(options.iter())
+    {
+        let selected = app.typing_style == style;
+        app.click_targets
+            .push((*option, crate::app::ClickTarget::TypingStyle(style)));
+        selector_box(
+            frame,
+            *option,
+            style.label(),
+            selected,
+            app.style_highlight == style,
+        );
+    }
+    let model = app
+        .current_model()
+        .map(|model| model.model.as_str())
+        .unwrap_or("No thread selected");
+    let content = format!(
+        "Left/Right or h/l: highlight; Enter: activate\nBlue outer outline: highlighted; green outline: active\nSaved automatically. Vim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}",
+        app.connection, model,
+    );
+    frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), details);
+}
+
 fn usage_panel(frame: &mut Frame, area: Rect, title: &str, app: &App, kind: &str) {
     let remaining = app
         .current_model()
@@ -405,6 +514,42 @@ fn usage_panel(frame: &mut Frame, area: Rect, title: &str, app: &App, kind: &str
     );
 }
 
+fn selector_box(frame: &mut Frame, area: Rect, label: &str, active: bool, highlighted: bool) {
+    let outer = Block::bordered()
+        .borders(if area.height <= 3 {
+            Borders::LEFT | Borders::RIGHT
+        } else {
+            Borders::ALL
+        })
+        .border_style(
+            Style::default()
+                .fg(if highlighted {
+                    Color::Blue
+                } else {
+                    Color::Black
+                })
+                .bg(Color::Black),
+        );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let block = Block::bordered().border_style(
+        Style::default()
+            .fg(if active {
+                Color::Green
+            } else {
+                Color::DarkGray
+            })
+            .bg(Color::Black),
+    );
+    frame.render_widget(
+        Paragraph::new(label)
+            .centered()
+            .block(block)
+            .style(Style::default().fg(Color::Gray).bg(Color::Black)),
+        inner,
+    );
+}
+
 fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered()
         .title(title)
@@ -419,6 +564,50 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn mouse_activates_rendered_selectors_and_settings_blocks_background_clicks() {
+        use crate::app::ClickTarget;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| matches!(target, ClickTarget::Workspace(3)))
+            .unwrap()
+            .0;
+        let click = |area: Rect| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        crate::input::handle_mouse(&mut app, click(area));
+        assert_eq!(app.workspace_tab, 3);
+        assert!(app.focus == Focus::WorkspaceTabs);
+        app.settings_open = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            app.click_targets
+                .iter()
+                .all(|(_, target)| matches!(target, ClickTarget::TypingStyle(_)))
+        );
+        let area = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| {
+                matches!(
+                    target,
+                    ClickTarget::TypingStyle(crate::preferences::TypingStyle::Helix)
+                )
+            })
+            .unwrap()
+            .0;
+        crate::input::handle_mouse(&mut app, click(area));
+        assert_eq!(app.typing_style, crate::preferences::TypingStyle::Helix);
+    }
 
     #[test]
     fn renders_compact_model_and_two_remaining_usage_boxes() {
@@ -437,7 +626,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()

@@ -10,16 +10,33 @@ pub struct ActivityNote {
     pub summary: String,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
     #[default]
     Projects,
     Chat,
     Composer,
     Model,
+    Workspace,
+    WorkspaceTabs,
+}
+
+#[derive(Clone, Copy)]
+pub enum ClickTarget {
+    Pane(Focus),
+    Workspace(usize),
+    TypingStyle(crate::preferences::TypingStyle),
 }
 
 pub struct App {
+    pub run_diffs: HashMap<String, crate::history::FileCounts>,
+    pub diff_requested: std::collections::HashSet<String>,
+    pub click_targets: Vec<(ratatui::layout::Rect, ClickTarget)>,
+    pub workspace_tab: usize,
+    pub workspace_highlight: usize,
+    pub style_highlight: crate::preferences::TypingStyle,
+    pub settings_open: bool,
+    pub typing_style: crate::preferences::TypingStyle,
     pub focus: Focus,
     pub models: crate::models::ModelPicker,
     pub usage: crate::usage::UsageState,
@@ -62,6 +79,14 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            run_diffs: HashMap::new(),
+            diff_requested: Default::default(),
+            click_targets: Vec::new(),
+            workspace_tab: 0,
+            workspace_highlight: 0,
+            style_highlight: crate::preferences::TypingStyle::default(),
+            settings_open: false,
+            typing_style: crate::preferences::TypingStyle::default(),
             focus: Focus::default(),
             models: crate::models::ModelPicker::default(),
             usage: crate::usage::UsageState::default(),
@@ -104,6 +129,28 @@ impl Default for App {
 }
 
 impl App {
+    fn apply_checkpoint(&mut self, checkpoint: crate::history::Checkpoint) {
+        if checkpoint.status != "ready" {
+            return;
+        }
+        if checkpoint
+            .files_total
+            .is_some_and(|total| total.count > checkpoint.files.len())
+        {
+            return;
+        }
+        if let Some(run) = checkpoint.run_id {
+            self.run_diffs.insert(
+                run.clone(),
+                checkpoint
+                    .files
+                    .into_iter()
+                    .map(|file| (file.path, (file.additions, file.deletions)))
+                    .collect(),
+            );
+            self.diff_requested.insert(run);
+        }
+    }
     fn record_activity(&mut self, id: String, summary: String) {
         if let Some(index) = self.activity.iter().position(|entry| entry.id == id) {
             self.activity.remove(index);
@@ -497,6 +544,8 @@ impl App {
         self.thinking_since = None;
         self.worked_duration = None;
         self.runs.clear();
+        self.run_diffs.clear();
+        self.diff_requested.clear();
         self.transcript = None;
         self.history_error = None;
         self.chat_scroll = 0;
@@ -531,6 +580,9 @@ impl App {
                     return;
                 }
                 self.live_model = projection.thread.model_selection;
+                for checkpoint in projection.checkpoints {
+                    self.apply_checkpoint(checkpoint);
+                }
                 self.runs = projection
                     .runs
                     .into_iter()
@@ -587,6 +639,11 @@ impl App {
                 }
                 self.history_sequence = Some(sequence);
                 match event.kind.as_str() {
+                    "checkpoint.captured" => {
+                        if let Ok(checkpoint) = serde_json::from_value(event.payload) {
+                            self.apply_checkpoint(checkpoint);
+                        }
+                    }
                     "turn-item.updated" => {
                         if let Ok(item) =
                             serde_json::from_value::<crate::history::Item>(event.payload)
@@ -839,16 +896,20 @@ impl App {
             Focus::Projects => Focus::Chat,
             Focus::Chat => Focus::Composer,
             Focus::Composer => Focus::Model,
-            Focus::Model => Focus::Projects,
+            Focus::Model => Focus::Workspace,
+            Focus::Workspace => Focus::WorkspaceTabs,
+            Focus::WorkspaceTabs => Focus::Projects,
         };
     }
 
     pub fn previous_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Projects => Focus::Model,
+            Focus::Projects => Focus::WorkspaceTabs,
             Focus::Chat => Focus::Projects,
             Focus::Composer => Focus::Chat,
             Focus::Model => Focus::Composer,
+            Focus::Workspace => Focus::Model,
+            Focus::WorkspaceTabs => Focus::Workspace,
         };
     }
 }
@@ -1027,6 +1088,29 @@ mod sending_tests {
 mod live_tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn snapshot_and_live_checkpoint_use_server_file_summaries() {
+        let mut app = App {
+            history_thread: Some("t1".into()),
+            ..Default::default()
+        };
+        let mut initial = snapshot(5);
+        initial["projection"]["checkpoints"] = json!([{
+            "runId":"r1", "status":"ready", "files":[
+                {"path":"src/main.rs","additions":2,"deletions":1}
+            ]
+        }]);
+        apply(&mut app, initial);
+        assert_eq!(app.run_diffs["r1"]["src/main.rs"], (2, 1));
+        apply(
+            &mut app,
+            json!({"kind":"event","sequence":6,"event":{
+                "type":"checkpoint.captured","payload":{"runId":"r1","status":"ready","files":[]}
+            }}),
+        );
+        assert!(app.run_diffs["r1"].is_empty());
+    }
 
     fn apply(app: &mut App, value: Value) {
         app.apply_live("t1", Ok(serde_json::from_value(value).unwrap()));

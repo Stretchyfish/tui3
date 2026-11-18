@@ -18,6 +18,8 @@ pub struct ProjectedItem {
 
 #[derive(Clone, Deserialize)]
 pub struct Item {
+    #[serde(rename = "fileName")]
+    pub file_name: Option<String>,
     #[serde(rename = "runId")]
     pub run_id: Option<String>,
     pub id: Option<String>,
@@ -84,6 +86,15 @@ impl Transcript {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn checkpoint_diff_counts_include_deleted_files_and_multiple_hunks() {
+        let counts = diff_counts(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n@@ -5 +5,2 @@\n same\n+extra\ndiff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
+        );
+        assert_eq!(counts.get("a.rs"), Some(&(2, 1)));
+        assert_eq!(counts.get("gone.rs"), Some(&(0, 1)));
+    }
+
     pub fn transcript(id: &str) -> Transcript {
         let json = r#"{"threadId":"ID","title":"Conversation","items":[
             {"position":3,"item":{"type":"assistant_message","text":"Hello, 世界!","streaming":true}},
@@ -128,19 +139,79 @@ pub enum LiveUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct Projection {
     #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default)]
     pub runs: Vec<Run>,
     pub thread: ThreadIdentity,
     pub visible_turn_items: Vec<ProjectedItem>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub files_total: Option<CheckpointTotals>,
+    pub run_id: Option<String>,
+    pub status: String,
+    pub files: Vec<CheckpointFile>,
+}
+
+#[derive(Deserialize)]
+pub struct CheckpointTotals {
+    pub count: usize,
+}
+
+#[derive(Deserialize)]
+pub struct CheckpointFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
+    pub ordinal: Option<u64>,
     pub id: String,
     pub status: String,
     pub requested_at: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+}
+
+pub type FileCounts = std::collections::BTreeMap<String, (u64, u64)>;
+
+pub fn diff_counts(diff: &str) -> FileCounts {
+    let mut files = FileCounts::new();
+    let mut old_path = None;
+    let mut path = None;
+    let mut hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            hunk = false;
+            path = None;
+        } else if !hunk && line.starts_with("--- ") {
+            old_path = Some(line[4..].trim_start_matches("a/").to_owned());
+        } else if !hunk && line.starts_with("+++ ") {
+            let name = line[4..].trim_start_matches("b/");
+            path = if name == "/dev/null" {
+                old_path.clone()
+            } else {
+                Some(name.to_owned())
+            };
+            if let Some(path) = &path {
+                files.entry(path.clone()).or_insert((0, 0));
+            }
+        } else if line.starts_with("@@ ") {
+            hunk = true;
+        } else if hunk && let Some(counts) = path.as_ref().and_then(|path| files.get_mut(path)) {
+            if line.starts_with('+') {
+                counts.0 += 1;
+            } else if line.starts_with('-') {
+                counts.1 += 1;
+            }
+        }
+    }
+    files
 }
 
 impl Run {

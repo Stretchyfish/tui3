@@ -26,6 +26,11 @@ pub struct Connection {
 }
 
 pub enum Update {
+    RunDiff {
+        thread_id: String,
+        run_id: String,
+        result: Result<crate::history::FileCounts, String>,
+    },
     Ready(Connection),
     Failed(String),
     Pairing(String),
@@ -602,6 +607,7 @@ impl T3Client {
 }
 
 pub struct Backend {
+    pub diffs: tokio::sync::mpsc::Sender<(String, String, u64)>,
     pub updates: mpsc::Receiver<Update>,
     pub pairing: tokio::sync::mpsc::Sender<()>,
     pub selected_thread: tokio::sync::watch::Sender<Option<String>>,
@@ -616,6 +622,32 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
     let history_sender = sender.clone();
     let (credentials, mut authorization) = tokio::sync::watch::channel::<Option<Config>>(None);
     let mut usage_authorization = authorization.clone();
+    let diff_auth = authorization.clone();
+    let diff_updates = sender.clone();
+    let (diffs, mut diff_requests) = tokio::sync::mpsc::channel::<(String, String, u64)>(32);
+    runtime.spawn(async move {
+        while let Some((thread_id, run_id, ordinal)) = diff_requests.recv().await {
+            let config = diff_auth.borrow().clone();
+            let result = match config.ok_or("Sign in to T3 first.".to_owned()).and_then(T3Client::new) {
+                Ok(client) => {
+                    let payload = serde_json::json!({
+                        "threadId":thread_id, "fromTurnCount":ordinal.saturating_sub(1), "toTurnCount":ordinal, "ignoreWhitespace": false
+                    });
+                    let mut response = client.rpc("orchestration.getTurnDiff", payload.clone()).await;
+                    for delay in [1, 2] {
+                        if response.is_ok() { break; }
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        response = client.rpc("orchestration.getTurnDiff", payload.clone()).await;
+                    }
+                    response.map_err(|error| error.message).and_then(|value| {
+                    value.get("diff").and_then(|diff| diff.as_str()).map(crate::history::diff_counts).ok_or("T3 returned no diff.".into())
+                    })
+                },
+                Err(error) => Err(error),
+            };
+            if diff_updates.send(Update::RunDiff { thread_id, run_id, result }).is_err() { break; }
+        }
+    });
     let usage_updates = sender.clone();
     runtime.spawn(async move {
         let mut delay = 1_u64;
@@ -771,6 +803,7 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         }
     });
     Backend {
+        diffs,
         updates: receiver,
         pairing: commands,
         selected_thread,
@@ -1083,6 +1116,56 @@ mod tests {
                 .any(|thread| thread.model_selection.is_some())
         );
         println!("Available configured models: {}", models.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running, paired local T3 server; read-only"]
+    async fn live_server_checkpoint_diff() {
+        let mut client = T3Client::new(Config::load().unwrap()).unwrap();
+        assert!(client.check().await.unwrap().authenticated);
+        let catalog = client.catalog().await.unwrap();
+        for thread in &catalog.threads {
+            let value = client
+                .rpc(
+                    "orchestration.getThreadProjection",
+                    serde_json::json!({"threadId":thread.id}),
+                )
+                .await
+                .unwrap();
+            let projection = value.get("projection").unwrap_or(&value);
+            let decoded: crate::history::Projection =
+                serde_json::from_value(projection.clone()).unwrap();
+            let ready = decoded
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.status == "ready")
+                .count();
+            println!("Decoded {ready} ready T3 checkpoint summaries");
+            let Some(runs) = projection.get("runs").and_then(|runs| runs.as_array()) else {
+                continue;
+            };
+            for run in runs
+                .iter()
+                .rev()
+                .filter(|run| run["status"] == "completed")
+                .take(10)
+            {
+                let Some(ordinal) = run["ordinal"].as_u64() else {
+                    continue;
+                };
+                if let Ok(value) = client.rpc("orchestration.getTurnDiff", serde_json::json!({
+                    "threadId":thread.id, "fromTurnCount":ordinal.saturating_sub(1), "toTurnCount":ordinal, "ignoreWhitespace":false
+                })).await {
+                    let diff = value["diff"].as_str().expect("server returns diff text");
+                    let counts = crate::history::diff_counts(diff);
+                    if !counts.is_empty() {
+                        println!("Read-only checkpoint diff: {} files with line counts", counts.len());
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("No nonempty completed checkpoint diff available for verification");
     }
 
     #[tokio::test]
