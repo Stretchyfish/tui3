@@ -23,6 +23,9 @@ pub enum Focus {
 
 #[derive(Clone, Copy)]
 pub enum ClickTarget {
+    StartupPrimary,
+    StartupClose,
+    AutoStart(bool),
     GitControl(usize),
     DiffBody,
     DiffFile(usize),
@@ -32,6 +35,10 @@ pub enum ClickTarget {
 }
 
 pub struct App {
+    pub startup: crate::startup::State,
+    pub auto_start_t3: bool,
+    pub auto_start_highlight: bool,
+    pub settings_row: usize,
     pub git: crate::git::GitState,
     pub chat_revision: u64,
     pub chat_cache: Option<(u64, Option<u64>, ratatui::text::Text<'static>)>,
@@ -80,6 +87,7 @@ pub struct App {
     pub send_notice: Option<String>,
     pub send_status: HashMap<String, String>,
     pub last_attempt: HashMap<String, SendRequest>,
+    pub previous_messages: HashMap<String, String>,
     pub draft_thread: Option<String>,
     pub drafts: HashMap<Option<String>, String>,
 }
@@ -87,6 +95,10 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            startup: Default::default(),
+            auto_start_t3: true,
+            auto_start_highlight: true,
+            settings_row: 0,
             git: Default::default(),
             chat_revision: 0,
             chat_cache: None,
@@ -135,6 +147,7 @@ impl Default for App {
             send_notice: None,
             send_status: HashMap::new(),
             last_attempt: HashMap::new(),
+            previous_messages: HashMap::new(),
             draft_thread: None,
             drafts: HashMap::new(),
         }
@@ -509,6 +522,12 @@ impl App {
             self.send_notice = Some("Thread selection changed. Please try again.".into());
             return None;
         }
+        self.previous_messages
+            .insert(id.clone(), self.draft.clone());
+        if self.usage_exhausted() {
+            self.send_notice = Some("Usage limit reached. When usage is available again, press r to resend the previous message.".into());
+            return None;
+        }
         let request = self
             .last_attempt
             .get(&id)
@@ -516,9 +535,42 @@ impl App {
             .cloned()
             .unwrap_or_else(|| SendRequest::new(id.clone(), self.draft.clone()));
         self.last_attempt.insert(id.clone(), request.clone());
+        self.previous_messages
+            .insert(id.clone(), request.text.clone());
         self.send_status.insert(id, "Sending…".into());
         self.send_pending = Some(request.clone());
         Some(request)
+    }
+
+    pub fn usage_exhausted(&self) -> bool {
+        let Some(model) = self.current_model() else {
+            return false;
+        };
+        ["session", "weekly"].into_iter().any(|kind| {
+            self.usage
+                .remaining(&model.instance_id, &model.model, kind)
+                .is_some_and(|remaining| remaining.percent <= 0.0)
+        })
+    }
+
+    pub fn retry_previous_message(&mut self) {
+        let Some(id) = self.selected_thread_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(message) = self.previous_messages.get(&id).cloned() else {
+            return;
+        };
+        if self.usage_exhausted() {
+            self.send_notice = Some("Usage limit reached. When usage is available again, press r to resend the previous message.".into());
+            return;
+        }
+        if self.draft.trim().is_empty() {
+            self.draft = message;
+            self.draft_cursor = self.draft.chars().count();
+            self.draft_thread = Some(id);
+        }
+        self.send_requested = true;
+        self.send_notice = None;
     }
 
     pub fn finish_send(
@@ -949,20 +1001,20 @@ impl App {
             Focus::Projects => Focus::Chat,
             Focus::Chat => Focus::Composer,
             Focus::Composer => Focus::Model,
-            Focus::Model => Focus::Workspace,
-            Focus::Workspace => Focus::WorkspaceTabs,
-            Focus::WorkspaceTabs => Focus::Projects,
+            Focus::Model => Focus::WorkspaceTabs,
+            Focus::WorkspaceTabs => Focus::Workspace,
+            Focus::Workspace => Focus::Projects,
         };
     }
 
     pub fn previous_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Projects => Focus::WorkspaceTabs,
+            Focus::Projects => Focus::Workspace,
             Focus::Chat => Focus::Projects,
             Focus::Composer => Focus::Chat,
             Focus::Model => Focus::Composer,
-            Focus::Workspace => Focus::Model,
-            Focus::WorkspaceTabs => Focus::Workspace,
+            Focus::Workspace => Focus::WorkspaceTabs,
+            Focus::WorkspaceTabs => Focus::Model,
         };
     }
 }

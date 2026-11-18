@@ -12,27 +12,78 @@ pub struct Viewport {
     heights: Vec<usize>,
 }
 
+fn prepared_line(line: &Line<'static>, width: u16) -> (Line<'static>, u16) {
+    let mut body = line.clone();
+    if let Some(first) = body.spans.first_mut()
+        && let Some(rest) = first
+            .content
+            .strip_prefix("│ ")
+            .or_else(|| first.content.strip_prefix('│'))
+    {
+        first.content = rest.to_owned().into();
+        return (body, width.min(2));
+    }
+    (body, 0)
+}
+
+fn wrapped_height(line: &Line<'static>, width: u16) -> usize {
+    use ratatui::widgets::{Paragraph, Wrap};
+    if width == 0 {
+        return 0;
+    }
+    let (body, gutter) = prepared_line(line, width);
+    if width <= gutter {
+        return 1;
+    }
+    Paragraph::new(Text::from(body))
+        .wrap(Wrap { trim: false })
+        .line_count(width - gutter)
+}
+
+fn render_lines(
+    buffer: &mut ratatui::buffer::Buffer,
+    content: &Text<'static>,
+    heights: &[usize],
+    start: usize,
+    mut row: usize,
+) {
+    use ratatui::{
+        layout::Rect,
+        widgets::{Paragraph, Widget, Wrap},
+    };
+    let width = buffer.area.width;
+    for (line, height) in content.lines[start..].iter().zip(&heights[start..]) {
+        if row >= buffer.area.height as usize {
+            break;
+        }
+        let height = (*height).min(buffer.area.height as usize - row) as u16;
+        let (body, gutter) = prepared_line(line, width);
+        let area = Rect::new(gutter, row as u16, width.saturating_sub(gutter), height);
+        Paragraph::new(Text::from(body))
+            .style(content.style)
+            .wrap(Wrap { trim: false })
+            .render(area, buffer);
+        if gutter > 0 {
+            let style = content.style.patch(line.style).patch(line.spans[0].style);
+            for y in row as u16..row as u16 + height {
+                buffer[(0, y)].set_symbol("│").set_style(style);
+            }
+        }
+        row += height as usize;
+    }
+}
+
 impl Viewport {
     pub fn new(content: Text<'static>, width: u16) -> Self {
-        use ratatui::widgets::{Paragraph, Widget, Wrap};
-        let paragraph = Paragraph::new(content.clone()).wrap(Wrap { trim: false });
-        let height = if width == 0 {
-            0
-        } else {
-            paragraph.line_count(width).min(u16::MAX as usize) as u16
-        };
-        let area = ratatui::layout::Rect::new(0, 0, width, height);
-        let mut buffer = ratatui::buffer::Buffer::empty(area);
-        paragraph.render(area, &mut buffer);
-        let heights = content
+        let heights: Vec<_> = content
             .lines
             .iter()
-            .map(|line| {
-                Paragraph::new(Text::from(line.clone()))
-                    .wrap(Wrap { trim: false })
-                    .line_count(width)
-            })
+            .map(|line| wrapped_height(line, width))
             .collect();
+        let height = heights.iter().sum::<usize>().min(u16::MAX as usize) as u16;
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        render_lines(&mut buffer, &content, &heights, 0, 0);
         Self {
             content,
             buffer,
@@ -41,7 +92,6 @@ impl Viewport {
     }
 
     pub fn update(&mut self, content: Text<'static>, width: u16) {
-        use ratatui::widgets::{Paragraph, Widget, Wrap};
         if self.buffer.area.width != width {
             *self = Self::new(content, width);
             return;
@@ -64,22 +114,17 @@ impl Viewport {
             .sum::<usize>()
             .min(u16::MAX as usize);
         self.heights.truncate(prefix);
-        self.heights
-            .extend(content.lines[prefix..].iter().map(|line| {
-                Paragraph::new(Text::from(line.clone()))
-                    .wrap(Wrap { trim: false })
-                    .line_count(width)
-            }));
+        self.heights.extend(
+            content.lines[prefix..]
+                .iter()
+                .map(|line| wrapped_height(line, width)),
+        );
         let height = self.heights.iter().sum::<usize>().min(u16::MAX as usize) as u16;
         self.buffer
             .resize(ratatui::layout::Rect::new(0, 0, width, height));
         let offset = (row * width as usize).min(self.buffer.content.len());
         self.buffer.content[offset..].fill(ratatui::buffer::Cell::EMPTY);
-        let area =
-            ratatui::layout::Rect::new(0, row as u16, width, height.saturating_sub(row as u16));
-        Paragraph::new(Text::from(content.lines[prefix..].to_vec()))
-            .wrap(Wrap { trim: false })
-            .render(area, &mut self.buffer);
+        render_lines(&mut self.buffer, &content, &self.heights, prefix, row);
         self.content = content;
     }
 }
@@ -301,6 +346,35 @@ pub fn notice(content: &mut Text<'static>, message: impl Into<String>, color: Co
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn message_gutter_continues_on_wrapped_rows_during_streaming_and_resize() {
+        use ratatui::{
+            style::{Color, Style},
+            text::{Line, Span, Text},
+        };
+        for color in [Color::Green, Color::Cyan] {
+            let text = |body: &str| {
+                Text::from(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(color)),
+                    Span::raw(body.to_owned()),
+                ]))
+            };
+            let mut viewport =
+                super::Viewport::new(text("A message that wraps across several rows."), 12);
+            for width in [12, 8, 20] {
+                viewport.update(
+                    text("A message that wraps across several rows. More streamed text."),
+                    width,
+                );
+                assert!(viewport.buffer.area.height > 1);
+                for row in 0..viewport.buffer.area.height {
+                    assert_eq!(viewport.buffer[(0, row)].symbol(), "│");
+                    assert_eq!(viewport.buffer[(0, row)].fg, color);
+                    assert_eq!(viewport.buffer[(1, row)].symbol(), " ");
+                }
+            }
+        }
+    }
     #[test]
     fn incremental_wrapping_matches_full_render_after_edits_and_resize() {
         use ratatui::text::Text;

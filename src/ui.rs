@@ -16,7 +16,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
     frame.render_widget(
-        Paragraph::new(format!(" tui3 | {}", app.connection)).bold(),
+        Paragraph::new(format!(
+            " tui3 | {} | {}",
+            app.connection, app.startup.event.message
+        ))
+        .bold(),
         header,
     );
     let [sidebar, main, workspace] = Layout::horizontal([
@@ -117,6 +121,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     app.chat_cache = Some((app.chat_revision, tick, text));
                 }
                 let mut text = app.chat_cache.as_ref().unwrap().2.clone();
+                if app.usage_exhausted()
+                    && app
+                        .selected_thread_id()
+                        .is_some_and(|id| app.previous_messages.contains_key(id))
+                {
+                    crate::chat::notice(
+                        &mut text,
+                        "Usage limit reached. When usage is available again, press r to resend the previous message.",
+                        Color::Yellow,
+                    );
+                }
                 if let Some(error) = error {
                     crate::chat::notice(
                         &mut text,
@@ -269,33 +284,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(current).block(model_block), model);
     usage_panel(frame, session, " Session left ", app, "session");
     usage_panel(frame, weekly, " Week left ", app, "weekly");
+    let footer_hint = if app.settings_open {
+        " SETTINGS | Esc/s: close | Ctrl+Q: quit "
+    } else if app.editing {
+        " TYPING | Enter: send | Alt+Enter: newline | Esc: navigate | Ctrl+Q: quit "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
+        " GIT | ↑↓/jk: control | Enter: open/confirm | Esc: cancel | r: refresh | Tab: pane "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.diff_view.file_focus {
+        " ↑↓/jk: file | ←/h/Enter: patch | [/]: run | Tab: pane "
+    } else if app.focus == Focus::Workspace {
+        " →/l: editor | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↑: tools "
+    } else if app.focus == Focus::WorkspaceTabs {
+        " ←→/hl: tabs | Enter: activate | ↓/j: panel "
+    } else if app.focus == Focus::Projects {
+        " ↑↓/jk: select | →/l/Enter: details | Tab: pane | s: settings | o: setup "
+    } else if app.focus == Focus::Chat {
+        " ↓/j: prompt | m: model | Shift+j/k/↑↓: scroll | s: settings "
+    } else if app.focus == Focus::Model {
+        " Enter: choose model | k/↑: prompt | Tab: pane | s: settings "
+    } else {
+        " ↓/j: model | ↑/k: chat | Enter/i: type | m: model | s: settings "
+    };
+    let [hint_area, shortcut_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(footer.width.min(52))])
+            .areas(footer);
     frame.render_widget(
-        Paragraph::new(if app.settings_open {
-            " SETTINGS | Esc/s: close | Ctrl+Q: quit "
-        } else if app.editing {
-            " TYPING | Enter: send | Alt+Enter: newline | Esc: navigate | Ctrl+Q: quit "
-        } else if app.focus == Focus::Workspace && app.workspace_tab == 4 {
-            " GIT | ↑↓/jk: control | Enter: open/confirm | Esc: cancel | r: refresh | Tab: pane "
-        } else if app.focus == Focus::Workspace
-            && app.workspace_tab == 0
-            && app.diff_view.file_focus
-        {
-            " ↑↓/jk: file | ←/h/Enter: patch | [/]: run | Tab: pane "
-        } else if app.focus == Focus::Workspace {
-            " →/l: files | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↓: tools "
-        } else if app.focus == Focus::WorkspaceTabs {
-            " ←→/hl: highlight | Enter: activate | ↑/k: panel | Tab: pane | q: quit "
-        } else if app.focus == Focus::Projects {
-            " ↑↓/jk: select | →/l/Enter: details | Tab: pane | s: settings | q: quit "
-        } else if app.focus == Focus::Chat {
-            " ↓/j: prompt | m: model | Shift+j/k/↑↓: scroll | s: settings | q: quit "
-        } else if app.focus == Focus::Model {
-            " Enter: choose model | k/↑: prompt | Tab: pane | s: settings | q: quit "
-        } else {
-            " ↓/j: model | ↑/k: chat | Enter/i: type | m: model | s: settings | q: quit "
-        })
-        .style(Style::default().fg(Color::DarkGray)),
-        footer,
+        Paragraph::new(footer_hint).style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
+    frame.render_widget(
+        Paragraph::new("D Diff e Editor t Term g Git c Chat | q Quit")
+            .right_aligned()
+            .style(Style::default().fg(Color::DarkGray)),
+        shortcut_area,
     );
     if app.settings_open {
         app.click_targets.clear();
@@ -363,18 +384,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
         }
     }
+    if app.startup.open {
+        app.click_targets.clear();
+        crate::startup::draw(frame, app);
+    }
 }
 
 fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
-    let names = ["Diffs", "Code", "Files", "Terminal", "Git", "Side chat"];
-    let letters = ["D", "C", "F", "T", "G", "S"];
-    let [content, selector] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+    app.click_targets
+        .push((area, crate::app::ClickTarget::Pane(Focus::Workspace)));
+    let names = ["Diffs", "Editor", "Terminal", "Git", "Side chat"];
+    let letters = ["D", "E", "t", "g", "c"];
+    let frame_block = panel(
+        " Workspace ",
+        matches!(app.focus, Focus::Workspace | Focus::WorkspaceTabs),
+    );
+    let inside = frame_block.inner(area);
+    frame.render_widget(frame_block, area);
+    let [selector, content] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(inside);
     app.click_targets
         .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
     if app.workspace_tab == 0 {
         crate::diff::draw(frame, app, content);
-    } else if app.workspace_tab == 4 {
+    } else if app.workspace_tab == 3 {
         crate::git::draw(frame, app, content);
     } else {
         frame.render_widget(
@@ -387,31 +420,94 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             content,
         );
     }
-    let boxes = Layout::horizontal([Constraint::Ratio(1, 6); 6])
-        .spacing(1)
-        .split(selector);
+    let boxes = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(selector);
     for (index, rect) in boxes.iter().enumerate() {
         app.click_targets
             .push((*rect, crate::app::ClickTarget::Workspace(index)));
         let selected = app.workspace_tab == index;
-        let available = rect.width.saturating_sub(4) as usize;
-        let label = if available >= names[index].len() {
-            names[index].to_owned()
-        } else if available > 2 {
-            format!(
-                "{}…",
-                names[index].chars().take(available - 1).collect::<String>()
-            )
-        } else {
-            names[index].chars().take(available).collect()
-        };
-        selector_box(
+        draw_workspace_tab(
             frame,
             *rect,
-            &label,
+            names[index],
             selected,
             app.workspace_highlight == index && app.focus == Focus::WorkspaceTabs,
+            index,
+            boxes.len(),
         );
+    }
+}
+
+fn draw_workspace_tab(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    active: bool,
+    highlighted: bool,
+    index: usize,
+    count: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    let border = if highlighted {
+        Color::Blue
+    } else if active {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let first = index == 0;
+    let last = index + 1 == count;
+    let top_style = Style::default().fg(border);
+    buffer.set_string(area.x, area.y, if first { "╭" } else { "┬" }, top_style);
+    for x in area.x.saturating_add(1)..area.x.saturating_add(area.width).saturating_sub(1) {
+        buffer[(x, area.y)].set_char('─').set_style(top_style);
+    }
+    if area.width > 1 {
+        buffer.set_string(
+            area.x + area.width - 1,
+            area.y,
+            if last { "╮" } else { "┬" },
+            top_style,
+        );
+    }
+    if area.height > 1 {
+        let y = area.y + 1;
+        buffer.set_string(area.x, y, "│", top_style);
+        if area.width > 1 {
+            buffer.set_string(area.x + area.width - 1, y, "│", top_style);
+        }
+        let available = area.width.saturating_sub(2) as usize;
+        let label = if name.chars().count() > available {
+            name.chars().take(available).collect::<String>()
+        } else {
+            name.to_owned()
+        };
+        let label_width = label.chars().count() as u16;
+        let x = area.x + 1 + area.width.saturating_sub(2 + label_width) / 2;
+        if available > 0 {
+            buffer.set_string(
+                x,
+                y,
+                label,
+                Style::default()
+                    .fg(if active { Color::Green } else { Color::Gray })
+                    .bold(),
+            );
+        }
+    }
+    if area.height > 2 && !active {
+        let y = area.y + area.height - 1;
+        let left = if first { "╰" } else { "┴" };
+        let right = if last { "╯" } else { "┴" };
+        buffer.set_string(area.x, y, left, top_style);
+        for x in area.x.saturating_add(1)..area.x.saturating_add(area.width).saturating_sub(1) {
+            buffer[(x, y)].set_char('─').set_style(top_style);
+        }
+        if area.width > 1 {
+            buffer.set_string(area.x + area.width - 1, y, right, top_style);
+        }
     }
 }
 
@@ -434,9 +530,17 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         .style(Style::default().bg(Color::Black).fg(Color::White));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [heading, selector, details] = Layout::vertical([
+    let [
+        heading,
+        selector,
+        startup_heading,
+        startup_selector,
+        details,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(5),
+        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Min(0),
     ])
     .areas(inner);
@@ -457,15 +561,33 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
             *option,
             style.label(),
             selected,
-            app.style_highlight == style,
+            app.settings_row == 0 && app.style_highlight == style,
         );
+    }
+    frame.render_widget(
+        Paragraph::new("Start T3 when tui3 launches"),
+        startup_heading,
+    );
+    let options = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+        .spacing(1)
+        .split(startup_selector);
+    for (index, value) in [true, false].into_iter().enumerate() {
+        selector_box(
+            frame,
+            options[index],
+            if value { "On" } else { "Off" },
+            app.auto_start_t3 == value,
+            app.settings_row == 1 && app.auto_start_highlight == value,
+        );
+        app.click_targets
+            .push((options[index], crate::app::ClickTarget::AutoStart(value)));
     }
     let model = app
         .current_model()
         .map(|model| model.model.as_str())
         .unwrap_or("No thread selected");
     let content = format!(
-        "Left/Right or h/l: highlight; Enter: activate\nBlue outer outline: highlighted; green outline: active\nSaved automatically. Vim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}",
+        "↑↓/jk: setting · ←→/hl: highlight · Enter: apply\nBlue: highlighted; green: active. Saved automatically.\nVim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}",
         app.connection, model,
     );
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), details);
@@ -573,6 +695,36 @@ pub(crate) fn panel(title: &str, focused: bool) -> Block<'_> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn workspace_tabs_are_above_content_inside_a_named_frame() {
+        use crate::app::ClickTarget;
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tabs = app
+            .click_targets
+            .iter()
+            .find_map(|(rect, target)| matches!(target, ClickTarget::Workspace(0)).then_some(*rect))
+            .unwrap();
+        let content = app
+            .click_targets
+            .iter()
+            .filter_map(|(rect, target)| {
+                matches!(target, ClickTarget::Pane(Focus::Workspace)).then_some(*rect)
+            })
+            .min_by_key(|rect| rect.height)
+            .unwrap();
+        assert!(tabs.y + tabs.height <= content.y);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Workspace") && text.contains("Diffs"));
+    }
 
     #[test]
     #[ignore = "performance benchmark; run with --release --ignored --nocapture"]
@@ -692,11 +844,10 @@ mod tests {
         assert!(app.focus == Focus::WorkspaceTabs);
         app.settings_open = true;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(
-            app.click_targets
-                .iter()
-                .all(|(_, target)| matches!(target, ClickTarget::TypingStyle(_)))
-        );
+        assert!(app.click_targets.iter().all(|(_, target)| matches!(
+            target,
+            ClickTarget::TypingStyle(_) | ClickTarget::AutoStart(_)
+        )));
         let area = app
             .click_targets
             .iter()

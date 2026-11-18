@@ -24,6 +24,7 @@
 - [x] Remember the last selected project/thread for each T3 environment and restore it on startup.
 - [x] Compact the model selector and add live session/weekly usage-remaining circles beside it.
 - [x] Distinguish user and agent messages with labeled, colored message blocks and clearer spacing.
+- [x] Preserve speaker-colored borders on every wrapped message line, including streaming updates and terminal resizing.
 - [x] Show when the agent is thinking and how long the current run has been active.
 - [x] Display the live working duration as gray text above the green AGENT header.
 - [x] Keep working until T3 reports the run has ended, and show its duration once above the final AGENT message header.
@@ -39,7 +40,18 @@
 - [x] Jump between word starts with Ctrl+Left/Right while typing in the Message box.
 - [x] Keep draft wrapping, cursor placement, and scrolling consistent; delete Unicode graphemes and normalize pasted control characters.
 - [x] Show send status only in the Message box, removing its duplicate in the chat.
+- [x] Show a chat notice when reported usage is exhausted and allow `r` to resend the previous message after usage returns.
 - [x] Keep the thread title in the Chat header without repeating it in the Message header.
+
+## Launch and first-time setup
+
+- [x] Check for a running T3 server when tui3 launches and reuse it when available.
+- [x] Save a default-on "Start T3 when tui3 launches" setting; this does not install an operating-system boot service.
+- [x] Match launch-setting navigation to its box order: Left/h highlights On; Right/l highlights Off.
+- [x] Start a missing local server asynchronously through `t3 serve`, with visible progress and failures; never start a local replacement for remote URLs or occupied ports.
+- [x] Offer an explicit official T3 CLI installation in a setup dialog when missing, then start the server and offer local pairing.
+- [x] Discover newly installed CLIs outside PATH and retry connection discovery after setup creates a runtime file.
+- [x] Support setup reopening with o, keyboard/mouse controls, error/retry states, and dismissal without installing.
 
 ## Right-side workspace panel
 
@@ -50,17 +62,19 @@ between workspace tools. Build each feature incrementally.
 ### Panel foundation
 
 - [ ] Inspect T3 Code's supported workspace, diff, terminal, Git, and conversation operations before choosing integration details.
-- [x] Add a focusable right-side panel with a boxed selector for Diffs, Code, Files, Terminal, Git, and Side chat, initially displaying letter placeholders.
-- [x] Support moving down from the panel to its selector and switching tools with Left/Right or h/l.
+- [x] Add a focusable right-side panel with a connected top tab strip for Diffs, Editor, Terminal, Git, and Side chat.
+- [x] Place tool selection at the top inside a shared Workspace frame; Up/k reaches the selector and Down/j returns to content.
+- [x] Add case-sensitive navigation shortcuts: D Diffs, e Editor, t Terminal, g Git, c Side chat; show them in the footer and preserve text entry and modal controls.
+- [x] Combine the Code and Files workspace tabs into one Editor tab opened with `e`.
 - [x] Move Right/l from the message panel to the workspace panel; Down/j still focuses the model selector.
-- [x] Keep all six workspace selector boxes in one horizontal row, progressively shortening names to fit the terminal width.
-- [x] Compact the workspace selector to three rows, retaining separate active and focus outlines.
+- [x] Keep all five workspace selector boxes in one horizontal row, progressively shortening names to fit the terminal width.
+- [x] Style workspace tabs as a connected strip, with the active tab open into the workspace and keyboard focus marked in blue.
 - [x] Allow mouse clicks to focus panes and activate workspace/settings selector boxes.
 - [x] Use click-only mouse tracking and drain unused mouse events to prevent input lag.
 - [x] Scroll the chat with the mouse wheel while hovering over it, preserving typing focus and auto-follow behavior.
 - [x] Distinguish highlighted choices from active choices in workspace and settings selectors; Enter/Space activates the highlighted choice.
 - [x] Mark active selectors with a green outline and keyboard focus with a separate blue outer outline in Settings and the workspace panel.
-- [ ] Add keyboard navigation between the sidebar, main conversation, and workspace panel, plus tab switching within the panel.
+- [x] Add keyboard navigation between the sidebar, main conversation, and workspace panel, plus tab switching within the panel.
 - [ ] Allow showing, hiding, and resizing the panel; handle narrow terminals.
 - [ ] Bind workspace tools to the selected project's/thread's actual workspace or worktree.
 - [ ] Show loading, empty, unavailable, and error states for each tool.
@@ -94,6 +108,7 @@ between workspace tools. Build each feature incrementally.
 - [x] Show repository status, current branch, ahead/behind counts, and changed files.
 - [x] Choose local branches and commit all changes with a message or push, with confirmations and asynchronous progress/error handling.
 - [x] Generate an editable AI commit subject/body from T3's actual working-tree diff using the installed Codex CLI, preserving drafts on failure.
+- [ ] Revisit commit-message generation to make the flow smoother and support other providers, ideally using T3's configured source-control writer.
 - [x] Extend local pairing for filesystem reads and Git writes, with p in Git to refresh older sessions.
 - [ ] Distinguish staged and unstaged changes if supported by the chosen T3 interface.
 - [ ] Open Git changes in the diff view.

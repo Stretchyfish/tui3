@@ -19,7 +19,11 @@ struct SavedSession {
 pub fn session_path() -> Result<PathBuf, String> {
     let root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
         .ok_or("Cannot locate config directory for saving the pairing session.")?;
     Ok(root.join("tui3/session.json"))
 }
@@ -64,7 +68,14 @@ pub fn save(path: &Path, origin: &Url, environment_id: &str, token: &str) -> Res
 pub fn local_state_dir() -> Option<PathBuf> {
     std::env::var_os("T3_STATE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3/userdata")))
+        .or_else(|| {
+            std::env::var_os("T3CODE_HOME").map(|base| PathBuf::from(base).join("userdata"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".t3/userdata"))
+        })
 }
 
 fn validate_target(state: &Path, origin: &Url) -> Result<PathBuf, String> {
@@ -106,7 +117,9 @@ fn parse_credential(output: &[u8]) -> Result<String, String> {
 pub async fn local_credential(origin: &Url) -> Result<String, String> {
     let state = local_state_dir().ok_or("Cannot find local T3 state directory.")?;
     let base = validate_target(&state, origin)?;
-    let mut command = tokio::process::Command::new("t3");
+    let cli =
+        crate::startup::cli_path().ok_or("T3 CLI is not installed. Press o to open setup.")?;
+    let mut command = tokio::process::Command::new(cli);
     command
         .args([
             "pair",

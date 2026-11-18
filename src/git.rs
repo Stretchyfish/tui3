@@ -175,7 +175,7 @@ pub fn sync(app: &mut App) {
             ..Default::default()
         };
     }
-    if app.workspace_tab == 4
+    if app.workspace_tab == 3
         && app.authenticated
         && app.git.pending.is_none()
         && !app.git.editing
@@ -263,9 +263,9 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Left | KeyCode::Char('h') if git.row == 4 => git.row = 1,
         KeyCode::Up | KeyCode::Char('k') if git.row == 4 => git.row = 0,
         KeyCode::Down | KeyCode::Char('j') if git.row == 4 => git.row = 2,
-        KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
+        KeyCode::Char('G') => git.queue(Operation::Generate(git.message.clone())),
         KeyCode::Char('r') => git.queue(Operation::Refresh),
-        KeyCode::Up | KeyCode::Char('k') => git.row = git.row.saturating_sub(1),
+        KeyCode::Up | KeyCode::Char('k') if git.row > 0 => git.row = git.row.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') if git.row < 3 => git.row += 1,
         KeyCode::Enter => {
             if !git
@@ -479,7 +479,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::Cyan),
     ));
     lines.push(Line::from(
-        "↑↓/jk: select · Enter: open · g: generate · r: refresh",
+        "↑↓/jk: select · Enter: open · G: generate · r: refresh",
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -508,7 +508,7 @@ pub(crate) mod tests {
     fn generating_a_message_only_refreshes_and_preserves_concurrent_edits() {
         let mut app = ready();
         app.git.message = "Previous draft".into();
-        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('G'));
         let request = app.git.request.take().unwrap();
         assert!(matches!(request.operation, Operation::Generate(_)));
         assert!(request.payload().get("action").is_none());
@@ -522,7 +522,7 @@ pub(crate) mod tests {
         );
         assert_eq!(app.git.message, "Add word navigation to the composer");
         assert!(app.git.confirm.is_none());
-        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('G'));
         let request = app.git.request.take().unwrap();
         app.git.message = "My newer draft".into();
         app.git.finish(

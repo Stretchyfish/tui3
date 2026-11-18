@@ -38,12 +38,26 @@ pub struct Location {
     pub thread_id: Option<String>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Preferences {
+    #[serde(default = "enabled")]
+    auto_start_t3: bool,
     #[serde(default)]
     typing_style: TypingStyle,
     #[serde(default)]
     locations: BTreeMap<String, Location>,
+}
+fn enabled() -> bool {
+    true
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            auto_start_t3: true,
+            typing_style: Default::default(),
+            locations: Default::default(),
+        }
+    }
 }
 
 pub struct ResumeStore {
@@ -55,6 +69,9 @@ pub struct ResumeStore {
 }
 
 impl ResumeStore {
+    pub fn auto_start_t3(&self) -> bool {
+        self.preferences.auto_start_t3
+    }
     pub fn typing_style(&self) -> TypingStyle {
         self.preferences.typing_style
     }
@@ -91,6 +108,11 @@ impl ResumeStore {
     }
 
     pub fn remember(&mut self, app: &crate::app::App) {
+        if self.preferences.auto_start_t3 != app.auto_start_t3 {
+            self.preferences.auto_start_t3 = app.auto_start_t3;
+            self.dirty = true;
+            self.flush();
+        }
         if self.preferences.typing_style != app.typing_style {
             self.preferences.typing_style = app.typing_style;
             self.dirty = true;
@@ -159,6 +181,22 @@ impl ResumeStore {
 mod tests {
     use super::*;
     use crate::{app::App, catalog::Selection};
+
+    #[test]
+    fn auto_start_defaults_on_for_new_and_old_preferences_and_saves_off_without_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ui-state.json");
+        let mut store = ResumeStore::at(Some(path.clone()));
+        assert!(store.auto_start_t3());
+        std::fs::write(&path, r#"{"locations":{}}"#).unwrap();
+        assert!(ResumeStore::at(Some(path.clone())).auto_start_t3());
+        let app = App {
+            auto_start_t3: false,
+            ..Default::default()
+        };
+        store.remember(&app);
+        assert!(!ResumeStore::at(Some(path)).auto_start_t3());
+    }
 
     #[test]
     fn typing_style_is_saved_without_a_server_connection() {

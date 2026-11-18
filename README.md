@@ -19,16 +19,20 @@ Clicking a typing-style box activates and saves it immediately.
 
 ## Workspace panel
 
-The right-side workspace panel includes Diffs and Git tools. Code (C), Files (F),
-Terminal (T), and Side chat (S) currently show letter placeholders.
+The right-side workspace panel includes Diffs, an Editor, and Git tools. The Editor,
+Terminal (t), and Side chat (c) currently show letter placeholders.
 From chat or the message panel in navigation mode, press Right or `l` to focus it.
-Down or `j` in the workspace panel focuses the boxed tool selector
-underneath; all six boxes stay on one row, progressively shortening their names as
+The tool selector sits at the top inside a shared **Workspace** frame, whose title
+names the active tool. Up or `k` at the top of a file/control list (or from the patch)
+focuses this selector. All five boxes stay on one row, progressively shortening their names as
 space shrinks and showing full names when they fit.
 Left/Right or `h/l` moves the blue outer outline; Enter or Space activates the tool,
-shown with a green inner outline. Up or `k` returns to the
+shown with a green inner outline. Down or `j` returns to the
 panel, then Left or `h` returns to chat. Tab/Shift+Tab also cycle through these panes.
 You can also click panes to focus them, or click a tool box to activate it directly.
+Navigation-mode shortcuts open and focus a tool directly: `d` or `D` Diffs, `e` Editor,
+`t` Terminal, `g` Git, and `c` Side chat. These are case-sensitive and
+do not intercept text input, settings, pickers, or confirmations.
 Clicking the message box highlights it; Enter or `i` still starts typing.
 
 The Diffs tab shows the latest completed run's checkpoint patch from T3, with green
@@ -36,12 +40,12 @@ additions, red deletions, and yellow hunk headers. While focused on the panel, u
 `[`/`]` to browse completed runs. A full-height file list stays visible to the right of the
 selected file's patch. Use Up/Down, `j/k`, or the wheel over the list to select a file.
 Left/`h` or Enter focuses the patch; Right/`l` returns to the file list. Clicking
-either side focuses it. `f` or Esc also returns from the patch to the list.
+either side focuses it. Esc also returns from the patch to the list.
 Line counts appear beside files when space permits and above the selected patch.
 Long paths shorten from the left to keep the filename visible.
 Use Page Up/Down or Shift+Up/Down to scroll,
 Home/End to jump, and Shift+Left/Right to pan long lines. The mouse wheel scrolls
-when hovering over the viewer. Down/`j` still focuses the tool selector.
+when hovering over the viewer. Up/`k` focuses the tool selector from the patch.
 Diff loading runs in the background. Empty diffs and unavailable checkpoints have
 explicit states; `r` retries a failed fetch. These are per-run diffs, not current
 uncommitted Git changes. Editing remains planned.
@@ -68,7 +72,7 @@ Use Up/Down or `j/k` to highlight a control and Enter to open it:
 
 - **Branch:** choose a local branch with Up/Down, then Enter to review the switch.
 - **Commit message:** type a message; Enter or Esc finishes text entry.
-- **Generate:** click the button beside the message, press `g`, or highlight it
+- **Generate:** click the button beside the message, press `G`, or highlight it
   with Right/`l` from the message field and press Enter. It refreshes T3's file list
   and generates an AI subject/body from the actual working-tree diff fetched through
   T3. Generation uses the installed, signed-in `codex` CLI in an ephemeral read-only
@@ -89,8 +93,31 @@ repository before retrying. Branch creation and individual staging are future wo
 
 ## Connecting to T3
 
-Start T3 Code, then launch tui3. By default, tui3 reads the server origin from
-`~/.t3/userdata/server-runtime.json`. Set `T3_STATE_DIR` for another state directory,
+On each **tui3 launch**, the app checks whether T3 is running and reuses it if it is.
+If a local CLI is installed but its server is stopped, tui3 starts `t3 serve` in the
+background, bound to loopback, and explains its progress in the setup dialog.
+**Start T3 when tui3 launches** defaults to On in Settings. Use Up/Down to select
+that setting, Left/Right to highlight On/Off, and Enter to save. Turning it off
+offers manual startup instead. This setting does not create an OS boot service.
+
+When the local CLI is missing, the dialog offers **Install & set up**. Installation
+only begins when you select that button; closing the offer installs nothing.
+It downloads T3's official installer from `https://t3.codes`, runs it for your user,
+starts the server, and offers **Connect / pair** without token copying. It also
+finds `~/.local/bin/t3` when that directory is not yet on PATH. Provider login and
+configuration remain in T3 Code. Installer prerequisites and supported platforms
+are described in [T3's installation guide](https://github.com/pingdotgg/t3code/blob/main/docs/user/install.md).
+
+Press `o` in navigation mode to reopen setup. The dialog supports keyboard and mouse
+input and reports download, installation, startup, and readiness failures. Closing
+a progress dialog does not cancel its background task. Servers started by tui3
+keep running after tui3 exits so other T3 clients can continue using them.
+Remote server URLs are checked but are never started or installed locally. An
+unrelated listener on the configured local port is reported instead of replaced.
+
+You can also start T3 Code yourself before launching tui3. By default, tui3 reads the server origin from
+`~/.t3/userdata/server-runtime.json`. Set `T3CODE_HOME` for another T3 home, or
+`T3_STATE_DIR` for its state directory (ending in `userdata` for local startup/pairing),
 or set `T3_SERVER_URL` to an explicit HTTP(S) origin:
 
 ```sh
@@ -275,6 +302,9 @@ Where applicable, model-specific limits are combined with the general allowance.
 Missing or unsupported windows show **N/A**. Disconnected or failed-probe data is
 marked **stale**; known account data is retained while reconnecting. Signing out or
 switching accounts clears unrelated usage data. No usage is estimated from messages.
+When the selected model's reported session or weekly allowance reaches zero, the chat
+shows a usage-limit notice. After usage refreshes, press `r` in the chat to resend the
+previous message.
 
 ## Checks
 

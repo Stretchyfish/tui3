@@ -46,6 +46,13 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         return;
     }
     match target {
+        Some(ClickTarget::StartupPrimary) => crate::startup::activate(app),
+        Some(ClickTarget::StartupClose) => app.startup.open = false,
+        Some(ClickTarget::AutoStart(value)) => {
+            app.settings_row = 1;
+            app.auto_start_t3 = value;
+            app.auto_start_highlight = value;
+        }
         Some(ClickTarget::GitControl(index)) => {
             app.editing = false;
             app.focus = Focus::Workspace;
@@ -79,6 +86,7 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.workspace_tab = index;
         }
         Some(ClickTarget::TypingStyle(style)) => {
+            app.settings_row = 0;
             app.style_highlight = style;
             app.typing_style = style;
         }
@@ -102,8 +110,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    if app.startup.open {
+        match key.code {
+            KeyCode::Enter if key.kind != KeyEventKind::Repeat => crate::startup::activate(app),
+            KeyCode::Esc => app.startup.open = false,
+            KeyCode::Char('q') => app.quit = true,
+            KeyCode::Char('s') => {
+                app.startup.open = false;
+                app.settings_open = true;
+                app.auto_start_highlight = app.auto_start_t3;
+                app.style_highlight = app.typing_style;
+            }
+            _ => (),
+        }
+        return;
+    }
     if app.settings_open {
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.settings_row = 0,
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = 1,
+            KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
+                app.auto_start_highlight = false
+            }
+            KeyCode::Left | KeyCode::Char('h') if app.settings_row == 1 => {
+                app.auto_start_highlight = true
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 1 => {
+                app.auto_start_t3 = app.auto_start_highlight
+            }
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
                 app.style_highlight = app.style_highlight.cycle(true);
@@ -131,7 +165,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    if app.focus == Focus::Workspace && app.workspace_tab == 4 && crate::git::key(app, key) {
+    let git_modal = app.focus == Focus::Workspace
+        && app.workspace_tab == 3
+        && (app.git.editing || app.git.picking || app.git.confirm.is_some());
+    if git_modal && crate::git::key(app, key) {
+        return;
+    }
+    if !app.editing
+        && let KeyCode::Char(mut ch) = key.code
+    {
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            ch = ch.to_ascii_uppercase();
+        }
+        if let Some(index) = match ch {
+            'd' | 'D' => Some(0),
+            'e' | 'E' => Some(1),
+            't' => Some(2),
+            'g' => Some(3),
+            'c' => Some(4),
+            _ => None,
+        } {
+            app.workspace_tab = index;
+            app.workspace_highlight = index;
+            app.focus = Focus::Workspace;
+            return;
+        }
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 3 && crate::git::key(app, key) {
         return;
     }
     if app.editing {
@@ -174,7 +234,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.diff_view.move_file(&app.runs, false);
+                    if app.diff_view.file == 0 {
+                        app.focus = Focus::WorkspaceTabs;
+                    } else {
+                        app.diff_view.move_file(&app.runs, false);
+                    }
                     return;
                 }
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
@@ -189,10 +253,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 if !app.diff_view.file_focus && !key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 app.diff_view.file_focus = true;
-                return;
-            }
-            KeyCode::Char('f') => {
-                app.diff_view.file_focus = !app.diff_view.file_focus;
                 return;
             }
             KeyCode::Esc => {
@@ -248,27 +308,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
     match key.code {
+        KeyCode::Char('r') if !app.editing && app.focus == Focus::Chat => {
+            app.retry_previous_message();
+        }
         KeyCode::Char('s') => {
+            app.settings_row = 0;
+            app.auto_start_highlight = app.auto_start_t3;
             app.style_highlight = app.typing_style;
             app.settings_open = true;
         }
+        KeyCode::Char('o') => app.startup.open = true,
         KeyCode::Char('m') => app.focus = Focus::Model,
         KeyCode::Right | KeyCode::Char('l')
             if app.focus == Focus::Chat || app.focus == Focus::Model =>
         {
             app.focus = Focus::Workspace;
         }
-        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Workspace => {
+        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::Workspace => {
             app.focus = Focus::WorkspaceTabs;
         }
-        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::WorkspaceTabs => {
+        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::WorkspaceTabs => {
             app.focus = Focus::Workspace;
         }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::WorkspaceTabs => {
-            app.workspace_highlight = (app.workspace_highlight + 1) % 6;
+            app.workspace_highlight = (app.workspace_highlight + 1) % 5;
         }
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::WorkspaceTabs => {
-            app.workspace_highlight = (app.workspace_highlight + 5) % 6;
+            app.workspace_highlight = (app.workspace_highlight + 4) % 5;
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.focus == Focus::WorkspaceTabs => {
             app.workspace_tab = app.workspace_highlight;
@@ -349,6 +415,83 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_hotkeys_are_case_sensitive_and_do_not_intercept_text_inputs() {
+        let mut app = App::default();
+        for (ch, index) in [
+            ('d', 0),
+            ('D', 0),
+            ('e', 1),
+            ('E', 1),
+            ('t', 2),
+            ('g', 3),
+            ('c', 4),
+        ] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+            assert_eq!(app.workspace_tab, index);
+            assert_eq!(app.workspace_highlight, index);
+            assert!(app.focus == Focus::Workspace);
+        }
+        app.focus = Focus::Composer;
+        app.editing = true;
+        for ch in "DCftgc".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.draft, "DCftgc");
+        assert!(app.focus == Focus::Composer);
+        app.editing = false;
+        app.focus = Focus::Workspace;
+        app.workspace_tab = 3;
+        app.git.editing = true;
+        for ch in "DCftgc".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.git.message, "DCftgc");
+        assert_eq!(app.workspace_tab, 3);
+    }
+
+    #[test]
+    fn setup_requires_explicit_install_and_settings_confirm_auto_start_changes() {
+        let mut app = App::default();
+        app.startup.open = true;
+        app.startup.event = crate::startup::Event {
+            message: "Missing".into(),
+            detail: String::new(),
+            offer: crate::startup::Offer::Install,
+            busy: false,
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.startup.request.is_none());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!app.auto_start_highlight);
+        assert!(app.auto_start_t3);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.auto_start_t3);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.auto_start_highlight);
+        app.settings_open = false;
+        app.startup.open = true;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.startup.request,
+            Some(crate::startup::Command::Install)
+        ));
+    }
 
     #[test]
     fn arrows_move_between_diff_and_persistent_file_list() {
@@ -465,23 +608,23 @@ mod tests {
         };
         handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert!(app.focus == Focus::Workspace);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert!(app.focus == Focus::WorkspaceTabs);
-        for index in 1..=6 {
+        for index in 1..=5 {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
             );
-            assert_eq!(app.workspace_highlight, index % 6);
+            assert_eq!(app.workspace_highlight, index % 5);
             assert_eq!(app.workspace_tab, 0);
         }
         handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.workspace_highlight, 5);
+        assert_eq!(app.workspace_highlight, 4);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.workspace_tab, 5);
+        assert_eq!(app.workspace_tab, 4);
         assert!(!app.editing);
         assert!(app.draft.is_empty());
-        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(app.focus == Focus::Chat);
     }

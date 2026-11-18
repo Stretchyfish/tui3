@@ -11,6 +11,7 @@ mod message;
 mod models;
 mod pairing;
 mod preferences;
+mod startup;
 mod t3;
 mod ui;
 mod usage;
@@ -26,8 +27,9 @@ use std::{io, time::Duration};
 
 fn main() -> io::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
-    let backend = t3::start(&runtime);
     let mut resume = preferences::ResumeStore::load();
+    let startup = startup::spawn(&runtime, resume.auto_start_t3());
+    let backend = t3::start(&runtime);
     let mut terminal = ratatui::init();
     let result = execute!(
         terminal.backend_mut(),
@@ -41,7 +43,7 @@ fn main() -> io::Result<()> {
             terminal.backend_mut(),
             crossterm::style::Print("\x1b[?1003l\x1b[?1002l\x1b[?1000h")
         )?;
-        run(&mut terminal, backend, &mut resume)
+        run(&mut terminal, backend, &mut resume, startup)
     });
     let _ = execute!(
         terminal.backend_mut(),
@@ -61,12 +63,33 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     backend: t3::Backend,
     resume: &mut preferences::ResumeStore,
+    startup: startup::Backend,
 ) -> io::Result<()> {
     let mut app = app::App {
         typing_style: resume.typing_style(),
+        auto_start_t3: resume.auto_start_t3(),
         ..app::App::default()
     };
     while !app.quit {
+        while let Ok(event) = startup.updates.try_recv() {
+            app.startup.apply(event);
+        }
+        startup.auto_start.send_if_modified(|value| {
+            if *value == app.auto_start_t3 {
+                false
+            } else {
+                *value = app.auto_start_t3;
+                true
+            }
+        });
+        if let Some(command) = app.startup.request.take() {
+            if startup.commands.try_send(command).is_ok() {
+                app.startup.event.busy = true;
+                app.startup.event.message = "Checking T3 setup…".into();
+            } else {
+                app.startup.event.detail = "Setup is already busy. Please wait.".into();
+            }
+        }
         while let Ok(update) = backend.updates.try_recv() {
             let update = match update {
                 t3::Update::Git { request, result } => {
@@ -269,7 +292,7 @@ fn run(
                 Event::Paste(text)
                     if app.git.editing
                         && app.focus == app::Focus::Workspace
-                        && app.workspace_tab == 4 =>
+                        && app.workspace_tab == 3 =>
                 {
                     app.git.message.push_str(&text.replace(['\r', '\n'], " "))
                 }

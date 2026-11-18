@@ -76,11 +76,7 @@ impl Config {
         let origin = match env::var("T3_SERVER_URL") {
             Ok(value) => value,
             Err(_) => {
-                let state = env::var_os("T3_STATE_DIR")
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3/userdata"))
-                    })
+                let state = crate::pairing::local_state_dir()
                     .ok_or("Set T3_SERVER_URL to your T3 server origin.")?;
                 #[derive(Deserialize)]
                 struct Runtime {
@@ -898,18 +894,29 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         }
     });
     runtime.spawn(async move {
-        let result = Config::load().and_then(T3Client::new);
-        let mut client = match result {
-            Ok(client) => client,
-            Err(error) => {
-                let _ = sender.send(Update::Failed(error));
-                return;
+        let mut client = loop {
+            match Config::load().and_then(T3Client::new) {
+                Ok(client) => break client,
+                Err(error) => {
+                    if sender.send(Update::Failed(error)).is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         };
         loop {
             let update = match client.check().await {
                 Ok(connection) => Update::Ready(connection),
-                Err(error) => Update::Failed(error),
+                Err(error) => {
+                    if let Ok(config) = Config::load()
+                        && config.origin != client.config.origin
+                        && let Ok(reloaded) = T3Client::new(config)
+                    {
+                        client = reloaded;
+                    }
+                    Update::Failed(error)
+                }
             };
             let authenticated =
                 matches!(&update, Update::Ready(connection) if connection.authenticated);
