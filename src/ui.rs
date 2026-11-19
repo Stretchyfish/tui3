@@ -572,25 +572,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let footer_hint = if app.settings_open {
         " SETTINGS | Esc/s: close | Ctrl+Q: quit "
     } else if app.editing {
-        " TYPING | Enter: queue | Ctrl+Enter: steer | Ctrl+C/V: copy/paste | Shift+Enter: newline | Shift+arrows: select | Ctrl+Shift+←→: words "
+        " TYPING | Enter: queue | Ctrl/Alt+Enter: steer | Ctrl+C/V: copy/paste | Shift+Enter: newline | Shift+arrows: select | Ctrl+Shift+←→: words "
     } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
-        " GIT | ↑↓/jk: control | Enter/Space: open/confirm | g: generate | r: refresh | Tab: pane "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.diff_view.file_focus {
-        " ↑↓/jk: file | ←/h/Enter: patch | [/]: run | Tab: pane "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 {
+        " GIT | ↑↓/jk: action | Enter/Space: open | g: generate | r: refresh "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 1 && app.diff_view.file_focus {
+        " ↑↓/jk: file | ←/h/Enter: patch | [/]: run "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 1 {
         " w: toggle wrap | PgUp/PgDn: scroll | Shift+←→: pan when unwrapped | ↑: tools "
     } else if app.focus == Focus::Workspace {
         " →/l: editor | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↑: tools "
     } else if app.focus == Focus::WorkspaceTabs {
         " ←→/hl: tabs | Enter/Space: activate | ↓/j: panel "
     } else if app.focus == Focus::Projects {
-        " ↑↓/jk: select | →/l: chat | Enter/Space: menu | Tab: pane | s: settings | o: setup "
+        " ↑↓/jk: select | →/l: chat | Enter/Space: menu | s: settings | o: setup "
     } else if app.focus == Focus::Chat {
         " ↓/j or m: Message | Shift+j/k/↑↓: scroll | s: settings "
     } else if app.focus == Focus::Model {
-        " Enter/Space: choose model | l/→: access | k/↑: prompt | Tab: pane | s: settings "
+        " Enter/Space: choose model | l/→: access | k/↑: prompt | s: settings "
     } else if app.focus == Focus::Access {
-        " Enter/Space: access level | h/←: model | l/→: usage | k/↑: prompt | Tab: pane "
+        " Enter/Space: access level | h/←: model | l/→: usage | k/↑: prompt "
     } else {
         " ↓/j: model | ↑/k: chat | Enter/Space/i: type | Shift+D: dictate | m: Message | s: settings "
     };
@@ -610,6 +610,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.settings_open {
         app.click_targets.clear();
         settings_panel(frame, app);
+    }
+    if app.git.has_modal() {
+        app.click_targets.clear();
+        crate::git::draw_modal(frame, app);
     }
     if app.models.open {
         app.click_targets.clear();
@@ -1021,8 +1025,8 @@ fn draw_thread_menu(frame: &mut Frame, app: &mut App, menu: &crate::app::ThreadM
 fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     app.click_targets
         .push((area, crate::app::ClickTarget::Pane(Focus::Workspace)));
-    let names = ["Diffs", "Editor", "Terminal", "Git"];
-    let letters = ["D", "E", "t", "g"];
+    let names = ["Editor", "Diffs", "Terminal", "Git"];
+    let letters = ["E", "D", "t", "g"];
     let active_tab = app.workspace_tab.min(names.len() - 1);
     let [selector, body] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
@@ -1038,7 +1042,7 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, body);
     app.click_targets
         .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
-    if active_tab == 0 {
+    if active_tab == 1 {
         crate::diff::draw(frame, app, content);
     } else if active_tab == 3 {
         crate::git::draw(frame, app, content);
@@ -1205,6 +1209,8 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         startup_selector,
         wrap_heading,
         wrap_selector,
+        layout_heading,
+        layout_selector,
         server_heading,
         server_row,
         server_progress,
@@ -1213,7 +1219,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         details,
     ] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -1276,6 +1284,25 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
             app.diff_view.wrap == value,
             app.settings_row == 2 && app.diff_wrap_highlight == value,
         );
+    }
+    frame.render_widget(Paragraph::new("Layout preset"), layout_heading);
+    let layout_options = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+        .spacing(1)
+        .split(layout_selector);
+    use crate::preferences::LayoutPreset;
+    for (preset, option) in [LayoutPreset::Default, LayoutPreset::EditorFocused]
+        .into_iter()
+        .zip(layout_options.iter())
+    {
+        selector_box(
+            frame,
+            *option,
+            preset.label(),
+            app.layout_preset == preset,
+            app.settings_row == 3 && app.layout_highlight == preset,
+        );
+        app.click_targets
+            .push((*option, crate::app::ClickTarget::LayoutPreset(preset)));
     }
     render_server_settings_row(frame, app, server_heading, server_row, server_progress);
     frame.render_widget(Paragraph::new("Desktop clipboard"), clipboard_heading);
@@ -1379,7 +1406,7 @@ fn render_server_settings_row(
         button_area,
         &button_label,
         button_active,
-        app.settings_row == 3,
+        app.settings_row == 4,
     );
 
     if progress_area.height == 0 {
@@ -2235,6 +2262,7 @@ mod tests {
             target,
             ClickTarget::TypingStyle(_)
                 | ClickTarget::AutoStart(_)
+                | ClickTarget::LayoutPreset(_)
                 | ClickTarget::ServerUpdateButton
         )));
         let area = app
@@ -2518,5 +2546,45 @@ mod tests {
             .collect();
         assert!(text.contains("Access level"));
         assert!(text.contains("Auto-accept edits"));
+    }
+
+    #[test]
+    fn git_panel_shows_three_actions_and_opens_commit_modal_on_top() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            workspace_tab: 3,
+            ..Default::default()
+        };
+        app.git.cwd = Some("/repo".into());
+        app.git.snapshot = Some(crate::git::Snapshot {
+            generated_message: None,
+            status: serde_json::from_value(crate::git::tests::status()).unwrap(),
+            branches: vec!["main".into()],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Branch: main"));
+        assert!(text.contains("Commit all changes"));
+        assert!(text.contains("Push"));
+        assert!(!text.contains("Generate commit message"));
+
+        app.git.commit_modal = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Generate commit message (g)"));
+        assert!(text.contains("Commit message"));
     }
 }

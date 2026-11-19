@@ -30,6 +30,37 @@ impl TypingStyle {
     }
 }
 
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayoutPreset {
+    #[default]
+    Default,
+    EditorFocused,
+}
+
+impl LayoutPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::EditorFocused => "Editor-focused",
+        }
+    }
+
+    pub fn workspace_width(self) -> u16 {
+        match self {
+            Self::Default => 32,
+            Self::EditorFocused => 50,
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Default => Self::EditorFocused,
+            Self::EditorFocused => Self::Default,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
@@ -45,6 +76,8 @@ struct Preferences {
     #[serde(default)]
     typing_style: TypingStyle,
     #[serde(default)]
+    layout_preset: LayoutPreset,
+    #[serde(default)]
     locations: BTreeMap<String, Location>,
 }
 fn enabled() -> bool {
@@ -55,6 +88,7 @@ impl Default for Preferences {
         Self {
             auto_start_t3: true,
             typing_style: Default::default(),
+            layout_preset: Default::default(),
             locations: Default::default(),
         }
     }
@@ -74,6 +108,9 @@ impl ResumeStore {
     }
     pub fn typing_style(&self) -> TypingStyle {
         self.preferences.typing_style
+    }
+    pub fn layout_preset(&self) -> LayoutPreset {
+        self.preferences.layout_preset
     }
     pub fn load() -> Self {
         let path = crate::pairing::session_path()
@@ -115,6 +152,11 @@ impl ResumeStore {
         }
         if self.preferences.typing_style != app.typing_style {
             self.preferences.typing_style = app.typing_style;
+            self.dirty = true;
+            self.flush();
+        }
+        if self.preferences.layout_preset != app.layout_preset {
+            self.preferences.layout_preset = app.layout_preset;
             self.dirty = true;
             self.flush();
         }

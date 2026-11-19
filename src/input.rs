@@ -112,7 +112,7 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         if matches!(target, Some(ClickTarget::Pane(Focus::Chat))) {
             app.scroll_chat(mouse.kind == MouseEventKind::ScrollDown, 3);
         }
-        if matches!(target, Some(ClickTarget::Pane(Focus::Workspace))) && app.workspace_tab == 0 {
+        if matches!(target, Some(ClickTarget::Pane(Focus::Workspace))) && app.workspace_tab == 1 {
             if app.diff_view.file_focus {
                 app.diff_view
                     .move_file(&app.runs, mouse.kind == MouseEventKind::ScrollDown);
@@ -199,12 +199,7 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.editing = false;
             app.focus = Focus::Workspace;
             app.git.row = index;
-            if index != 1 {
-                app.git.editing = false;
-            }
-            if index == 4 {
-                crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            }
+            crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
         Some(ClickTarget::DiffBody) => {
             app.editing = false;
@@ -232,8 +227,12 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.style_highlight = style;
             app.typing_style = style;
         }
-        Some(ClickTarget::ServerUpdateButton) => {
+        Some(ClickTarget::LayoutPreset(preset)) => {
             app.settings_row = 3;
+            app.apply_layout_preset(preset);
+        }
+        Some(ClickTarget::ServerUpdateButton) => {
+            app.settings_row = 4;
             app.trigger_server_update_action();
         }
         None => (),
@@ -410,7 +409,8 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         && !app.models.open
         && !app.startup.open
         && key.code == KeyCode::Enter
-        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
     {
         app.steer_requested = true;
         app.send_requested = true;
@@ -508,7 +508,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Up | KeyCode::Char('k') => {
                 app.settings_row = app.settings_row.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(3),
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(4),
             KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
                 app.auto_start_highlight = false
             }
@@ -527,11 +527,19 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 2 => {
                 app.diff_view.wrap = app.diff_wrap_highlight
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if app.settings_row == 3 =>
+            {
+                app.layout_highlight = app.layout_highlight.toggle();
+            }
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 3 => {
+                app.apply_layout_preset(app.layout_highlight);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 4 => {
                 app.trigger_server_update_action();
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
-                if app.settings_row == 3 => {}
+                if app.settings_row == 4 => {}
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
                 app.style_highlight = app.style_highlight.cycle(true);
@@ -612,9 +620,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         }
         return;
     }
-    let git_modal = app.focus == Focus::Workspace
-        && app.workspace_tab == 3
-        && (app.git.editing || app.git.picking || app.git.confirm.is_some());
+    let git_modal = app.git.has_modal() || app.git.editing;
     if git_modal && crate::git::key(app, key) {
         return;
     }
@@ -634,8 +640,8 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             ch = ch.to_ascii_uppercase();
         }
         if let Some(index) = match ch {
-            'd' => Some(0),
-            'e' | 'E' => Some(1),
+            'e' | 'E' => Some(0),
+            'd' => Some(1),
             't' => Some(2),
             'g' => Some(3),
             _ => None,
@@ -685,14 +691,6 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 app.editing = false;
             }
             KeyCode::Esc => app.editing = false,
-            KeyCode::Tab | KeyCode::BackTab => {
-                app.editing = false;
-                if key.code == KeyCode::BackTab {
-                    app.previous_focus();
-                } else {
-                    app.toggle_focus();
-                }
-            }
             KeyCode::Char(character) => {
                 if character == '/' {
                     app.slash_dismissed = false;
@@ -736,7 +734,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         }
         return;
     }
-    if app.focus == Focus::Workspace && app.workspace_tab == 0 {
+    if app.focus == Focus::Workspace && app.workspace_tab == 1 {
         if app.diff_view.file_focus {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -839,6 +837,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             app.settings_row = 0;
             app.auto_start_highlight = app.auto_start_t3;
             app.style_highlight = app.typing_style;
+            app.layout_highlight = app.layout_preset;
             app.settings_open = true;
             app.clipboard_check_requested = true;
             app.request_server_version_check();
@@ -964,8 +963,6 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
             app.focus = Focus::Projects;
         }
-        KeyCode::Tab => app.toggle_focus(),
-        KeyCode::BackTab => app.previous_focus(),
         KeyCode::Left | KeyCode::Char('h') => app.focus = Focus::Projects,
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Projects => {
             app.focus = Focus::Chat;
@@ -1319,7 +1316,7 @@ mod tests {
     #[test]
     fn workspace_hotkeys_are_case_sensitive_and_do_not_intercept_text_inputs() {
         let mut app = App::default();
-        for (ch, index) in [('d', 0), ('e', 1), ('E', 1), ('t', 2), ('g', 3)] {
+        for (ch, index) in [('e', 0), ('E', 0), ('d', 1), ('t', 2), ('g', 3)] {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -1390,6 +1387,7 @@ mod tests {
     fn arrows_move_between_diff_and_persistent_file_list() {
         let mut app = App {
             focus: Focus::Workspace,
+            workspace_tab: 1,
             ..Default::default()
         };
         app.diff_view.file_focus = true;
@@ -1589,6 +1587,8 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(app.focus == Focus::Composer);
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Composer);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(app.focus == Focus::Model);
     }
 
@@ -1864,7 +1864,7 @@ mod tests {
         );
         assert!(!app.dictation.toggle_requested);
         assert!(app.focus == Focus::Workspace);
-        assert_eq!(app.workspace_tab, 0);
+        assert_eq!(app.workspace_tab, 1);
 
         app.focus = Focus::Composer;
         app.editing = true;
@@ -2133,16 +2133,61 @@ mod tests {
             latest: "0.1.11".into(),
             database_migration: None,
         };
-        for _ in 0..4 {
+        for _ in 0..5 {
             handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.settings_row, 3);
+        assert_eq!(app.settings_row, 4);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.server_update_requested);
         assert!(matches!(
             app.server_update_status,
             crate::app::ServerUpdateStatus::Downloading { .. }
         ));
+    }
+
+    #[test]
+    fn alt_enter_dispatches_steering_and_tab_does_not_switch_panes() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            draft: "Steer now".into(),
+            ..Default::default()
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Composer);
+        assert!(app.editing);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(app.steer_requested);
+        assert!(app.send_requested);
+        assert!(!app.editing);
+
+        app.focus = Focus::Projects;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.focus == Focus::Projects);
+    }
+
+    #[test]
+    fn settings_layout_preset_updates_workspace_width() {
+        let mut app = App::default();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        for _ in 0..3 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.settings_row, 3);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_highlight,
+            crate::preferences::LayoutPreset::EditorFocused
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_preset,
+            crate::preferences::LayoutPreset::EditorFocused
+        );
+        assert_eq!(app.workspace_width, 50);
     }
 }
 

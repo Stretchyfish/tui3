@@ -615,7 +615,7 @@ impl T3Client {
                     .await
                     .map_err(|error| error.message)?;
             }
-            Operation::Commit(_) | Operation::Push => {
+            Operation::Commit(_) | Operation::CommitPush(_) | Operation::Push => {
                 let mut completed = None;
                 let stream = self.stream_rpc(
                     "git.runStackedAction",

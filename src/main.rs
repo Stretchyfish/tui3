@@ -22,9 +22,11 @@ mod usage;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
+    terminal::supports_keyboard_enhancement,
 };
 use std::{io, time::Duration};
 
@@ -35,12 +37,19 @@ fn main() -> io::Result<()> {
     let startup = startup::spawn(&runtime, resume.auto_start_t3());
     let backend = t3::start(&runtime);
     let mut terminal = ratatui::init();
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let result = execute!(
         terminal.backend_mut(),
         EnableBracketedPaste,
         EnableMouseCapture
     )
     .and_then(|_| {
+        if keyboard_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+        }
         // Track drags for text selection without reporting idle pointer motion.
         #[cfg(not(windows))]
         execute!(
@@ -49,6 +58,9 @@ fn main() -> io::Result<()> {
         )?;
         run(&mut terminal, backend, &mut resume, startup)
     });
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -72,9 +84,13 @@ fn run(
     resume: &mut preferences::ResumeStore,
     startup: startup::Backend,
 ) -> io::Result<Option<u32>> {
+    let layout_preset = resume.layout_preset();
     let mut app = app::App {
         typing_style: resume.typing_style(),
         auto_start_t3: resume.auto_start_t3(),
+        layout_preset,
+        layout_highlight: layout_preset,
+        workspace_width: layout_preset.workspace_width(),
         check_other_instances: Some(startup::other_tui3_instances_running),
         ..app::App::default()
     };
@@ -428,7 +444,7 @@ fn run(
         if app.authenticated
             && let Some(thread) = app.history_thread.as_ref()
         {
-            let viewed = if app.workspace_visible && app.workspace_tab == 0 {
+            let viewed = if app.workspace_visible && app.workspace_tab == 1 {
                 app.diff_view.run_id(&app.runs).map(str::to_owned)
             } else {
                 None

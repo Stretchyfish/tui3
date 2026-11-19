@@ -122,6 +122,7 @@ pub enum ClickTarget {
     Pane(Focus),
     Workspace(usize),
     TypingStyle(crate::preferences::TypingStyle),
+    LayoutPreset(crate::preferences::LayoutPreset),
     ServerUpdateButton,
 }
 
@@ -182,6 +183,8 @@ pub struct App {
     pub workspace_highlight: usize,
     pub workspace_visible: bool,
     pub workspace_width: u16,
+    pub layout_preset: crate::preferences::LayoutPreset,
+    pub layout_highlight: crate::preferences::LayoutPreset,
     pub diff_wrap_highlight: bool,
     pub style_highlight: crate::preferences::TypingStyle,
     pub settings_open: bool,
@@ -308,6 +311,8 @@ impl Default for App {
             workspace_highlight: 0,
             workspace_visible: true,
             workspace_width: 32,
+            layout_preset: crate::preferences::LayoutPreset::default(),
+            layout_highlight: crate::preferences::LayoutPreset::default(),
             diff_wrap_highlight: true,
             style_highlight: crate::preferences::TypingStyle::default(),
             settings_open: false,
@@ -2210,32 +2215,11 @@ impl App {
         }
     }
 
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Projects => Focus::Chat,
-            Focus::Chat => Focus::Composer,
-            Focus::Composer => Focus::Model,
-            Focus::Model => Focus::Access,
-            Focus::Access => Focus::SessionUsage,
-            Focus::SessionUsage => Focus::WeeklyUsage,
-            Focus::WeeklyUsage => Focus::WorkspaceTabs,
-            Focus::WorkspaceTabs => Focus::Workspace,
-            Focus::Workspace => Focus::Projects,
-        };
-    }
-
-    pub fn previous_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Projects => Focus::Workspace,
-            Focus::Chat => Focus::Projects,
-            Focus::Composer => Focus::Chat,
-            Focus::Model => Focus::Composer,
-            Focus::Access => Focus::Model,
-            Focus::SessionUsage => Focus::Access,
-            Focus::WeeklyUsage => Focus::SessionUsage,
-            Focus::Workspace => Focus::WorkspaceTabs,
-            Focus::WorkspaceTabs => Focus::WeeklyUsage,
-        };
+    pub fn apply_layout_preset(&mut self, preset: crate::preferences::LayoutPreset) {
+        self.layout_preset = preset;
+        self.layout_highlight = preset;
+        self.workspace_width = preset.workspace_width();
+        self.workspace_visible = true;
     }
 }
 
