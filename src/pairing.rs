@@ -132,6 +132,8 @@ pub async fn local_credential(origin: &Url) -> Result<String, String> {
             "--scope",
             "filesystem:read",
             "--scope",
+            "filesystem:write",
+            "--scope",
             "source-control:write",
             "--base-dir",
         ])

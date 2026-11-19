@@ -98,6 +98,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Start a fresh session; earlier messages stay visible",
     },
     SlashCommand {
+        name: "context",
+        description: "Show the current thread's context window usage in chat",
+    },
+    SlashCommand {
         name: "model",
         description: "Switch response model for this thread",
     },
@@ -115,6 +119,7 @@ pub enum ClickTarget {
     SlashCommand(usize),
     AutoStart(bool),
     GitControl(usize),
+    EditorEntry(usize),
     RemoveAttachment(usize),
     SidebarRow(usize),
     DiffBody,
@@ -171,6 +176,7 @@ pub struct App {
     pub auto_start_t3: bool,
     pub auto_start_highlight: bool,
     pub settings_row: usize,
+    pub editor: crate::editor::EditorState,
     pub git: crate::git::GitState,
     pub chat_revision: u64,
     pub chat_cache: Option<(u64, Option<u64>, ratatui::text::Text<'static>)>,
@@ -199,6 +205,8 @@ pub struct App {
     pub usage: crate::usage::UsageState,
     pub live_model: Option<crate::models::ModelSelection>,
     pub live_runtime_mode: Option<String>,
+    pub context_usage: Option<crate::history::ContextUsage>,
+    pub context_report_thread: Option<String>,
     pub access_open: bool,
     pub access_highlight: usize,
     pub access_pending: Option<crate::t3::RuntimeModeChange>,
@@ -299,6 +307,7 @@ impl Default for App {
             server_version_check_requested: false,
             server_update_requested: false,
             dictation: Default::default(),
+            editor: Default::default(),
             git: Default::default(),
             chat_revision: 0,
             chat_cache: None,
@@ -327,6 +336,8 @@ impl Default for App {
             usage: crate::usage::UsageState::default(),
             live_model: None,
             live_runtime_mode: None,
+            context_usage: None,
+            context_report_thread: None,
             access_open: false,
             access_highlight: 0,
             access_pending: None,
@@ -989,6 +1000,17 @@ impl App {
                     self.send_notice = Some("Select a thread before using /clear.".into());
                 }
             }
+            "context" => {
+                if let Some(thread_id) = self.selected_thread_id().map(str::to_owned) {
+                    self.context_report_thread = Some(thread_id);
+                    self.chat_revision = self.chat_revision.wrapping_add(1);
+                    self.follow_chat = true;
+                    self.editing = false;
+                    self.send_notice = None;
+                } else {
+                    self.send_notice = Some("Select a thread before using /context.".into());
+                }
+            }
             "model" => {
                 self.editing = false;
                 self.open_models();
@@ -1416,6 +1438,7 @@ impl App {
         if selected == self.history_thread {
             return false;
         }
+        self.context_usage = None;
         let wrap = self.diff_view.wrap;
         if let Some(previous) = self.history_thread.take() {
             self.thread_diffs.insert(
@@ -1487,6 +1510,7 @@ impl App {
                 }
                 self.live_model = projection.thread.model_selection;
                 self.live_runtime_mode = projection.thread.runtime_mode.clone();
+                self.context_usage = projection.thread.context_usage;
                 if let Some(mode) = projection.thread.runtime_mode {
                     self.set_thread_runtime_mode(thread_id, mode);
                 }

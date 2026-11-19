@@ -103,6 +103,10 @@ pub enum ServerCommand {
 }
 
 pub enum Update {
+    Editor {
+        request: crate::editor::Request,
+        result: Result<crate::editor::Response, String>,
+    },
     Git {
         request: crate::git::Request,
         result: Result<crate::git::Snapshot, String>,
@@ -600,6 +604,66 @@ impl T3Client {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| "Unexpected T3 transcription response.".into())
+    }
+
+    async fn editor_request(
+        &self,
+        request: &crate::editor::Request,
+    ) -> Result<crate::editor::Response, String> {
+        use crate::editor::{Entry, Operation, Response};
+        match &request.operation {
+            Operation::ListEntries(directory) => {
+                let value = self
+                    .rpc("projects.listEntries", request.payload())
+                    .await
+                    .map_err(|error| error.message)?;
+                let entries = value
+                    .get("entries")
+                    .cloned()
+                    .ok_or("Invalid T3 file list.")?;
+                let entries = serde_json::from_value::<Vec<Entry>>(entries)
+                    .map_err(|_| "Invalid T3 file list.")?;
+                let truncated = value
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(Response::Entries {
+                    directory: directory.clone(),
+                    entries,
+                    truncated,
+                })
+            }
+            Operation::ReadFile(relative_path) => {
+                let value = self
+                    .rpc("projects.readFile", request.payload())
+                    .await
+                    .map_err(|error| error.message)?;
+                let contents = value
+                    .get("contents")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let truncated = value
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let exists = value.get("exists").and_then(|v| v.as_bool()).unwrap_or(true);
+                Ok(Response::File {
+                    relative_path: relative_path.clone(),
+                    contents,
+                    truncated,
+                    exists,
+                })
+            }
+            Operation::WriteFile { path, .. } => {
+                self.rpc("projects.writeFile", request.payload())
+                    .await
+                    .map_err(|error| error.message)?;
+                Ok(Response::Saved {
+                    relative_path: path.clone(),
+                })
+            }
+        }
     }
 
     async fn git_request(
@@ -1192,6 +1256,7 @@ impl T3Client {
 }
 
 pub struct Backend {
+    pub editor: tokio::sync::mpsc::Sender<crate::editor::Request>,
     pub git: tokio::sync::mpsc::Sender<crate::git::Request>,
     pub diffs: tokio::sync::mpsc::Sender<(String, String, u64)>,
     pub updates: mpsc::Receiver<Update>,
@@ -1213,6 +1278,27 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
     let history_sender = sender.clone();
     let (credentials, mut authorization) = tokio::sync::watch::channel::<Option<Config>>(None);
     let mut usage_authorization = authorization.clone();
+    let editor_auth = authorization.clone();
+    let editor_updates = sender.clone();
+    let (editor, mut editor_requests) = tokio::sync::mpsc::channel::<crate::editor::Request>(4);
+    runtime.spawn(async move {
+        while let Some(request) = editor_requests.recv().await {
+            let config = editor_auth.borrow().clone();
+            let result = match config
+                .ok_or("Sign in to T3 first.".to_owned())
+                .and_then(T3Client::new)
+            {
+                Ok(client) => client.editor_request(&request).await,
+                Err(error) => Err(error),
+            };
+            if editor_updates
+                .send(Update::Editor { request, result })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let git_auth = authorization.clone();
     let git_updates = sender.clone();
     let (git, mut git_requests) = tokio::sync::mpsc::channel::<crate::git::Request>(4);
@@ -1604,6 +1690,7 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         }
     });
     Backend {
+        editor,
         git,
         diffs,
         updates: receiver,

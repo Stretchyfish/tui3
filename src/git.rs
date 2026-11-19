@@ -190,7 +190,7 @@ pub fn sync(app: &mut App) {
             ..Default::default()
         };
     }
-    if app.workspace_tab == 3
+    if matches!(app.workspace_tab, 0 | 3)
         && app.authenticated
         && app.git.pending.is_none()
         && !app.git.has_modal()

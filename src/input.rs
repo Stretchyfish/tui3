@@ -201,6 +201,15 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.git.row = index;
             crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
+        Some(ClickTarget::EditorEntry(index)) => {
+            app.editing = false;
+            app.focus = Focus::Workspace;
+            app.workspace_tab = 0;
+            app.workspace_highlight = 0;
+            app.editor.tree_focus = true;
+            app.editor.selected_entry = index;
+            app.editor.activate_entry(index);
+        }
         Some(ClickTarget::DiffBody) => {
             app.editing = false;
             app.focus = Focus::Workspace;
@@ -268,6 +277,30 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         }
         return;
     }
+    if app.focus == Focus::Workspace
+        && app.workspace_tab == 2
+        && app.local_terminal.tab_typing
+        && app.quit_dialog.is_none()
+        && !app.startup.open
+        && !app.settings_open
+        && !app.models.open
+        && app.thread_menu.is_none()
+    {
+        if key.code == KeyCode::Esc {
+            app.local_terminal.tab_typing = false;
+        } else if let Some(session) = &app.local_terminal.session {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            {
+                session.scroll(if key.code == KeyCode::PageUp { 10 } else { -10 });
+            } else {
+                session.scroll(-isize::MAX);
+                let application = session.parser.lock().unwrap().screen().application_cursor();
+                session.send(crate::local_terminal::key_bytes(key, application));
+            }
+        }
+        return;
+    }
     let entering_text =
         if app.quit_dialog.is_some() || app.startup.open || app.settings_open || app.models.open {
             false
@@ -276,6 +309,10 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         } else {
             app.editing
                 || (app.focus == Focus::Workspace && app.workspace_tab == 3 && app.git.editing)
+                || (app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing)
+                || (app.focus == Focus::Workspace
+                    && app.workspace_tab == 2
+                    && app.local_terminal.tab_typing)
         };
     if key.code == KeyCode::Char(' ')
         && key.modifiers.is_empty()
@@ -387,6 +424,17 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         && (app.selected_draft().is_some() || app.selected_screen().is_some())
     {
         copy_selection(app);
+        return;
+    }
+    if app.focus == Focus::Workspace
+        && app.workspace_tab == 0
+        && app.editor.editing
+        && app.quit_dialog.is_none()
+        && !app.startup.open
+        && !app.settings_open
+        && !app.models.open
+    {
+        crate::editor::key(app, key);
         return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
@@ -626,6 +674,30 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
     }
     if app.focus == Focus::Workspace && app.workspace_tab == 3 && crate::git::key(app, key) {
         return;
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 0 && crate::editor::key(app, key) {
+        return;
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 2 {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('i') => {
+                app.local_terminal.tab_typing = true;
+                return;
+            }
+            KeyCode::PageUp => {
+                if let Some(session) = &app.local_terminal.session {
+                    session.scroll(10);
+                }
+                return;
+            }
+            KeyCode::PageDown => {
+                if let Some(session) = &app.local_terminal.session {
+                    session.scroll(-10);
+                }
+                return;
+            }
+            _ => (),
+        }
     }
     if !app.editing
         && matches!(key.code, KeyCode::Char('D') | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('D'))
@@ -1316,7 +1388,7 @@ mod tests {
     #[test]
     fn workspace_hotkeys_are_case_sensitive_and_do_not_intercept_text_inputs() {
         let mut app = App::default();
-        for (ch, index) in [('e', 0), ('E', 0), ('d', 1), ('t', 2), ('g', 3)] {
+        for (ch, index) in [('e', 0), ('E', 0), ('d', 1), ('g', 3), ('t', 2)] {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -2081,15 +2153,16 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
         );
-        assert_eq!(app.matching_slash_commands().len(), 2);
+        assert_eq!(app.matching_slash_commands().len(), 3);
 
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
         );
         let matches = app.matching_slash_commands();
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].name, "clear");
+        assert_eq!(matches[1].name, "context");
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.draft, "");
@@ -2111,6 +2184,31 @@ mod tests {
 
         app.finish_send(request, Ok(()));
         assert!(!app.is_fresh_context());
+    }
+
+    #[test]
+    fn slash_context_command_enables_context_report_for_selected_thread() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        app.focus = Focus::Composer;
+        app.editing = true;
+
+        for ch in "/context".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let matches = app.matching_slash_commands();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "context");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.draft, "");
+        assert_eq!(app.context_report_thread.as_deref(), Some("t1"));
+        assert!(!app.send_requested);
     }
 
     #[test]
@@ -2188,6 +2286,54 @@ mod tests {
             crate::preferences::LayoutPreset::EditorFocused
         );
         assert_eq!(app.workspace_width, 50);
+    }
+
+    #[test]
+    fn sidebar_terminal_typing_mode_requires_enter_and_exits_on_esc() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            workspace_tab: 2,
+            workspace_visible: true,
+            ..Default::default()
+        };
+        assert!(!app.local_terminal.tab_typing);
+
+        // Navigation mode: Up moves to WorkspaceTabs, Space/Enter enters typing mode.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.local_terminal.tab_typing);
+
+        // In typing mode, conflicting hotkeys are ignored and not handled by TUI.
+        for ch in ['q', 's', 'w', 'd', 'e', 'g', 'c', 'm', 'o', 'p'] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+            assert!(app.focus == Focus::Workspace);
+            assert_eq!(app.workspace_tab, 2);
+            assert!(app.workspace_visible);
+            assert!(!app.settings_open);
+            assert!(!app.startup.open);
+            assert!(app.quit_dialog.is_none());
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        );
+        assert!(app.quit_dialog.is_none());
+        assert!(app.local_terminal.tab_typing);
+
+        // Esc exits typing mode without leaving the Terminal panel.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.local_terminal.tab_typing);
+        assert!(app.focus == Focus::Workspace);
+
+        // Once out of typing mode, navigation works again.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.focus == Focus::WorkspaceTabs);
     }
 }
 

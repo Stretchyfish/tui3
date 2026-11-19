@@ -6,6 +6,7 @@ mod commit_message;
 mod composer;
 mod dictation;
 mod diff;
+mod editor;
 mod git;
 mod history;
 mod input;
@@ -215,6 +216,10 @@ fn run(
         }
         while let Ok(update) = backend.updates.try_recv() {
             let update = match update {
+                t3::Update::Editor { request, result } => {
+                    app.editor.finish(&request, result);
+                    continue;
+                }
                 t3::Update::Git { request, result } => {
                     app.git.finish(&request, result);
                     continue;
@@ -417,6 +422,7 @@ fn run(
                 | t3::Update::Live { .. }
                 | t3::Update::Usage(_)
                 | t3::Update::Models(_)
+                | t3::Update::Editor { .. }
                 | t3::Update::Git { .. }
                 | t3::Update::GitProgress { .. }
                 | t3::Update::RunDiff { .. }
@@ -432,6 +438,15 @@ fn run(
             };
         }
         app.sync_history_selection();
+        editor::sync(&mut app);
+        if let Some(request) = app.editor.request.take()
+            && backend.editor.try_send(request.clone()).is_err()
+        {
+            app.editor.finish(
+                &request,
+                Err("Editor worker unavailable. Press r to retry.".into()),
+            );
+        }
         git::sync(&mut app);
         if let Some(request) = app.git.request.take()
             && backend.git.try_send(request.clone()).is_err()
@@ -598,7 +613,7 @@ fn run(
                 }
             }
         }
-        if app.terminal_overlay_open
+        if (app.terminal_overlay_open || (app.workspace_visible && app.workspace_tab == 2))
             && app.local_terminal.session.is_none()
             && app.local_terminal.error.is_none()
         {

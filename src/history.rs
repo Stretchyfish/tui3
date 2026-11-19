@@ -264,6 +264,35 @@ impl Run {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub total_processed_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub last_used_tokens: Option<u64>,
+    pub last_input_tokens: Option<u64>,
+    pub last_cached_input_tokens: Option<u64>,
+    pub last_output_tokens: Option<u64>,
+    pub last_reasoning_output_tokens: Option<u64>,
+    pub tool_uses: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub compacts_automatically: Option<bool>,
+    pub auto_compact_threshold: Option<u64>,
+    pub cost: Option<ContextCost>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCost {
+    pub amount: f64,
+    pub currency: String,
+}
+
 #[derive(Deserialize)]
 pub struct ThreadIdentity {
     pub id: String,
@@ -272,6 +301,8 @@ pub struct ThreadIdentity {
     pub model_selection: Option<crate::models::ModelSelection>,
     #[serde(default, rename = "runtimeMode")]
     pub runtime_mode: Option<String>,
+    #[serde(default, rename = "contextUsage")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 #[derive(Deserialize)]

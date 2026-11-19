@@ -64,6 +64,7 @@ impl vt100::Callbacks for TerminalReplies {
 pub struct LocalTerminal {
     pub session: Option<Session>,
     pub error: Option<String>,
+    pub tab_typing: bool,
 }
 pub struct Session {
     pub parser: Arc<Mutex<vt100::Parser<TerminalReplies>>>,

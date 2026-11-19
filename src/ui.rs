@@ -290,6 +290,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         crate::chat::notice(&mut content, notice.clone(), Color::Yellow);
     }
+    if app.context_report_thread.as_deref() == app.selected_thread_id()
+        && app.selected_thread_id().is_some()
+    {
+        render_context_usage(&mut content, app.context_usage.as_ref());
+    }
     let block = panel(&title, app.focus == Focus::Chat);
     let chat_inner = block.inner(chat);
     let image_count = app
@@ -569,12 +574,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .push((session, crate::app::ClickTarget::Pane(Focus::SessionUsage)));
     app.click_targets
         .push((weekly, crate::app::ClickTarget::Pane(Focus::WeeklyUsage)));
-    let footer_hint = if app.settings_open {
-        " SETTINGS | Esc/s: close | Ctrl+Q: quit "
+    let (mode_label, mode_color, _) = mode_badge(app);
+    let footer_hint = if app.terminal_overlay_open {
+        " Ctrl+J: hide | Shift+PgUp/PgDn: scroll "
+    } else if app.settings_open {
+        " Esc/s: close | Ctrl+Q: quit "
     } else if app.editing {
-        " TYPING | Enter: queue | Ctrl/Alt+Enter: steer | Ctrl+C/V: copy/paste | Shift+Enter: newline | Shift+arrows: select | Ctrl+Shift+←→: words "
+        " Enter: queue | Ctrl/Alt+Enter: steer | Ctrl+C/V: copy/paste | Shift+Enter: newline | Shift+arrows: select | Ctrl+Shift+←→: words "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing {
+        " Ctrl+S: save | Esc: stop editing "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.tree_focus {
+        " ↑↓/jk: file | Enter: open | ←/Backspace: up | Tab/l: code | r: refresh "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 {
+        " Enter/i: edit | ↑↓←→/hjkl: move | Tab/Esc: files | Ctrl+S: save "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 && app.local_terminal.tab_typing {
+        " Esc: stop typing | Shift+PgUp/PgDn: scroll "
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 {
+        " Enter/Space/i: type | PgUp/PgDn: scroll | ↑/k: tools | ←/h: chat "
     } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
-        " GIT | ↑↓/jk: action | Enter/Space: open | g: generate | r: refresh "
+        " ↑↓/jk: action | Enter/Space: open | g: generate | r: refresh "
     } else if app.focus == Focus::Workspace && app.workspace_tab == 1 && app.diff_view.file_focus {
         " ↑↓/jk: file | ←/h/Enter: patch | [/]: run "
     } else if app.focus == Focus::Workspace && app.workspace_tab == 1 {
@@ -597,10 +615,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [hint_area, shortcut_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(footer.width.min(72))])
             .areas(footer);
-    frame.render_widget(
-        Paragraph::new(footer_hint).style(Style::default().fg(Color::DarkGray)),
-        hint_area,
-    );
+    let hint_line = Line::from(vec![
+        Span::styled(
+            mode_label,
+            Style::default().fg(Color::Black).bg(mode_color).bold(),
+        ),
+        Span::styled(footer_hint, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(hint_line), hint_area);
     frame.render_widget(
         Paragraph::new("Shift+D Dictate | Ctrl+J / Shift+T Terminal | w Panel { } Resize | q Quit")
             .right_aligned()
@@ -742,32 +764,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .areas(center);
         frame.render_widget(Clear, area);
-        let block = panel(" Local terminal ", true)
+        let block = panel(" Local terminal [TYPING] ", true)
             .title_bottom(" Ctrl+J: hide | Shift+PgUp/PgDn: scroll ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if let Some(session) = &mut app.local_terminal.session {
-            session.resize(inner.height, inner.width);
-            let parser = session.parser.lock().unwrap();
-            frame.render_widget(
-                tui_term::widget::PseudoTerminal::new(parser.screen()),
-                inner,
-            );
+        draw_local_terminal_body(frame, app, inner);
+        if let Some(session) = &app.local_terminal.session {
             let status = session.status.lock().unwrap();
             let title = status.as_deref().unwrap_or(&session.cwd);
             frame.render_widget(
                 Paragraph::new(format!(" {title} ")),
                 ratatui::layout::Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(
-                    app.local_terminal
-                        .error
-                        .as_deref()
-                        .unwrap_or("Starting local shell…"),
-                ),
-                inner,
             );
         }
     }
@@ -1022,11 +1029,34 @@ fn draw_thread_menu(frame: &mut Frame, app: &mut App, menu: &crate::app::ThreadM
     }
 }
 
+fn draw_local_terminal_body(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(session) = &mut app.local_terminal.session {
+        session.resize(area.height, area.width);
+        let parser = session.parser.lock().unwrap();
+        frame.render_widget(
+            tui_term::widget::PseudoTerminal::new(parser.screen()),
+            area,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(
+                app.local_terminal
+                    .error
+                    .as_deref()
+                    .unwrap_or("Starting local shell…"),
+            ),
+            area,
+        );
+    }
+}
+
 fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     app.click_targets
         .push((area, crate::app::ClickTarget::Pane(Focus::Workspace)));
     let names = ["Editor", "Diffs", "Terminal", "Git"];
-    let letters = ["E", "D", "t", "g"];
     let active_tab = app.workspace_tab.min(names.len() - 1);
     let [selector, body] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
@@ -1042,12 +1072,32 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, body);
     app.click_targets
         .push((content, crate::app::ClickTarget::Pane(Focus::Workspace)));
-    if active_tab == 1 {
-        crate::diff::draw(frame, app, content);
-    } else if active_tab == 3 {
-        crate::git::draw(frame, app, content);
+    if active_tab == 2 && app.focus == Focus::Workspace && content.height > 1 {
+        let [term_header, term_body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+        let (badge, badge_color, hint) = if app.local_terminal.tab_typing {
+            (" [TYPING] ", Color::Green, " Esc: nav mode")
+        } else {
+            (" [NAV] ", Color::Cyan, " Enter/i: type mode")
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    badge,
+                    Style::default().fg(Color::Black).bg(badge_color).bold(),
+                ),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ])),
+            term_header,
+        );
+        draw_local_terminal_body(frame, app, term_body);
     } else {
-        frame.render_widget(Paragraph::new(letters[active_tab]).centered(), content);
+        match active_tab {
+            0 => crate::editor::draw(frame, app, content),
+            1 => crate::diff::draw(frame, app, content),
+            2 => draw_local_terminal_body(frame, app, content),
+            _ => crate::git::draw(frame, app, content),
+        }
     }
     let boxes = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(selector);
     for (index, rect) in boxes.iter().enumerate() {
@@ -1459,6 +1509,132 @@ fn render_server_settings_row(
     }
 }
 
+fn mode_badge(app: &App) -> (&'static str, Color, &'static str) {
+    if app.terminal_overlay_open {
+        (" TERMINAL ", Color::Magenta, "Ctrl+J: hide")
+    } else if app.settings_open {
+        (" SETTINGS ", Color::Yellow, "Esc: close")
+    } else if app.models.open {
+        (" MODEL ", Color::Yellow, "Esc: close")
+    } else if app.access_open {
+        (" ACCESS ", Color::Yellow, "Esc: close")
+    } else if app.editing {
+        (" TYPING ", Color::Green, "Esc: normal")
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing {
+        (" EDITOR:EDIT ", Color::Green, "Esc: nav")
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 {
+        (" EDITOR ", Color::Cyan, "i/Enter: edit")
+    } else if app.focus == Focus::Workspace
+        && app.workspace_tab == 2
+        && app.local_terminal.tab_typing
+    {
+        (" TERM:TYPING ", Color::Green, "Esc: nav")
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 {
+        (" TERMINAL ", Color::Magenta, "i/Enter: type")
+    } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
+        (" GIT ", Color::Cyan, "←/h: chat")
+    } else {
+        (" NORMAL ", Color::Blue, "i/Enter: type")
+    }
+}
+
+fn format_tokens(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn render_context_usage(
+    content: &mut Text<'static>,
+    usage: Option<&crate::history::ContextUsage>,
+) {
+    crate::chat::notice(content, "Context window usage", Color::Cyan);
+    let Some(usage) = usage else {
+        crate::chat::notice(
+            content,
+            "  No context usage reported for this thread yet (or not supported by this provider).",
+            Color::DarkGray,
+        );
+        return;
+    };
+    if let Some(max) = usage.max_tokens.filter(|&m| m > 0) {
+        let ratio = (usage.used_tokens as f64 / max as f64).clamp(0.0, 1.0);
+        let pct = (usage.used_tokens as f64 / max as f64) * 100.0;
+        let width = 16_usize;
+        let filled = ((ratio * width as f64).round() as usize).min(width);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+        let bar_color = if pct >= 90.0 {
+            Color::Red
+        } else if pct >= 70.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        crate::chat::notice(
+            content,
+            format!(
+                "  [{bar}] {pct:.1}% ({} / {} tokens)",
+                format_tokens(usage.used_tokens),
+                format_tokens(max)
+            ),
+            bar_color,
+        );
+    } else {
+        crate::chat::notice(
+            content,
+            format!("  Used: {} tokens", format_tokens(usage.used_tokens)),
+            Color::Green,
+        );
+    }
+    if let Some(threshold) = usage.auto_compact_threshold {
+        crate::chat::notice(
+            content,
+            format!("  Auto-compact threshold: {} tokens", format_tokens(threshold)),
+            Color::Gray,
+        );
+    } else if usage.compacts_automatically == Some(true) {
+        crate::chat::notice(content, "  Auto-compact: enabled", Color::Gray);
+    }
+    let mut parts = Vec::new();
+    if let Some(n) = usage.input_tokens {
+        parts.push(format!("Input: {}", format_tokens(n)));
+    }
+    if let Some(n) = usage.cached_input_tokens {
+        parts.push(format!("Cached: {}", format_tokens(n)));
+    }
+    if let Some(n) = usage.output_tokens {
+        parts.push(format!("Output: {}", format_tokens(n)));
+    }
+    if let Some(n) = usage.reasoning_output_tokens {
+        parts.push(format!("Reasoning: {}", format_tokens(n)));
+    }
+    if !parts.is_empty() {
+        crate::chat::notice(content, format!("  {}", parts.join(" · ")), Color::Gray);
+    }
+    let mut extras = Vec::new();
+    if let Some(n) = usage.last_used_tokens {
+        extras.push(format!("Last turn: {}", format_tokens(n)));
+    }
+    if let Some(n) = usage.total_processed_tokens {
+        extras.push(format!("Total processed: {}", format_tokens(n)));
+    }
+    if let Some(n) = usage.tool_uses {
+        extras.push(format!("Tool uses: {n}"));
+    }
+    if let Some(cost) = &usage.cost {
+        extras.push(format!("Cost: {:.4} {}", cost.amount, cost.currency));
+    }
+    if !extras.is_empty() {
+        crate::chat::notice(content, format!("  {}", extras.join(" · ")), Color::DarkGray);
+    }
+}
+
 fn usage_panel(frame: &mut Frame, area: Rect, title: &str, app: &App, kind: &str) {
     let remaining = app
         .current_model()
@@ -1769,6 +1945,88 @@ mod tests {
         };
         let visible = render(&mut app);
         assert!(visible.contains("Installing v0.1.11…"));
+    }
+
+    #[test]
+    fn slash_context_renders_visual_usage_bar_in_chat() {
+        let mut app = App::default();
+        app.authenticated = true;
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        let snapshot = serde_json::json!({
+            "kind": "snapshot",
+            "snapshotSequence": 1,
+            "projection": {
+                "thread": {
+                    "id": "t1",
+                    "title": "Thread",
+                    "contextUsage": {
+                        "usedTokens": 64000,
+                        "maxTokens": 128000,
+                        "inputTokens": 50000,
+                        "cachedInputTokens": 10000,
+                        "outputTokens": 4000,
+                        "autoCompactThreshold": 110000
+                    }
+                },
+                "visibleTurnItems": []
+            }
+        });
+        app.apply_live("t1", Ok(serde_json::from_value(snapshot).unwrap()));
+        app.context_report_thread = Some("t1".into());
+        app.chat_revision = app.chat_revision.wrapping_add(1);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let visible = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("Context window usage"));
+        assert!(visible.contains("50.0% (64,000 / 128,000 tokens)"));
+        assert!(visible.contains("Auto-compact threshold: 110,000 tokens"));
+        assert!(visible.contains("Input: 50,000"));
+        assert!(visible.contains("Cached: 10,000"));
+        assert!(visible.contains("Output: 4,000"));
+    }
+
+    #[test]
+    fn footer_and_terminal_show_visual_mode_indicator() {
+        let render = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::default();
+        app.workspace_tab = 2;
+        let inactive = render(&mut app);
+        assert!(!inactive.contains("[NAV]"));
+        assert!(!inactive.contains("[TYPING]"));
+
+        app.focus = Focus::Workspace;
+        let nav = render(&mut app);
+        assert!(nav.contains("[NAV]"));
+        assert!(nav.contains("Enter/i: type mode"));
+
+        app.local_terminal.tab_typing = true;
+        let typing = render(&mut app);
+        assert!(typing.contains("[TYPING]"));
+        assert!(typing.contains("Esc: nav mode"));
     }
 
     #[test]
@@ -2586,5 +2844,43 @@ mod tests {
             .collect();
         assert!(text.contains("Generate commit message (g)"));
         assert!(text.contains("Commit message"));
+    }
+
+    #[test]
+    fn editor_panel_renders_file_tree_and_open_file() {
+        let mut app = App {
+            authenticated: true,
+            focus: Focus::Workspace,
+            workspace_tab: 0,
+            workspace_width: 50,
+            ..Default::default()
+        };
+        app.editor.cwd = Some("/repo".into());
+        app.editor.entries = vec![
+            crate::editor::Entry {
+                path: "src".into(),
+                kind: "directory".into(),
+                ignored: None,
+            },
+            crate::editor::Entry {
+                path: "Cargo.toml".into(),
+                kind: "file".into(),
+                ignored: None,
+            },
+        ];
+        app.editor.open_file = Some("Cargo.toml".into());
+        app.editor.lines = vec!["[package]".into(), "name = \"tui3\"".into()];
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("src/"));
+        assert!(text.contains("Cargo.toml"));
+        assert!(text.contains("[package]"));
     }
 }
