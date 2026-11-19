@@ -122,6 +122,39 @@ pub enum ClickTarget {
     Pane(Focus),
     Workspace(usize),
     TypingStyle(crate::preferences::TypingStyle),
+    ServerUpdateButton,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ServerVersionStatus {
+    #[default]
+    Unknown,
+    Checking,
+    UpToDate {
+        latest: String,
+    },
+    UpdateAvailable {
+        latest: String,
+        database_migration: Option<u64>,
+    },
+    Error(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ServerUpdateStatus {
+    #[default]
+    Idle,
+    Downloading {
+        target_version: String,
+        tick: u8,
+    },
+    Installing {
+        target_version: String,
+    },
+    Completed {
+        target_version: String,
+    },
+    Failed(String),
 }
 
 #[derive(Default)]
@@ -156,6 +189,7 @@ pub struct App {
     pub clipboard_check_requested: bool,
     pub clipboard_check_pending: bool,
     pub terminal_overlay_open: bool,
+    pub local_terminal: crate::local_terminal::LocalTerminal,
     pub typing_style: crate::preferences::TypingStyle,
     pub focus: Focus,
     pub models: crate::models::ModelPicker,
@@ -203,6 +237,12 @@ pub struct App {
     pub connection: String,
     /// Machine label reported by the connected T3 environment descriptor.
     pub environment_label: Option<String>,
+    pub server_version: Option<String>,
+    pub server_connected: bool,
+    pub server_version_status: ServerVersionStatus,
+    pub server_update_status: ServerUpdateStatus,
+    pub server_version_check_requested: bool,
+    pub server_update_requested: bool,
     pub dictation: crate::dictation::State,
     pub authenticated: bool,
     pub pairing_requested: bool,
@@ -249,6 +289,12 @@ impl Default for App {
             auto_start_highlight: true,
             settings_row: 0,
             environment_label: None,
+            server_version: None,
+            server_connected: false,
+            server_version_status: ServerVersionStatus::Unknown,
+            server_update_status: ServerUpdateStatus::Idle,
+            server_version_check_requested: false,
+            server_update_requested: false,
             dictation: Default::default(),
             git: Default::default(),
             chat_revision: 0,
@@ -269,6 +315,7 @@ impl Default for App {
             clipboard_check_requested: true,
             clipboard_check_pending: false,
             terminal_overlay_open: false,
+            local_terminal: Default::default(),
             typing_style: crate::preferences::TypingStyle::default(),
             focus: Focus::default(),
             models: crate::models::ModelPicker::default(),
@@ -352,7 +399,132 @@ impl Default for App {
     }
 }
 
+pub fn is_newer_version(current: &str, latest: &str) -> bool {
+    let parse = |s: &str| -> Option<(u64, u64, u64, String)> {
+        let s = s.trim().strip_prefix('v').unwrap_or(s.trim());
+        let (core, pre) = match s.split_once('-') {
+            Some((core, pre)) => (core, pre.to_owned()),
+            None => (s, String::new()),
+        };
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((major, minor, patch, pre))
+    };
+    match (parse(current), parse(latest)) {
+        (Some((c_maj, c_min, c_pat, c_pre)), Some((l_maj, l_min, l_pat, l_pre))) => {
+            if (l_maj, l_min, l_pat) != (c_maj, c_min, c_pat) {
+                (l_maj, l_min, l_pat) > (c_maj, c_min, c_pat)
+            } else {
+                // Stable release (empty pre) is newer than a prerelease of the same core version.
+                match (c_pre.is_empty(), l_pre.is_empty()) {
+                    (false, true) => true,
+                    (true, false) => false,
+                    _ => l_pre != c_pre && l_pre > c_pre,
+                }
+            }
+        }
+        _ => current.trim() != latest.trim(),
+    }
+}
+
 impl App {
+    pub fn request_server_version_check(&mut self) {
+        if self.authenticated
+            && !matches!(
+                self.server_update_status,
+                ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }
+            )
+        {
+            self.server_version_status = ServerVersionStatus::Checking;
+            self.server_version_check_requested = true;
+        }
+    }
+
+    pub fn release_spec(&self) -> &'static str {
+        if self
+            .server_version
+            .as_deref()
+            .is_some_and(|v| v.contains("nightly"))
+        {
+            "nightly"
+        } else {
+            "latest"
+        }
+    }
+
+    pub fn trigger_server_update_action(&mut self) {
+        if matches!(
+            self.server_update_status,
+            ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }
+        ) {
+            return;
+        }
+        if !self.authenticated {
+            self.server_version_status =
+                ServerVersionStatus::Error("Connect and sign in to T3 first.".into());
+            return;
+        }
+        match &self.server_version_status {
+            ServerVersionStatus::UpdateAvailable { latest, .. } => {
+                self.server_update_status = ServerUpdateStatus::Downloading {
+                    target_version: latest.clone(),
+                    tick: 12,
+                };
+                self.server_update_requested = true;
+            }
+            ServerVersionStatus::Checking => (),
+            _ => {
+                self.server_update_status = ServerUpdateStatus::Idle;
+                self.server_version_status = ServerVersionStatus::Checking;
+                self.server_version_check_requested = true;
+            }
+        }
+    }
+
+    pub fn apply_server_version_check(
+        &mut self,
+        result: Result<Option<crate::t3::NpmRelease>, String>,
+    ) {
+        match result {
+            Ok(Some(release)) => {
+                let is_newer = self
+                    .server_version
+                    .as_deref()
+                    .is_some_and(|current| is_newer_version(current, &release.version));
+                if is_newer {
+                    self.server_version_status = ServerVersionStatus::UpdateAvailable {
+                        latest: release.version,
+                        database_migration: release.database_migration,
+                    };
+                } else {
+                    self.server_version_status = ServerVersionStatus::UpToDate {
+                        latest: release.version,
+                    };
+                }
+            }
+            Ok(None) => {
+                self.server_version_status =
+                    ServerVersionStatus::Error("No T3 release found on npm.".into());
+            }
+            Err(error) => {
+                self.server_version_status = ServerVersionStatus::Error(error);
+            }
+        }
+    }
+
+    pub fn tick_server_update(&mut self) {
+        if let ServerUpdateStatus::Downloading { tick, .. } = &mut self.server_update_status
+            && *tick < 72
+        {
+            *tick = (*tick).saturating_add(2).min(72);
+        }
+    }
+
     pub fn finish_diff(
         &mut self,
         thread_id: String,
@@ -1420,9 +1592,9 @@ impl App {
                         }
                     }
                     "runtime-request.updated" => {
-                        if let Ok(req) = serde_json::from_value::<crate::history::RuntimeRequest>(
-                            event.payload,
-                        ) {
+                        if let Ok(req) =
+                            serde_json::from_value::<crate::history::RuntimeRequest>(event.payload)
+                        {
                             if req.status == "pending"
                                 && self.approval_dismissed_id.as_deref() != Some(req.id.as_str())
                             {
@@ -1808,6 +1980,18 @@ impl App {
         })
     }
 
+    pub fn thread_needs_approval(&self, thread_id: &str) -> bool {
+        if self.history_thread.as_deref() == Some(thread_id) && self.transcript.is_some() {
+            return self.pending_approval().is_some();
+        }
+        self.catalog.as_ref().is_some_and(|catalog| {
+            catalog
+                .threads
+                .iter()
+                .any(|thread| thread.id == thread_id && thread.needs_approval())
+        })
+    }
+
     pub fn current_runtime_mode(&self) -> Option<&str> {
         let id = self.selected_thread_id()?;
         if self.history_thread.as_deref() == Some(id)
@@ -1931,7 +2115,11 @@ impl App {
                     .clone()
                     .or_else(|| req.map(|r| r.kind.clone()))
                     .unwrap_or_else(|| "permission".into()),
-                prompt: item.prompt.clone().or_else(|| item.title.clone()).or_else(|| item.text.clone()),
+                prompt: item
+                    .prompt
+                    .clone()
+                    .or_else(|| item.title.clone())
+                    .or_else(|| item.text.clone()),
                 reason: item.reason.clone(),
                 app_name: item.app_name.clone(),
                 options,
@@ -2588,5 +2776,56 @@ mod model_tests {
         app.apply_dictation(Event::Finished(Ok("world".into())));
         assert_eq!(app.dictation.phase, Phase::Idle);
         assert_eq!(app.draft, "Hello world");
+    }
+
+    #[test]
+    fn server_version_comparison_and_update_actions() {
+        assert!(is_newer_version("0.1.10", "0.1.11"));
+        assert!(is_newer_version("v0.1.10", "0.2.0"));
+        assert!(is_newer_version("0.1.10-nightly.1", "0.1.10"));
+        assert!(!is_newer_version("0.1.10", "0.1.10"));
+        assert!(!is_newer_version("0.1.10", "0.1.9"));
+        assert!(!is_newer_version("0.1.10", "0.1.10-nightly.1"));
+
+        let mut app = App::default();
+        app.authenticated = true;
+        app.server_version = Some("0.1.10".into());
+        app.apply_server_version_check(Ok(Some(crate::t3::NpmRelease {
+            version: "0.1.10".into(),
+            database_migration: None,
+        })));
+        assert_eq!(
+            app.server_version_status,
+            ServerVersionStatus::UpToDate {
+                latest: "0.1.10".into()
+            }
+        );
+
+        app.trigger_server_update_action();
+        assert_eq!(app.server_version_status, ServerVersionStatus::Checking);
+        assert!(app.server_version_check_requested);
+
+        app.server_version_check_requested = false;
+        app.apply_server_version_check(Ok(Some(crate::t3::NpmRelease {
+            version: "0.1.11".into(),
+            database_migration: Some(3),
+        })));
+        assert_eq!(
+            app.server_version_status,
+            ServerVersionStatus::UpdateAvailable {
+                latest: "0.1.11".into(),
+                database_migration: Some(3),
+            }
+        );
+
+        app.trigger_server_update_action();
+        assert!(app.server_update_requested);
+        assert!(matches!(
+            app.server_update_status,
+            ServerUpdateStatus::Downloading {
+                ref target_version,
+                ..
+            } if target_version == "0.1.11"
+        ));
     }
 }

@@ -132,10 +132,13 @@ between workspace tools. Build each feature incrementally.
 
 ### Terminal
 
-- [x] Add a floating terminal placeholder toggled with Ctrl+J or Shift+T and closed with Esc.
+- [x] Add a floating terminal overlay opened with Ctrl+J or Shift+T.
 - [ ] Integrate an interactive terminal in the selected workspace using the supported T3 interface where available.
-- [ ] Support terminal input, output, resizing, scrollback, and clean process/session lifecycle handling.
-- [ ] Make switching between terminal input and pane navigation explicit.
+- [x] Embed a local shell PTY in the overlay, starting in the selected project/worktree; preserve the session while hidden and show its original directory.
+- [x] Support local terminal input, ANSI output, resizing, paste, scrollback, and shell cleanup on exit.
+- [x] Reply to terminal capability/status queries so Fish completes startup; verify real Fish typing, command execution, Backspace, interrupts, hide/reopen behavior, and a real fullscreen `less` session.
+- [ ] Add independent local terminal sessions when switching workspaces.
+- [x] Use Ctrl+J to leave terminal input; pass Esc, Ctrl+C, and text to the shell, with Shift+PageUp/PageDown or the mouse wheel for scrollback.
 
 ### Git
 

@@ -9,6 +9,7 @@ mod diff;
 mod git;
 mod history;
 mod input;
+mod local_terminal;
 mod message;
 mod models;
 mod pairing;
@@ -287,12 +288,79 @@ fn run(
                     app.pairing_in_progress = false;
                     continue;
                 }
+                t3::Update::ServerVersionChecked(result) => {
+                    app.apply_server_version_check(result);
+                    continue;
+                }
+                t3::Update::ServerUpdateProgress(stage) => {
+                    match stage {
+                        t3::ServerUpdateStage::Downloading => {
+                            let target_version = match &app.server_update_status {
+                                app::ServerUpdateStatus::Downloading { target_version, .. }
+                                | app::ServerUpdateStatus::Installing { target_version } => {
+                                    target_version.clone()
+                                }
+                                _ => match &app.server_version_status {
+                                    app::ServerVersionStatus::UpdateAvailable {
+                                        latest, ..
+                                    } => latest.clone(),
+                                    _ => String::new(),
+                                },
+                            };
+                            if !matches!(
+                                app.server_update_status,
+                                app::ServerUpdateStatus::Downloading { .. }
+                            ) {
+                                app.server_update_status = app::ServerUpdateStatus::Downloading {
+                                    target_version,
+                                    tick: 15,
+                                };
+                            }
+                        }
+                        t3::ServerUpdateStage::Installing => {
+                            let target_version = match &app.server_update_status {
+                                app::ServerUpdateStatus::Downloading { target_version, .. }
+                                | app::ServerUpdateStatus::Installing { target_version } => {
+                                    target_version.clone()
+                                }
+                                _ => match &app.server_version_status {
+                                    app::ServerVersionStatus::UpdateAvailable {
+                                        latest, ..
+                                    } => latest.clone(),
+                                    _ => String::new(),
+                                },
+                            };
+                            app.server_update_status =
+                                app::ServerUpdateStatus::Installing { target_version };
+                        }
+                    }
+                    continue;
+                }
+                t3::Update::ServerUpdateFinished(result) => {
+                    match result {
+                        Ok(target_version) => {
+                            app.server_update_status = app::ServerUpdateStatus::Completed {
+                                target_version: target_version.clone(),
+                            };
+                            app.server_version = Some(target_version.clone());
+                            app.server_version_status = app::ServerVersionStatus::UpToDate {
+                                latest: target_version,
+                            };
+                        }
+                        Err(error) => {
+                            app.server_update_status = app::ServerUpdateStatus::Failed(error);
+                        }
+                    }
+                    continue;
+                }
                 update => update,
             };
             app.connection = match update {
                 t3::Update::Ready(connection) => {
                     resume.activate(&connection.environment.environment_id, &mut app);
                     app.environment_label = Some(connection.environment.label.clone());
+                    app.server_version = Some(connection.environment.server_version.clone());
+                    app.server_connected = true;
                     if app.local_server_pid.is_none() {
                         app.local_server_pid = startup::local_server_pid();
                     }
@@ -300,6 +368,9 @@ fn run(
                     if app.authenticated {
                         app.pairing_in_progress = false;
                         app.pairing_message = "Signed in to T3.".into();
+                        if app.server_version_status == app::ServerVersionStatus::Unknown {
+                            app.request_server_version_check();
+                        }
                     }
                     if !app.authenticated {
                         app.clear_catalog();
@@ -318,6 +389,7 @@ fn run(
                 t3::Update::Failed(error) => {
                     // Preserve the conversation on transient connection failures. Explicit
                     // session rejection is handled by Ready(authenticated = false).
+                    app.server_connected = false;
                     app.catalog_error = Some(error.clone());
                     format!("Disconnected | {error}")
                 }
@@ -335,7 +407,10 @@ fn run(
                 | t3::Update::ModelChanged { .. }
                 | t3::Update::RuntimeModeChanged { .. }
                 | t3::Update::ApprovalResponded { .. }
-                | t3::Update::ThreadAction { .. } => {
+                | t3::Update::ThreadAction { .. }
+                | t3::Update::ServerVersionChecked(_)
+                | t3::Update::ServerUpdateProgress(_)
+                | t3::Update::ServerUpdateFinished(_) => {
                     unreachable!()
                 }
             };
@@ -412,6 +487,116 @@ fn run(
                 "Dictation is busy. Please wait and try again.".into(),
             )));
         }
+        if app.models.load_requested {
+            app.models.load_requested = false;
+            if backend.models.try_send(models::ModelCommand::Load).is_err() {
+                app.models.loading = false;
+                app.models.error = Some("Model catalog is unavailable. Press r to retry.".into());
+            }
+        }
+        if app.models.change_requested {
+            app.models.change_requested = false;
+            if let Some(request) = app.prepare_model_change()
+                && backend
+                    .models
+                    .try_send(models::ModelCommand::Set(request.clone()))
+                    .is_err()
+            {
+                app.finish_model_change(
+                    request,
+                    Err("Model changes are unavailable. Please retry.".into()),
+                );
+            }
+        }
+        if let Some(request) = app.access_requested.take()
+            && backend.runtime_modes.try_send(request.clone()).is_err()
+        {
+            app.apply_runtime_mode_change(
+                request,
+                Err("Access level changes are unavailable. Please retry.".into()),
+            );
+        }
+        if let Some(request) = app.approval_requested.take()
+            && backend.approvals.try_send(request.clone()).is_err()
+        {
+            app.apply_approval_response(
+                request,
+                Err("Approval responses are unavailable. Please retry.".into()),
+            );
+        }
+        if app.send_requested {
+            app.send_requested = false;
+            if let Some(request) = app.prepare_send()
+                && backend.messages.try_send(request.clone()).is_err()
+            {
+                app.finish_send(
+                    request,
+                    Err("Message sender is unavailable. Your draft is kept.".into()),
+                );
+            }
+        }
+        if app.server_version_check_requested {
+            app.server_version_check_requested = false;
+            let spec = app.release_spec().to_owned();
+            if backend
+                .server_updates
+                .try_send(t3::ServerCommand::CheckVersion { spec })
+                .is_err()
+            {
+                app.server_version_status =
+                    app::ServerVersionStatus::Error("Server version check is unavailable.".into());
+            }
+        }
+        if app.server_update_requested {
+            app.server_update_requested = false;
+            if let app::ServerVersionStatus::UpdateAvailable {
+                latest,
+                database_migration,
+            } = &app.server_version_status
+            {
+                if backend
+                    .server_updates
+                    .try_send(t3::ServerCommand::StartUpdate {
+                        target_version: latest.clone(),
+                        target_database_migration: *database_migration,
+                    })
+                    .is_err()
+                {
+                    app.server_update_status = app::ServerUpdateStatus::Failed(
+                        "Server update worker is unavailable.".into(),
+                    );
+                }
+            }
+        }
+        app.tick_server_update();
+        if app.pairing_requested {
+            app.pairing_requested = false;
+            match backend.pairing.try_send(()) {
+                Ok(()) => {
+                    app.pairing_in_progress = true;
+                    app.pairing_message = "Pairing with local T3…".into();
+                }
+                Err(_) => {
+                    app.pairing_message =
+                        "Pairing is unavailable. Check the server configuration and restart.".into()
+                }
+            }
+        }
+        if app.terminal_overlay_open
+            && app.local_terminal.session.is_none()
+            && app.local_terminal.error.is_none()
+        {
+            let cwd = git::workspace(&app).unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            match local_terminal::Session::start(cwd) {
+                Ok(session) => app.local_terminal.session = Some(session),
+                Err(error) => app.local_terminal.error = Some(error),
+            }
+        }
         resume.remember(&app);
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
@@ -426,6 +611,11 @@ fn run(
             match next {
                 Event::Key(key) => input::handle_key(&mut app, key),
                 Event::Mouse(mouse) => input::handle_mouse(&mut app, mouse),
+                Event::Paste(text) if app.terminal_overlay_open => {
+                    if let Some(session) = &app.local_terminal.session {
+                        session.paste(&text);
+                    }
+                }
                 Event::Paste(text)
                     if !app.terminal_overlay_open
                         && app.git.editing
@@ -438,69 +628,6 @@ fn run(
                     app.insert_draft(&text)
                 }
                 _ => (),
-            }
-            if app.models.load_requested {
-                app.models.load_requested = false;
-                if backend.models.try_send(models::ModelCommand::Load).is_err() {
-                    app.models.loading = false;
-                    app.models.error =
-                        Some("Model catalog is unavailable. Press r to retry.".into());
-                }
-            }
-            if app.models.change_requested {
-                app.models.change_requested = false;
-                if let Some(request) = app.prepare_model_change()
-                    && backend
-                        .models
-                        .try_send(models::ModelCommand::Set(request.clone()))
-                        .is_err()
-                {
-                    app.finish_model_change(
-                        request,
-                        Err("Model changes are unavailable. Please retry.".into()),
-                    );
-                }
-            }
-            if let Some(request) = app.access_requested.take()
-                && backend.runtime_modes.try_send(request.clone()).is_err()
-            {
-                app.apply_runtime_mode_change(
-                    request,
-                    Err("Access level changes are unavailable. Please retry.".into()),
-                );
-            }
-            if let Some(request) = app.approval_requested.take()
-                && backend.approvals.try_send(request.clone()).is_err()
-            {
-                app.apply_approval_response(
-                    request,
-                    Err("Approval responses are unavailable. Please retry.".into()),
-                );
-            }
-            if app.send_requested {
-                app.send_requested = false;
-                if let Some(request) = app.prepare_send()
-                    && backend.messages.try_send(request.clone()).is_err()
-                {
-                    app.finish_send(
-                        request,
-                        Err("Message sender is unavailable. Your draft is kept.".into()),
-                    );
-                }
-            }
-            if app.pairing_requested {
-                app.pairing_requested = false;
-                match backend.pairing.try_send(()) {
-                    Ok(()) => {
-                        app.pairing_in_progress = true;
-                        app.pairing_message = "Pairing with local T3…".into();
-                    }
-                    Err(_) => {
-                        app.pairing_message =
-                            "Pairing is unavailable. Check the server configuration and restart."
-                                .into()
-                    }
-                }
             }
         }
     }

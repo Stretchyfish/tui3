@@ -14,6 +14,12 @@ pub struct Project {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingRuntimeRequest {
+    pub kind: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub worktree_path: Option<String>,
     pub id: String,
@@ -23,6 +29,8 @@ pub struct Thread {
     pub model_selection: Option<crate::models::ModelSelection>,
     #[serde(default)]
     pub runtime_mode: Option<String>,
+    #[serde(default)]
+    pub pending_runtime_request: Option<PendingRuntimeRequest>,
     pub archived_at: Option<String>,
     pub deleted_at: Option<String>,
 }
@@ -88,6 +96,15 @@ impl Thread {
             self.status.as_str(),
             "preparing" | "queued" | "starting" | "running" | "waiting"
         )
+    }
+
+    pub fn needs_approval(&self) -> bool {
+        self.pending_runtime_request.as_ref().is_some_and(|req| {
+            matches!(
+                req.kind.as_str(),
+                "command" | "file-read" | "file-change" | "mcp-elicitation" | "permission"
+            )
+        })
     }
 }
 

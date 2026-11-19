@@ -13,6 +13,17 @@ fn copy_selection(app: &mut App) {
 pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     use crate::app::ClickTarget;
     use crossterm::event::{MouseButton, MouseEventKind};
+    if app.terminal_overlay_open {
+        if let Some(session) = &app.local_terminal.session {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => session.scroll(3),
+                MouseEventKind::ScrollDown => session.scroll(-3),
+                _ => (),
+            }
+        }
+        return;
+    }
+
     let point = (mouse.row, mouse.column);
     if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
         app.context_menu = Some((mouse.column, mouse.row));
@@ -221,12 +232,41 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.style_highlight = style;
             app.typing_style = style;
         }
+        Some(ClickTarget::ServerUpdateButton) => {
+            app.settings_row = 3;
+            app.trigger_server_update_action();
+        }
         None => (),
     }
 }
 
 pub fn handle_key(app: &mut App, mut key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
+        return;
+    }
+    if app.terminal_overlay_open {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+            app.terminal_overlay_open = false;
+            app.local_terminal.error = None;
+            if app
+                .local_terminal
+                .session
+                .as_ref()
+                .is_some_and(|s| s.status.lock().unwrap().is_some())
+            {
+                app.local_terminal.session = None;
+            }
+        } else if let Some(session) = &app.local_terminal.session {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            {
+                session.scroll(if key.code == KeyCode::PageUp { 10 } else { -10 });
+            } else {
+                session.scroll(-isize::MAX);
+                let application = session.parser.lock().unwrap().screen().application_cursor();
+                session.send(crate::local_terminal::key_bytes(key, application));
+            }
+        }
         return;
     }
     let entering_text =
@@ -293,6 +333,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             app.dictation.toggle_requested = true;
         }
         app.dictation.send_on_finish = true;
+        app.editing = false;
         return;
     }
     if app.dictation.listening()
@@ -362,16 +403,6 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 && !app.startup.open))
     {
         app.terminal_overlay_open = !app.terminal_overlay_open;
-        return;
-    }
-    if app.terminal_overlay_open {
-        if key.code == KeyCode::Esc {
-            app.terminal_overlay_open = false;
-        } else if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c' | 'q'))
-        {
-            app.request_quit();
-        }
         return;
     }
     if app.editing
@@ -461,6 +492,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 app.clipboard_check_requested = true;
                 app.auto_start_highlight = app.auto_start_t3;
                 app.style_highlight = app.typing_style;
+                app.request_server_version_check();
             }
             _ => (),
         }
@@ -471,11 +503,12 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Char('r') => {
                 app.clipboard_status = crate::app::ClipboardStatus::Checking;
                 app.clipboard_check_requested = true;
+                app.request_server_version_check();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.settings_row = app.settings_row.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(2),
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(3),
             KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
                 app.auto_start_highlight = false
             }
@@ -494,6 +527,11 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 2 => {
                 app.diff_view.wrap = app.diff_wrap_highlight
             }
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 3 => {
+                app.trigger_server_update_action();
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if app.settings_row == 3 => {}
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
                 app.style_highlight = app.style_highlight.cycle(true);
@@ -803,6 +841,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             app.style_highlight = app.typing_style;
             app.settings_open = true;
             app.clipboard_check_requested = true;
+            app.request_server_version_check();
         }
         KeyCode::Char('o') => app.startup.open = true,
         KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => app.focus = Focus::Chat,
@@ -1166,10 +1205,16 @@ mod tests {
             focus: Focus::Composer,
             ..App::default()
         };
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
         assert!(app.focus == Focus::Projects);
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
         assert!(app.focus == Focus::Chat);
 
         app.focus = Focus::Projects;
@@ -1206,7 +1251,10 @@ mod tests {
         app.sync_history_selection();
         app.focus = Focus::Model;
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
         assert!(app.focus == Focus::Access);
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1254,7 +1302,10 @@ mod tests {
         assert!(app.active_approval_popup().is_none());
 
         app.focus = Focus::Chat;
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
         assert!(app.active_approval_popup().is_some());
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -1945,12 +1996,14 @@ mod tests {
     fn enter_while_dictating_stops_and_sends_on_finish() {
         let mut app = App {
             focus: Focus::Composer,
+            editing: true,
             draft_thread: Some("t1".into()),
             ..Default::default()
         };
         app.dictation.phase = crate::dictation::Phase::Recording;
         app.dictation.thread = Some("t1".into());
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.editing);
         assert!(app.dictation.toggle_requested);
         assert!(app.dictation.send_on_finish);
         assert!(!app.send_requested);
@@ -1960,6 +2013,7 @@ mod tests {
         )));
         assert_eq!(app.draft, "ship this message");
         assert!(app.send_requested);
+        assert!(!app.editing);
     }
 
     #[test]
@@ -2057,5 +2111,125 @@ mod tests {
 
         app.finish_send(request, Ok(()));
         assert!(!app.is_fresh_context());
+    }
+
+    #[test]
+    fn settings_row_3_navigates_and_triggers_server_update_action() {
+        let mut app = App::default();
+        app.authenticated = true;
+        app.server_version = Some("0.1.10".into());
+        app.server_version_status = crate::app::ServerVersionStatus::UpdateAvailable {
+            latest: "0.1.11".into(),
+            database_migration: None,
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert!(app.settings_open);
+        assert_eq!(app.settings_row, 0);
+        // Opening settings triggers a fresh version check; restore UpdateAvailable for action test.
+        app.server_version_status = crate::app::ServerVersionStatus::UpdateAvailable {
+            latest: "0.1.11".into(),
+            database_migration: None,
+        };
+        for _ in 0..4 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.settings_row, 3);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.server_update_requested);
+        assert!(matches!(
+            app.server_update_status,
+            crate::app::ServerUpdateStatus::Downloading { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod terminal_overlay_tests {
+    use super::*;
+    #[test]
+    fn overlay_routes_real_typing_to_fish_and_survives_hiding() {
+        if !std::path::Path::new("/usr/bin/fish").exists() {
+            return;
+        }
+        let mut app = App {
+            terminal_overlay_open: true,
+            ..App::default()
+        };
+        app.local_terminal.session = Some(
+            crate::local_terminal::Session::start_shell("/tmp".into(), "/usr/bin/fish".into())
+                .unwrap(),
+        );
+        for c in "printf 'routed_%s_ok\\n' keyx".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let contents = app
+                .local_terminal
+                .session
+                .as_ref()
+                .unwrap()
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents();
+            if contents.contains("routed_keys_ok") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed command did not execute: {contents}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for _ in 0..2 {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            );
+        }
+        assert!(app.terminal_overlay_open);
+        assert!(app.local_terminal.session.is_some());
+        assert!(!app.quit);
+    }
+    #[test]
+    fn overlay_keeps_escape_interrupt_and_text_inside_terminal() {
+        let mut app = App::default();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(app.terminal_overlay_open);
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+        ] {
+            handle_key(&mut app, key);
+            assert!(app.terminal_overlay_open);
+            assert!(!app.quit);
+            assert!(app.quit_dialog.is_none());
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.terminal_overlay_open);
     }
 }

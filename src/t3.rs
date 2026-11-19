@@ -79,6 +79,29 @@ impl ApprovalResponse {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpmRelease {
+    pub version: String,
+    pub database_migration: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerUpdateStage {
+    Downloading,
+    Installing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerCommand {
+    CheckVersion {
+        spec: String,
+    },
+    StartUpdate {
+        target_version: String,
+        target_database_migration: Option<u64>,
+    },
+}
+
 pub enum Update {
     Git {
         request: crate::git::Request,
@@ -129,6 +152,9 @@ pub enum Update {
         thread_id: String,
         result: Result<crate::history::Transcript, String>,
     },
+    ServerVersionChecked(Result<Option<NpmRelease>, String>),
+    ServerUpdateProgress(ServerUpdateStage),
+    ServerUpdateFinished(Result<String, String>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -192,6 +218,17 @@ impl Config {
             bootstrap_token,
         })
     }
+}
+
+fn extract_rpc_reason(exit: &serde_json::Value) -> Option<String> {
+    exit["cause"]["failure"]["reason"]
+        .as_str()
+        .or_else(|| exit["cause"]["error"]["reason"].as_str())
+        .or_else(|| exit["cause"]["failure"]["message"].as_str())
+        .or_else(|| exit["cause"]["error"]["message"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 pub struct T3Client {
@@ -729,6 +766,219 @@ impl T3Client {
         Ok(())
     }
 
+    async fn check_npm_release(&self, spec: &str) -> Result<Option<NpmRelease>, String> {
+        let mut socket = self.websocket().await?;
+        let request = serde_json::json!({
+            "_tag": "Request",
+            "id": "1",
+            "tag": "server.getNpmRelease",
+            "payload": { "spec": spec },
+            "headers": [],
+        });
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .map_err(|_| "Could not check T3 server version.".to_owned())?;
+        let operation = async {
+            while let Some(frame) = socket.next().await {
+                let frame = frame
+                    .map_err(|_| "Connection lost while checking server version.".to_owned())?;
+                let data = match frame {
+                    Message::Text(text) => text.as_bytes().to_vec(),
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Ping(data) => {
+                        socket.send(Message::Pong(data)).await.map_err(|_| {
+                            "T3 connection lost while checking server version.".to_owned()
+                        })?;
+                        continue;
+                    }
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                let value: serde_json::Value = serde_json::from_slice(&data)
+                    .map_err(|_| "Invalid T3 version response.".to_owned())?;
+                let messages = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+                for message in messages {
+                    if message["_tag"] == "Ping" {
+                        socket
+                            .send(Message::Text(r#"{"_tag":"Pong"}"#.into()))
+                            .await
+                            .map_err(|_| {
+                                "T3 connection lost while checking server version.".to_owned()
+                            })?;
+                    } else if message["_tag"] == "Exit" && message["requestId"] == "1" {
+                        let result = if message["exit"]["_tag"] == "Success" {
+                            let val = &message["exit"]["value"];
+                            if val.is_null() {
+                                Ok(None)
+                            } else {
+                                let version =
+                                    val["version"].as_str().map(str::to_owned).ok_or_else(
+                                        || "T3 returned invalid release metadata.".to_owned(),
+                                    )?;
+                                let database_migration = val["databaseMigration"].as_u64();
+                                Ok(Some(NpmRelease {
+                                    version,
+                                    database_migration,
+                                }))
+                            }
+                        } else {
+                            Err(extract_rpc_reason(&message["exit"])
+                                .unwrap_or_else(|| "Could not check T3 server version.".into()))
+                        };
+                        let _ = socket.close(None).await;
+                        return result;
+                    } else if message["_tag"] == "Defect" {
+                        return Err("T3 could not check server version.".into());
+                    }
+                }
+            }
+            Err("T3 closed before returning version information.".into())
+        };
+        tokio::time::timeout(Duration::from_secs(20), operation)
+            .await
+            .map_err(|_| "T3 version check timed out.".to_owned())?
+    }
+
+    async fn update_server_with_progress(
+        &self,
+        target_version: &str,
+        target_database_migration: Option<u64>,
+        updates: &mpsc::Sender<Update>,
+    ) -> Result<String, String> {
+        let mut payload = serde_json::json!({
+            "targetVersion": target_version,
+        });
+        if let Some(migration) = target_database_migration {
+            payload["targetDatabaseMigration"] = serde_json::json!(migration);
+        }
+        let mut socket = self.websocket().await?;
+        let request = serde_json::json!({
+            "_tag": "Request",
+            "id": "1",
+            "tag": "server.updateServerWithProgress",
+            "payload": payload,
+            "headers": [],
+        });
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .map_err(|_| "Could not start T3 server update.".to_owned())?;
+
+        let stream = async {
+            let mut completed_version: Option<String> = None;
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            let mut received = tokio::time::Instant::now();
+            loop {
+                let frame = tokio::select! {
+                    frame = socket.next() => frame
+                        .ok_or_else(|| "T3 connection closed during update.".to_owned())?
+                        .map_err(|_| "T3 connection lost during update.".to_owned())?,
+                    _ = heartbeat.tick() => {
+                        if received.elapsed() > Duration::from_secs(60) {
+                            return Err("T3 server update stopped responding.".into());
+                        }
+                        socket
+                            .send(Message::Text(r#"{"_tag":"Ping"}"#.into()))
+                            .await
+                            .map_err(|_| "T3 connection lost during update.".to_owned())?;
+                        continue;
+                    }
+                };
+                received = tokio::time::Instant::now();
+                let data = match frame {
+                    Message::Text(text) => text.as_bytes().to_vec(),
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Ping(data) => {
+                        socket
+                            .send(Message::Pong(data))
+                            .await
+                            .map_err(|_| "T3 connection lost during update.".to_owned())?;
+                        continue;
+                    }
+                    Message::Close(_) => {
+                        return if let Some(version) = completed_version {
+                            Ok(version)
+                        } else {
+                            Err("T3 connection closed before update completed.".into())
+                        };
+                    }
+                    _ => continue,
+                };
+                let value: serde_json::Value = serde_json::from_slice(&data)
+                    .map_err(|_| "Invalid T3 update response.".to_owned())?;
+                let messages = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+                for message in messages {
+                    match message["_tag"].as_str() {
+                        Some("Ping") => {
+                            socket
+                                .send(Message::Text(r#"{"_tag":"Pong"}"#.into()))
+                                .await
+                                .map_err(|_| "T3 connection lost during update.".to_owned())?;
+                        }
+                        Some("Chunk") if message["requestId"] == "1" => {
+                            let values = message["values"]
+                                .as_array()
+                                .ok_or_else(|| "Invalid T3 update stream chunk.".to_owned())?;
+                            for value in values {
+                                match value["type"].as_str() {
+                                    Some("progress") => {
+                                        let stage = match value["stage"].as_str() {
+                                            Some("downloading") => {
+                                                Some(ServerUpdateStage::Downloading)
+                                            }
+                                            Some("installing") => {
+                                                Some(ServerUpdateStage::Installing)
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(stage) = stage {
+                                            updates
+                                                .send(Update::ServerUpdateProgress(stage))
+                                                .map_err(|_| "TUI closed.".to_owned())?;
+                                        }
+                                    }
+                                    Some("complete") => {
+                                        let ver = value["result"]["targetVersion"]
+                                            .as_str()
+                                            .unwrap_or(target_version)
+                                            .to_owned();
+                                        completed_version = Some(ver);
+                                    }
+                                    _ => (),
+                                }
+                            }
+                            socket
+                                .send(Message::Text(r#"{"_tag":"Ack","requestId":"1"}"#.into()))
+                                .await
+                                .map_err(|_| "T3 update acknowledgement failed.".to_owned())?;
+                        }
+                        Some("Exit") if message["requestId"] == "1" => {
+                            let _ = socket.close(None).await;
+                            if message["exit"]["_tag"] == "Success" {
+                                return Ok(
+                                    completed_version.unwrap_or_else(|| target_version.to_owned())
+                                );
+                            }
+                            return Err(extract_rpc_reason(&message["exit"])
+                                .unwrap_or_else(|| "T3 server update failed.".into()));
+                        }
+                        Some("Defect") => {
+                            return Err("T3 could not process the server update.".into());
+                        }
+                        _ => (),
+                    }
+                }
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(180), stream)
+            .await
+            .map_err(|_| "T3 server update timed out.".to_owned())?
+    }
+
     async fn send_message(
         &self,
         request: &crate::message::SendRequest,
@@ -953,6 +1203,7 @@ pub struct Backend {
     pub approvals: tokio::sync::mpsc::Sender<ApprovalResponse>,
     pub dictation: tokio::sync::mpsc::Sender<crate::dictation::Command>,
     pub thread_actions: tokio::sync::mpsc::Sender<ThreadAction>,
+    pub server_updates: tokio::sync::mpsc::Sender<ServerCommand>,
 }
 
 pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
@@ -1037,6 +1288,8 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
     let runtime_mode_updates = sender.clone();
     let approval_authorization = authorization.clone();
     let approval_updates = sender.clone();
+    let server_update_authorization = authorization.clone();
+    let server_update_updates = sender.clone();
     let (models, mut model_requests) = tokio::sync::mpsc::channel::<crate::models::ModelCommand>(2);
     runtime.spawn(async move {
         while let Some(command) = model_requests.recv().await {
@@ -1314,6 +1567,42 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
             }
         }
     });
+    let (server_updates, mut server_update_requests) =
+        tokio::sync::mpsc::channel::<ServerCommand>(4);
+    runtime.spawn(async move {
+        while let Some(command) = server_update_requests.recv().await {
+            let config = server_update_authorization.borrow().clone();
+            let client = config
+                .ok_or_else(|| "Sign in to T3 first.".to_owned())
+                .and_then(T3Client::new);
+            let update = match command {
+                ServerCommand::CheckVersion { spec } => {
+                    Update::ServerVersionChecked(match client {
+                        Ok(client) => client.check_npm_release(&spec).await,
+                        Err(error) => Err(error),
+                    })
+                }
+                ServerCommand::StartUpdate {
+                    target_version,
+                    target_database_migration,
+                } => Update::ServerUpdateFinished(match client {
+                    Ok(client) => {
+                        client
+                            .update_server_with_progress(
+                                &target_version,
+                                target_database_migration,
+                                &server_update_updates,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }),
+            };
+            if server_update_updates.send(update).is_err() {
+                break;
+            }
+        }
+    });
     Backend {
         git,
         diffs,
@@ -1326,6 +1615,7 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         approvals,
         dictation,
         thread_actions,
+        server_updates,
     }
 }
 
@@ -1950,5 +2240,149 @@ mod tests {
             assert!(!error.contains(body));
             worker.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn check_npm_release_and_update_stream_handle_progress_and_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            // 1. server.getNpmRelease
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let req: serde_json::Value =
+                serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(req["tag"], "server.getNpmRelease");
+            assert_eq!(req["payload"]["spec"], "latest");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "_tag": "Exit",
+                        "requestId": "1",
+                        "exit": {
+                            "_tag": "Success",
+                            "value": { "version": "0.1.11", "databaseMigration": 4 }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // 2. server.updateServerWithProgress (success)
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let req: serde_json::Value =
+                serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(req["tag"], "server.updateServerWithProgress");
+            assert_eq!(req["payload"]["targetVersion"], "0.1.11");
+            assert_eq!(req["payload"]["targetDatabaseMigration"], 4);
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "_tag": "Chunk",
+                        "requestId": "1",
+                        "values": [{ "type": "progress", "stage": "downloading" }]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let ack: serde_json::Value =
+                serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ack["_tag"], "Ack");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "_tag": "Chunk",
+                        "requestId": "1",
+                        "values": [
+                            { "type": "progress", "stage": "installing" },
+                            { "type": "complete", "result": { "targetVersion": "0.1.11", "method": "boot-service" } }
+                        ]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let ack: serde_json::Value =
+                serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap();
+            assert_eq!(ack["_tag"], "Ack");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "_tag": "Exit",
+                        "requestId": "1",
+                        "exit": { "_tag": "Success", "value": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // 3. server.updateServerWithProgress (failure reason)
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "_tag": "Exit",
+                        "requestId": "1",
+                        "exit": {
+                            "_tag": "Failure",
+                            "cause": {
+                                "failure": {
+                                    "reason": "Update the desktop app to update this server."
+                                }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let config = Config {
+            origin,
+            access_token: Some("test-access".into()),
+            bootstrap_token: None,
+        };
+        let client = T3Client::new(config).unwrap();
+        let release = client.check_npm_release("latest").await.unwrap().unwrap();
+        assert_eq!(release.version, "0.1.11");
+        assert_eq!(release.database_migration, Some(4));
+
+        let (tx, rx) = mpsc::channel();
+        let updated = client
+            .update_server_with_progress("0.1.11", Some(4), &tx)
+            .await
+            .unwrap();
+        assert_eq!(updated, "0.1.11");
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Update::ServerUpdateProgress(ServerUpdateStage::Downloading),
+                Update::ServerUpdateProgress(ServerUpdateStage::Installing),
+            ]
+        ));
+
+        let err = client
+            .update_server_with_progress("0.1.11", Some(4), &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Update the desktop app to update this server.");
+        server.await.unwrap();
     }
 }

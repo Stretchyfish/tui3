@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -98,17 +98,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let host = app.environment_label.as_deref();
         let items = app.rows.iter().map(|row| {
             let mut line = match &row.selection {
-                crate::catalog::Selection::Thread(id) if app.is_thread_running(id) => {
+                crate::catalog::Selection::Thread(id)
+                    if app.thread_needs_approval(id) || app.is_thread_running(id) =>
+                {
+                    let (icon, color) = if app.thread_needs_approval(id) {
+                        ("🔒", Color::Yellow)
+                    } else {
+                        ("●", Color::Green)
+                    };
                     if let Some(rest) = row.label.strip_prefix("  · ") {
                         Line::from(vec![
                             Span::raw("  "),
-                            Span::styled("●", Style::default().fg(Color::Green)),
+                            Span::styled(icon, Style::default().fg(color)),
                             Span::raw(" "),
                             Span::raw(rest),
                         ])
                     } else {
                         Line::from(vec![
-                            Span::styled("● ", Style::default().fg(Color::Green)),
+                            Span::styled(format!("{icon} "), Style::default().fg(color)),
                             Span::raw(row.label.as_str()),
                         ])
                     }
@@ -731,11 +738,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .areas(center);
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new("Terminal panel placeholder")
-                .block(panel(" Terminal ", true).title_bottom(" Ctrl+J, Shift+T or Esc: close ")),
-            area,
-        );
+        let block = panel(" Local terminal ", true)
+            .title_bottom(" Ctrl+J: hide | Shift+PgUp/PgDn: scroll ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if let Some(session) = &mut app.local_terminal.session {
+            session.resize(inner.height, inner.width);
+            let parser = session.parser.lock().unwrap();
+            frame.render_widget(
+                tui_term::widget::PseudoTerminal::new(parser.screen()),
+                inner,
+            );
+            let status = session.status.lock().unwrap();
+            let title = status.as_deref().unwrap_or(&session.cwd);
+            frame.render_widget(
+                Paragraph::new(format!(" {title} ")),
+                ratatui::layout::Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(
+                    app.local_terminal
+                        .error
+                        .as_deref()
+                        .unwrap_or("Starting local shell…"),
+                ),
+                inner,
+            );
+        }
     }
     app.screen_buffer = app.screen_selection.map(|_| frame.buffer_mut().clone());
     if let Some((a, b)) = app.screen_selection {
@@ -1144,9 +1174,9 @@ fn draw_workspace_tab(
 
 fn settings_panel(frame: &mut Frame, app: &mut App) {
     let [_, center, _] = Layout::vertical([
-        Constraint::Percentage(15),
-        Constraint::Percentage(70),
-        Constraint::Percentage(15),
+        Constraint::Percentage(8),
+        Constraint::Percentage(84),
+        Constraint::Percentage(8),
     ])
     .areas(frame.area());
     let [_, area, _] = Layout::horizontal([
@@ -1157,10 +1187,17 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
     .areas(center);
     frame.render_widget(Clear, area);
     let block = panel(" Settings ", true)
-        .title_bottom(" r: recheck clipboard · Esc/s: close ")
+        .title_bottom(" r: recheck clipboard & server · Esc/s: close ")
         .style(Style::default().bg(Color::Black).fg(Color::White));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let has_server_progress = !matches!(
+        app.server_update_status,
+        crate::app::ServerUpdateStatus::Idle
+    ) || matches!(
+        app.server_version_status,
+        crate::app::ServerVersionStatus::Error(_)
+    );
     let [
         heading,
         selector,
@@ -1168,6 +1205,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         startup_selector,
         wrap_heading,
         wrap_selector,
+        server_heading,
+        server_row,
+        server_progress,
         clipboard_heading,
         clipboard_result,
         details,
@@ -1178,6 +1218,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(if has_server_progress { 2 } else { 0 }),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(0),
@@ -1234,6 +1277,7 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
             app.settings_row == 2 && app.diff_wrap_highlight == value,
         );
     }
+    render_server_settings_row(frame, app, server_heading, server_row, server_progress);
     frame.render_widget(Paragraph::new("Desktop clipboard"), clipboard_heading);
     let (status, color) = match &app.clipboard_status {
         crate::app::ClipboardStatus::Checking => {
@@ -1262,6 +1306,130 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         app.connection, model,
     );
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), details);
+}
+
+fn render_server_settings_row(
+    frame: &mut Frame,
+    app: &mut App,
+    heading_area: Rect,
+    row_area: Rect,
+    progress_area: Rect,
+) {
+    use crate::app::{ServerUpdateStatus, ServerVersionStatus};
+    frame.render_widget(Paragraph::new("T3 server"), heading_area);
+    let [status_area, button_area] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(24)])
+            .spacing(1)
+            .areas(row_area);
+
+    let (conn_label, conn_color) = if app.server_connected && app.authenticated {
+        ("Connected", Color::Green)
+    } else if app.server_connected {
+        ("Auth required", Color::Yellow)
+    } else {
+        ("Disconnected", Color::Red)
+    };
+    let ver_label = app
+        .server_version
+        .as_deref()
+        .map(|v| format!("v{v}"))
+        .unwrap_or_else(|| "unknown".into());
+    let (check_label, check_color) = match &app.server_version_status {
+        ServerVersionStatus::Unknown => ("Not checked".to_owned(), Color::DarkGray),
+        ServerVersionStatus::Checking => ("Checking version…".to_owned(), Color::Yellow),
+        ServerVersionStatus::UpToDate { .. } => ("Up to date".to_owned(), Color::Green),
+        ServerVersionStatus::UpdateAvailable { latest, .. } => {
+            (format!("Update available (v{latest})"), Color::Yellow)
+        }
+        ServerVersionStatus::Error(_) => ("Version check failed".to_owned(), Color::Red),
+    };
+    let status_line = Line::from(vec![
+        Span::styled(conn_label, Style::default().fg(conn_color)),
+        Span::raw(format!(" · {ver_label} · ")),
+        Span::styled(check_label, Style::default().fg(check_color)),
+    ]);
+    let status_block =
+        Block::bordered().border_style(Style::default().fg(Color::DarkGray).bg(Color::Black));
+    frame.render_widget(
+        Paragraph::new(status_line)
+            .block(status_block)
+            .style(Style::default().bg(Color::Black)),
+        status_area,
+    );
+
+    let (button_label, button_active) =
+        match (&app.server_update_status, &app.server_version_status) {
+            (ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }, _) => {
+                ("Updating…".to_owned(), false)
+            }
+            (ServerUpdateStatus::Completed { .. }, _) => ("Updated".to_owned(), true),
+            (_, ServerVersionStatus::UpToDate { .. }) => ("Up to date".to_owned(), true),
+            (_, ServerVersionStatus::UpdateAvailable { latest, .. }) => {
+                (format!("Update v{latest}"), false)
+            }
+            (_, ServerVersionStatus::Checking) => ("Checking…".to_owned(), false),
+            (_, ServerVersionStatus::Unknown | ServerVersionStatus::Error(_)) => {
+                ("Check update".to_owned(), false)
+            }
+        };
+    app.click_targets
+        .push((button_area, crate::app::ClickTarget::ServerUpdateButton));
+    selector_box(
+        frame,
+        button_area,
+        &button_label,
+        button_active,
+        app.settings_row == 3,
+    );
+
+    if progress_area.height == 0 {
+        return;
+    }
+    match &app.server_update_status {
+        ServerUpdateStatus::Downloading {
+            target_version,
+            tick,
+        } => {
+            let ratio = f64::from((*tick).min(95)) / 100.0;
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+                .ratio(ratio)
+                .label(format!("Downloading v{target_version}…"));
+            frame.render_widget(gauge, progress_area);
+        }
+        ServerUpdateStatus::Installing { target_version } => {
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+                .ratio(0.88)
+                .label(format!("Installing v{target_version}…"));
+            frame.render_widget(gauge, progress_area);
+        }
+        ServerUpdateStatus::Completed { target_version } => {
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                .ratio(1.0)
+                .label(format!("Updated to v{target_version}"));
+            frame.render_widget(gauge, progress_area);
+        }
+        ServerUpdateStatus::Failed(error) => {
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .style(Style::default().fg(Color::Red))
+                    .wrap(Wrap { trim: false }),
+                progress_area,
+            );
+        }
+        ServerUpdateStatus::Idle => {
+            if let ServerVersionStatus::Error(error) = &app.server_version_status {
+                frame.render_widget(
+                    Paragraph::new(error.as_str())
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: false }),
+                    progress_area,
+                );
+            }
+        }
+    }
 }
 
 fn usage_panel(frame: &mut Frame, area: Rect, title: &str, app: &App, kind: &str) {
@@ -1478,7 +1646,9 @@ fn approval_panel(frame: &mut Frame, app: &App, pending: &crate::app::PendingApp
 }
 
 fn centered_box(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(2)).max(20.min(area.width));
+    let w = width
+        .min(area.width.saturating_sub(2))
+        .max(20.min(area.width));
     let h = height
         .min(area.height.saturating_sub(2))
         .max(7.min(area.height));
@@ -1501,6 +1671,78 @@ pub(crate) fn panel(title: &str, focused: bool) -> Block<'_> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn settings_shows_t3_server_status_and_update_progress() {
+        use crate::app::{ClickTarget, ServerUpdateStatus, ServerVersionStatus};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let render = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::default();
+        app.settings_open = true;
+        app.server_connected = true;
+        app.authenticated = true;
+        app.server_version = Some("0.1.10".into());
+        app.server_version_status = ServerVersionStatus::UpToDate {
+            latest: "0.1.10".into(),
+        };
+        let visible = render(&mut app);
+        assert!(visible.contains("T3 server"));
+        assert!(visible.contains("Connected · v0.1.10 · Up to date"));
+        assert!(visible.contains("Up to date"));
+
+        app.server_version_status = ServerVersionStatus::UpdateAvailable {
+            latest: "0.1.11".into(),
+            database_migration: Some(4),
+        };
+        let visible = render(&mut app);
+        assert!(visible.contains("Update available (v0.1.11)"));
+        assert!(visible.contains("Update v0.1.11"));
+
+        let button = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| matches!(target, ClickTarget::ServerUpdateButton))
+            .unwrap()
+            .0;
+        crate::input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.server_update_requested);
+        assert!(matches!(
+            app.server_update_status,
+            ServerUpdateStatus::Downloading { .. }
+        ));
+
+        let visible = render(&mut app);
+        assert!(visible.contains("Updating…"));
+        assert!(visible.contains("Downloading v0.1.11…"));
+
+        app.server_update_status = ServerUpdateStatus::Installing {
+            target_version: "0.1.11".into(),
+        };
+        let visible = render(&mut app);
+        assert!(visible.contains("Installing v0.1.11…"));
+    }
 
     #[test]
     fn settings_shows_clipboard_access_state() {
@@ -1779,6 +2021,38 @@ mod tests {
     }
 
     #[test]
+    fn approval_pending_threads_show_lock_indicator_in_project_menu() {
+        let mut catalog = crate::catalog::tests::snapshot();
+        let mut waiting_thread = catalog.threads[0].clone();
+        waiting_thread.id = "t-approval".into();
+        waiting_thread.title = "Needs approval".into();
+        waiting_thread.status = "waiting".into();
+        waiting_thread.pending_runtime_request = Some(crate::catalog::PendingRuntimeRequest {
+            kind: "command".into(),
+        });
+        catalog.threads.push(waiting_thread);
+        let mut app = App::default();
+        app.update_catalog(catalog);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found_lock = false;
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if line.contains("Needs approval") {
+                assert!(!line.contains('●'));
+                found_lock = (0..buffer.area.width).any(|x| {
+                    let cell = &buffer[(x, y)];
+                    cell.symbol() == "🔒" && cell.fg == Color::Yellow
+                });
+            }
+        }
+        assert!(found_lock);
+    }
+
+    #[test]
     fn thread_menu_renders_options_rename_and_delete() {
         let mut app = App {
             thread_menu: Some(crate::app::ThreadMenu {
@@ -1959,7 +2233,9 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(app.click_targets.iter().all(|(_, target)| matches!(
             target,
-            ClickTarget::TypingStyle(_) | ClickTarget::AutoStart(_)
+            ClickTarget::TypingStyle(_)
+                | ClickTarget::AutoStart(_)
+                | ClickTarget::ServerUpdateButton
         )));
         let area = app
             .click_targets

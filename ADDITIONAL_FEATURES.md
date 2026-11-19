@@ -8,3 +8,8 @@
 - [x] if the user clicks enter while in the project panel on a thread it open another sub panel for more options, for now lets go with rename & delete.
 - [x] Add an access level panel next to the model selector, and show approval requests in chat with an interactive pop-up prompt for the user to respond to.
 - [x] Show queued messages at the bottom of the chat in a distinct color to highlight that they are not active yet.
+- [ ] Swap the Editor and Diffs workspace panels so Editor is the leftmost tab.
+- [ ] Investigate and refine the steering functionality (user is not convinced it is actually working).
+- [ ] Add layout presets to Settings (starting with two layouts: the current default layout, and an editor-focused layout with a narrower chat window and a wider workspace/editor panel, similar to resizing with `{`/`}`).
+- [ ] Remove the Tab hotkey for switching between panels, along with the Tab hint text in the bottom footer.
+- [ ] Overhaul `README.md` to be concise (short overview + easy `curl` install instructions; discuss details when we get there).
