@@ -104,6 +104,9 @@ impl GitState {
                 cwd: cwd.clone(),
                 operation,
             });
+        } else {
+            self.error =
+                Some("Select a project or thread with an available workspace first.".into());
         }
     }
     pub fn finish(&mut self, request: &Request, result: Result<Snapshot, String>) {
@@ -193,6 +196,7 @@ pub fn sync(app: &mut App) {
 
 pub fn key(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('p')
+        && !app.authenticated
         && !app.git.editing
         && !app.git.picking
         && app.git.confirm.is_none()
@@ -259,11 +263,7 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     match key.code {
-        KeyCode::Right | KeyCode::Char('l') if git.row == 1 => git.row = 4,
-        KeyCode::Left | KeyCode::Char('h') if git.row == 4 => git.row = 1,
-        KeyCode::Up | KeyCode::Char('k') if git.row == 4 => git.row = 0,
-        KeyCode::Down | KeyCode::Char('j') if git.row == 4 => git.row = 2,
-        KeyCode::Char('G') => git.queue(Operation::Generate(git.message.clone())),
+        KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
         KeyCode::Char('r') => git.queue(Operation::Refresh),
         KeyCode::Up | KeyCode::Char('k') if git.row > 0 => git.row = git.row.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') if git.row < 3 => git.row += 1,
@@ -276,7 +276,6 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
                 return true;
             }
             match git.row {
-                4 => git.queue(Operation::Generate(git.message.clone())),
                 0 => {
                     git.picking = true;
                     git.branch_index = git
@@ -319,9 +318,7 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let git = &app.git;
-    let block = crate::ui::panel(" Git ", app.focus == Focus::Workspace);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = area;
     let branch = git
         .snapshot
         .as_ref()
@@ -388,10 +385,29 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         "Commit all changes".into(),
         "Push".into(),
     ];
+    let generating = git
+        .request
+        .as_ref()
+        .is_some_and(|request| matches!(request.operation, Operation::Generate(_)))
+        || (git.pending.is_some() && git.notice == "Generating message…");
     for (index, rect) in rows.iter().enumerate() {
         if index == 1 {
-            let [message, generate] =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(12)]).areas(*rect);
+            let message = *rect;
+            let message_block = crate::ui::panel(
+                if generating {
+                    " Commit message · Generating… "
+                } else if git.editing {
+                    " Commit message (typing) "
+                } else {
+                    " Commit message "
+                },
+                app.focus == Focus::Workspace && git.row == 1,
+            );
+            let message_block = if generating {
+                message_block.title_bottom(" Please wait · g generates a draft ")
+            } else {
+                message_block
+            };
             crate::composer::draw(
                 frame,
                 if git.editing {
@@ -401,29 +417,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 },
                 git.message.chars().count(),
                 git.editing,
-                crate::ui::panel(
-                    if git.editing {
-                        " Commit message (typing) "
-                    } else {
-                        " Commit message "
-                    },
-                    app.focus == Focus::Workspace && git.row == 1,
-                ),
+                message_block,
                 message,
-            );
-            frame.render_widget(
-                Paragraph::new("Generate")
-                    .centered()
-                    .block(crate::ui::panel(
-                        "",
-                        app.focus == Focus::Workspace && git.row == 4,
-                    )),
-                generate,
             );
             app.click_targets
                 .push((message, crate::app::ClickTarget::GitControl(1)));
-            app.click_targets
-                .push((generate, crate::app::ClickTarget::GitControl(4)));
         } else {
             frame.render_widget(
                 Paragraph::new(labels[index].as_str()).block(crate::ui::panel(
@@ -479,7 +477,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::Cyan),
     ));
     lines.push(Line::from(
-        "↑↓/jk: select · Enter: open · G: generate · r: refresh",
+        "↑↓/jk: select · Enter: open · g: generate · r: refresh",
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -508,7 +506,7 @@ pub(crate) mod tests {
     fn generating_a_message_only_refreshes_and_preserves_concurrent_edits() {
         let mut app = ready();
         app.git.message = "Previous draft".into();
-        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('g'));
         let request = app.git.request.take().unwrap();
         assert!(matches!(request.operation, Operation::Generate(_)));
         assert!(request.payload().get("action").is_none());
@@ -522,7 +520,7 @@ pub(crate) mod tests {
         );
         assert_eq!(app.git.message, "Add word navigation to the composer");
         assert!(app.git.confirm.is_none());
-        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('g'));
         let request = app.git.request.take().unwrap();
         app.git.message = "My newer draft".into();
         app.git.finish(

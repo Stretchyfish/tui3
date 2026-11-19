@@ -10,6 +10,12 @@ pub struct ActivityNote {
     pub summary: String,
 }
 
+pub enum ClipboardStatus {
+    Checking,
+    Available,
+    Unavailable(String),
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
     #[default]
@@ -17,16 +23,67 @@ pub enum Focus {
     Chat,
     Composer,
     Model,
+    SessionUsage,
+    WeeklyUsage,
     Workspace,
     WorkspaceTabs,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuitDialog {
+    pub shutdown_server: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadMenuMode {
+    ProjectOptions,
+    Options,
+    Rename,
+    ConfirmDelete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadMenu {
+    pub thread_id: String,
+    pub original_title: String,
+    pub mode: ThreadMenuMode,
+    pub selected_option: usize,
+    pub rename_input: String,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "clear",
+        description: "Start a fresh session; earlier messages stay visible",
+    },
+    SlashCommand {
+        name: "model",
+        description: "Switch response model for this thread",
+    },
+];
 
 #[derive(Clone, Copy)]
 pub enum ClickTarget {
     StartupPrimary,
     StartupClose,
+    QuitChoice(bool),
+    QuitCancel,
+    ThreadMenuOption(usize),
+    ThreadMenuConfirm,
+    ThreadMenuCancel,
+    SlashCommand(usize),
     AutoStart(bool),
     GitControl(usize),
+    RemoveAttachment(usize),
+    SidebarRow(usize),
     DiffBody,
     DiffFile(usize),
     Pane(Focus),
@@ -34,7 +91,15 @@ pub enum ClickTarget {
     TypingStyle(crate::preferences::TypingStyle),
 }
 
+#[derive(Default)]
+pub struct ThreadDiffs {
+    pub view: crate::diff::DiffView,
+    pub counts: HashMap<String, crate::history::FileCounts>,
+    pub requested: std::collections::HashSet<String>,
+}
+
 pub struct App {
+    pub thread_diffs: HashMap<String, ThreadDiffs>,
     pub startup: crate::startup::State,
     pub auto_start_t3: bool,
     pub auto_start_highlight: bool,
@@ -49,8 +114,15 @@ pub struct App {
     pub click_targets: Vec<(ratatui::layout::Rect, ClickTarget)>,
     pub workspace_tab: usize,
     pub workspace_highlight: usize,
+    pub workspace_visible: bool,
+    pub workspace_width: u16,
+    pub diff_wrap_highlight: bool,
     pub style_highlight: crate::preferences::TypingStyle,
     pub settings_open: bool,
+    pub clipboard_status: ClipboardStatus,
+    pub clipboard_check_requested: bool,
+    pub clipboard_check_pending: bool,
+    pub terminal_overlay_open: bool,
     pub typing_style: crate::preferences::TypingStyle,
     pub focus: Focus,
     pub models: crate::models::ModelPicker,
@@ -58,9 +130,35 @@ pub struct App {
     pub live_model: Option<crate::models::ModelSelection>,
     pub draft: String,
     pub draft_cursor: usize,
+    pub draft_selection_anchor: Option<usize>,
+    pub screen_selection: Option<((u16, u16), (u16, u16))>,
+    pub screen_selection_area: Option<ratatui::layout::Rect>,
+    pub chat_text_area: ratatui::layout::Rect,
+    pub chat_selection_scroll: u16,
+    pub screen_selecting: bool,
+    pub screen_buffer: Option<ratatui::buffer::Buffer>,
+    pub copy_requested: Option<String>,
+    pub context_menu: Option<(u16, u16)>,
+    pub context_menu_area: ratatui::layout::Rect,
+    pub context_paste_requested: bool,
+    pub composer_text_area: ratatui::layout::Rect,
+    pub last_escape: Option<Instant>,
     pub editing: bool,
     pub quit: bool,
+    pub quit_dialog: Option<QuitDialog>,
+    pub local_server_pid: Option<u32>,
+    pub shutdown_server_on_quit: bool,
+    pub check_other_instances: Option<fn() -> bool>,
+    pub thread_menu: Option<ThreadMenu>,
+    pub sidebar_menu_anchor: (u16, u16),
+    pub thread_action_requested: Option<crate::t3::ThreadAction>,
+    pub fresh_context_threads: std::collections::HashSet<String>,
+    pub slash_highlight: usize,
+    pub slash_dismissed: bool,
     pub connection: String,
+    /// Machine label reported by the connected T3 environment descriptor.
+    pub environment_label: Option<String>,
+    pub dictation: crate::dictation::State,
     pub authenticated: bool,
     pub pairing_requested: bool,
     pub pairing_in_progress: bool,
@@ -83,6 +181,11 @@ pub struct App {
     pub chat_max_scroll: u16,
     pub follow_chat: bool,
     pub send_requested: bool,
+    pub steer_requested: bool,
+    pub paste_requested: bool,
+    pub paste_pending: bool,
+    pub paste_generation: u64,
+    pub images: HashMap<String, Vec<serde_json::Value>>,
     pub send_pending: Option<SendRequest>,
     pub send_notice: Option<String>,
     pub send_status: HashMap<String, String>,
@@ -95,10 +198,13 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            thread_diffs: HashMap::new(),
             startup: Default::default(),
             auto_start_t3: true,
             auto_start_highlight: true,
             settings_row: 0,
+            environment_label: None,
+            dictation: Default::default(),
             git: Default::default(),
             chat_revision: 0,
             chat_cache: None,
@@ -109,8 +215,15 @@ impl Default for App {
             click_targets: Vec::new(),
             workspace_tab: 0,
             workspace_highlight: 0,
+            workspace_visible: true,
+            workspace_width: 32,
+            diff_wrap_highlight: true,
             style_highlight: crate::preferences::TypingStyle::default(),
             settings_open: false,
+            clipboard_status: ClipboardStatus::Checking,
+            clipboard_check_requested: true,
+            clipboard_check_pending: false,
+            terminal_overlay_open: false,
             typing_style: crate::preferences::TypingStyle::default(),
             focus: Focus::default(),
             models: crate::models::ModelPicker::default(),
@@ -118,8 +231,31 @@ impl Default for App {
             live_model: None,
             draft: String::new(),
             draft_cursor: 0,
+            draft_selection_anchor: None,
+            screen_selection: None,
+            screen_selection_area: None,
+            chat_text_area: Default::default(),
+            chat_selection_scroll: 0,
+            screen_selecting: false,
+            screen_buffer: None,
+            copy_requested: None,
+            context_menu: None,
+            context_menu_area: Default::default(),
+            context_paste_requested: false,
+            composer_text_area: Default::default(),
+            last_escape: None,
             editing: false,
             quit: false,
+            quit_dialog: None,
+            local_server_pid: None,
+            shutdown_server_on_quit: false,
+            check_other_instances: None,
+            thread_menu: None,
+            sidebar_menu_anchor: (0, 0),
+            thread_action_requested: None,
+            fresh_context_threads: std::collections::HashSet::new(),
+            slash_highlight: 0,
+            slash_dismissed: false,
             connection: "Connecting to T3…".into(),
             authenticated: false,
             pairing_requested: false,
@@ -143,6 +279,11 @@ impl Default for App {
             chat_max_scroll: 0,
             follow_chat: true,
             send_requested: false,
+            steer_requested: false,
+            paste_requested: false,
+            paste_pending: false,
+            paste_generation: 0,
+            images: HashMap::new(),
             send_pending: None,
             send_notice: None,
             send_status: HashMap::new(),
@@ -155,6 +296,56 @@ impl Default for App {
 }
 
 impl App {
+    pub fn finish_diff(
+        &mut self,
+        thread_id: String,
+        run_id: String,
+        result: Result<String, String>,
+    ) {
+        if self.history_thread.as_ref() == Some(&thread_id) {
+            self.chat_revision = self.chat_revision.wrapping_add(1);
+            Self::store_diff(&mut self.diff_view, &mut self.run_diffs, run_id, result);
+        } else {
+            let cached = self.thread_diffs.entry(thread_id).or_default();
+            Self::store_diff(&mut cached.view, &mut cached.counts, run_id, result);
+        }
+    }
+
+    fn store_diff(
+        view: &mut crate::diff::DiffView,
+        counts: &mut HashMap<String, crate::history::FileCounts>,
+        run_id: String,
+        result: Result<String, String>,
+    ) {
+        match result {
+            Ok(patch) => {
+                counts
+                    .entry(run_id.clone())
+                    .or_insert_with(|| crate::history::diff_counts(&patch));
+                view.errors.remove(&run_id);
+                view.patches.insert(run_id, patch.into());
+            }
+            Err(error) => {
+                view.errors.insert(run_id, error);
+            }
+        }
+    }
+    pub fn attach_clipboard_image(&mut self, thread: String, image: serde_json::Value) {
+        let images = self.images.entry(thread).or_default();
+        let total = images
+            .iter()
+            .chain(std::iter::once(&image))
+            .map(|image| image["sizeBytes"].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        if images.len() >= 100 || total > 80 * 1024 * 1024 {
+            self.send_notice =
+                Some("T3 allows at most 100 images totaling 80 MiB per message.".into());
+            return;
+        }
+        images.push(image);
+        self.send_notice =
+            Some("Clipboard image attached. Enter sends it; Ctrl+Backspace removes images.".into());
+    }
     fn apply_checkpoint(&mut self, checkpoint: crate::history::Checkpoint) {
         if checkpoint.status != "ready" {
             return;
@@ -227,18 +418,208 @@ impl App {
         self.draft.len()
     }
 
+    pub fn selected_draft(&self) -> Option<String> {
+        let anchor = self.draft_selection_anchor?;
+        let (start, end) = (anchor.min(self.draft_cursor), anchor.max(self.draft_cursor));
+        (start < end).then(|| self.draft.chars().skip(start).take(end - start).collect())
+    }
+
+    fn delete_draft_selection(&mut self) -> bool {
+        let Some(anchor) = self.draft_selection_anchor.take() else {
+            return false;
+        };
+        let (start, end) = (anchor.min(self.draft_cursor), anchor.max(self.draft_cursor));
+        if start == end {
+            return false;
+        }
+        let start_byte = self
+            .draft
+            .char_indices()
+            .nth(start)
+            .map_or(self.draft.len(), |(i, _)| i);
+        let end_byte = self
+            .draft
+            .char_indices()
+            .nth(end)
+            .map_or(self.draft.len(), |(i, _)| i);
+        self.draft.drain(start_byte..end_byte);
+        self.draft_cursor = start;
+        true
+    }
+
+    pub fn selected_screen(&self) -> Option<String> {
+        let ((ay, ax), (by, bx)) = self.screen_selection?;
+        let buffer = self.screen_buffer.as_ref()?;
+        let ((start_y, start_x), (end_y, end_x)) = if (ay, ax) <= (by, bx) {
+            ((ay, ax), (by, bx))
+        } else {
+            ((by, bx), (ay, ax))
+        };
+        if (start_y, start_x) == (end_y, end_x) {
+            return None;
+        }
+        let area = self.screen_selection_area.unwrap_or(buffer.area);
+        let chat = self.screen_selection_area == Some(self.chat_text_area);
+        let mut lines = Vec::new();
+        for y in start_y..=end_y {
+            if y < area.y || y >= area.bottom() {
+                continue;
+            }
+            let left = if y == start_y { start_x } else { area.x };
+            let right = if y == end_y { end_x } else { area.right() };
+            let mut line = String::new();
+            for x in left.max(area.x)..right.min(area.right()) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            let line = line.trim_end();
+            let line = if chat {
+                line.strip_prefix("│ ").unwrap_or(line)
+            } else {
+                line
+            };
+            let line = line.to_owned();
+            lines.push((y, line));
+        }
+        let mut result = String::new();
+        for (index, (y, line)) in lines.into_iter().enumerate() {
+            if index > 0 {
+                let previous_y = y - 1;
+                let wrapped = chat
+                    && self.chat_viewport.as_ref().is_some_and(|viewport| {
+                        viewport.same_source_line(
+                            previous_y - area.y + self.chat_selection_scroll,
+                            y - area.y + self.chat_selection_scroll,
+                        )
+                    });
+                if !wrapped {
+                    result.push('\n');
+                }
+            }
+            result.push_str(&line);
+        }
+        Some(result)
+    }
+
     pub fn insert_draft(&mut self, text: &str) {
+        self.screen_selection = None;
+        self.delete_draft_selection();
         let byte = self.draft_byte_cursor();
-        let text = text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\t', "    ");
-        let text: String = text
-            .chars()
-            .filter(|ch| *ch == '\n' || !ch.is_control())
-            .collect();
+        let text = normalize_draft_text(text);
         self.draft.insert_str(byte, &text);
         self.draft_cursor += text.chars().count();
+    }
+
+    /// Turn pending dictation key requests into a backend command.
+    pub fn take_dictation_command(&mut self) -> Option<crate::dictation::Command> {
+        use crate::dictation::{Command, Phase};
+        if std::mem::take(&mut self.dictation.cancel_requested) {
+            self.dictation.toggle_requested = false;
+            if self.dictation.listening() {
+                self.dictation.phase = Phase::Idle;
+                self.dictation.started = None;
+                return Some(Command::Cancel);
+            }
+            return None;
+        }
+        if !std::mem::take(&mut self.dictation.toggle_requested) {
+            return None;
+        }
+        match self.dictation.phase {
+            Phase::Idle => {
+                let Some(thread) = self.draft_thread.clone() else {
+                    self.send_notice = Some("Select a thread before dictating.".into());
+                    return None;
+                };
+                self.dictation.phase = Phase::Starting;
+                self.dictation.thread = Some(thread);
+                self.dictation.level = 0.0;
+                self.send_notice = None;
+                Some(Command::Start)
+            }
+            Phase::Starting | Phase::Recording => Some(Command::Stop),
+            Phase::Transcribing => {
+                self.send_notice = Some("Still transcribing the last dictation…".into());
+                None
+            }
+        }
+    }
+
+    /// Stop before T3's five-minute audio limit.
+    pub fn check_dictation_limit(&mut self) {
+        if self.dictation.phase == crate::dictation::Phase::Recording
+            && self.dictation.started.is_some_and(|started| {
+                started.elapsed().as_secs() >= crate::dictation::AUTO_STOP_SECONDS
+            })
+            && !self.dictation.toggle_requested
+        {
+            self.dictation.toggle_requested = true;
+            self.dictation.started = None;
+        }
+    }
+
+    pub fn apply_dictation(&mut self, event: crate::dictation::Event) {
+        use crate::dictation::{Event, Phase};
+        match event {
+            Event::Recording { .. } if self.dictation.phase == Phase::Starting => {
+                self.dictation.phase = Phase::Recording;
+                self.dictation.started = Some(Instant::now());
+            }
+            Event::Recording { .. } => (),
+            Event::Level(level) => self.dictation.level = level,
+            Event::Transcribing => self.dictation.phase = Phase::Transcribing,
+            Event::Cancelled => {
+                self.dictation = Default::default();
+                self.send_notice = Some("Dictation cancelled.".into());
+            }
+            Event::Finished(result) => {
+                let thread = self.dictation.thread.take();
+                let send_after = self.dictation.send_on_finish;
+                self.dictation = Default::default();
+                match (result, thread) {
+                    (Ok(text), Some(thread)) => {
+                        let current = self.draft_thread.as_deref() == Some(thread.as_str());
+                        let prefix = if current {
+                            let byte = self.draft_byte_cursor();
+                            self.draft[..byte].to_owned()
+                        } else {
+                            self.drafts
+                                .get(&Some(thread.clone()))
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        let addition = crate::dictation::join_text(&prefix, &text);
+                        self.send_notice = Some(if addition.is_empty() {
+                            "No speech was recognized.".into()
+                        } else if self.insert_into_thread_draft(&thread, &addition) {
+                            "Dictation added to Message.".into()
+                        } else {
+                            "Dictation added to the original thread's draft.".into()
+                        });
+                        if send_after && current && !self.draft.trim().is_empty() {
+                            self.send_requested = true;
+                            self.editing = false;
+                        }
+                    }
+                    (Ok(_), None) => (),
+                    (Err(error), _) => self.send_notice = Some(error),
+                }
+            }
+        }
+    }
+
+    pub fn insert_into_thread_draft(&mut self, thread: &str, text: &str) -> bool {
+        if self.draft_thread.as_deref() == Some(thread) {
+            self.insert_draft(text);
+            true
+        } else {
+            self.drafts
+                .entry(Some(thread.to_owned()))
+                .or_default()
+                .push_str(&normalize_draft_text(text));
+            false
+        }
     }
 
     pub fn move_draft_word(&mut self, right: bool) {
@@ -260,6 +641,10 @@ impl App {
     }
 
     pub fn backspace_draft(&mut self) {
+        self.screen_selection = None;
+        if self.delete_draft_selection() {
+            return;
+        }
         use unicode_segmentation::UnicodeSegmentation;
         let end = self.draft_byte_cursor();
         if let Some((start, _)) = self.draft[..end].grapheme_indices(true).next_back() {
@@ -269,7 +654,121 @@ impl App {
         }
     }
 
+    pub fn backspace_draft_word(&mut self) {
+        self.screen_selection = None;
+        if self.delete_draft_selection() {
+            return;
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        let end = self.draft_byte_cursor();
+        if end == 0 {
+            return;
+        }
+        let start = self.draft[..end]
+            .unicode_word_indices()
+            .rev()
+            .find(|(start, _)| *start < end)
+            .map_or(0, |(start, _)| start);
+        let removed = self.draft[start..end].chars().count();
+        self.draft.drain(start..end);
+        self.draft_cursor -= removed;
+    }
+
+    pub fn select_all_draft(&mut self) {
+        self.screen_selection = None;
+        if self.draft.is_empty() {
+            self.draft_selection_anchor = None;
+            self.draft_cursor = 0;
+        } else {
+            self.draft_selection_anchor = Some(0);
+            self.draft_cursor = self.draft.chars().count();
+        }
+    }
+
+    pub fn is_fresh_context(&self) -> bool {
+        self.selected_thread_id()
+            .is_some_and(|id| self.fresh_context_threads.contains(id))
+    }
+
+    pub fn slash_query(&self) -> Option<(usize, usize, &str)> {
+        if !self.editing || self.focus != Focus::Composer || self.slash_dismissed {
+            return None;
+        }
+        let byte = self
+            .draft
+            .char_indices()
+            .nth(self.draft_cursor)
+            .map_or(self.draft.len(), |(index, _)| index);
+        let prefix = &self.draft[..byte];
+        let token_start = prefix.rfind(char::is_whitespace).map_or(0, |index| {
+            index + prefix[index..].chars().next().map_or(1, char::len_utf8)
+        });
+        let token = &prefix[token_start..];
+        let query = token.strip_prefix('/')?;
+        Some((token_start, byte, query))
+    }
+
+    pub fn matching_slash_commands(&self) -> Vec<&'static SlashCommand> {
+        let Some((_, _, query)) = self.slash_query() else {
+            return Vec::new();
+        };
+        let query = query.to_ascii_lowercase();
+        let mut prefix_matches = Vec::new();
+        let mut other_matches = Vec::new();
+        for command in SLASH_COMMANDS {
+            if query.is_empty() || command.name.starts_with(&query) {
+                prefix_matches.push(command);
+            } else if command.name.contains(&query) {
+                other_matches.push(command);
+            }
+        }
+        prefix_matches.extend(other_matches);
+        prefix_matches
+    }
+
+    pub fn apply_slash_command(&mut self, index: usize) -> bool {
+        let matches = self.matching_slash_commands();
+        let Some((token_start, cursor_byte, _)) = self.slash_query() else {
+            return false;
+        };
+        let Some(command) = matches.get(index).copied() else {
+            return false;
+        };
+        self.draft.drain(token_start..cursor_byte);
+        if token_start == 0 && self.draft.starts_with(' ') {
+            self.draft.remove(0);
+        }
+        self.draft_cursor = self.draft[..token_start.min(self.draft.len())]
+            .chars()
+            .count();
+        self.draft_selection_anchor = None;
+        self.slash_highlight = 0;
+        self.slash_dismissed = false;
+        match command.name {
+            "clear" => {
+                if let Some(thread_id) = self.selected_thread_id().map(str::to_owned) {
+                    self.fresh_context_threads.insert(thread_id);
+                    self.send_notice = Some(
+                        "Fresh context enabled: next message starts a new agent session.".into(),
+                    );
+                } else {
+                    self.send_notice = Some("Select a thread before using /clear.".into());
+                }
+            }
+            "model" => {
+                self.editing = false;
+                self.open_models();
+            }
+            _ => (),
+        }
+        true
+    }
+
     pub fn delete_draft(&mut self) {
+        self.screen_selection = None;
+        if self.delete_draft_selection() {
+            return;
+        }
         use unicode_segmentation::UnicodeSegmentation;
         let start = self.draft_byte_cursor();
         if let Some(grapheme) = self.draft[start..].graphemes(true).next() {
@@ -395,6 +894,7 @@ impl App {
         }
         self.models.thread_id = self.selected_thread_id().map(str::to_owned);
         self.models.open = true;
+        self.models.reasoning_focus = false;
         self.models.notice = None;
         self.models.error = None;
         self.select_current_model();
@@ -419,6 +919,9 @@ impl App {
         self.models
             .list_state
             .select(index.or_else(|| (!self.models.choices.is_empty()).then_some(0)));
+        if let (Some(index), Some(current)) = (index, self.current_model().cloned()) {
+            self.models.choices[index].selection.options = current.options;
+        }
     }
 
     pub fn move_model(&mut self, down: bool, amount: usize) {
@@ -433,6 +936,14 @@ impl App {
         } else {
             current.saturating_sub(amount)
         }));
+    }
+
+    pub fn move_reasoning(&mut self, forward: bool) {
+        if let Some(index) = self.models.list_state.selected()
+            && let Some(choice) = self.models.choices.get_mut(index)
+        {
+            choice.cycle_reasoning(forward);
+        }
     }
 
     pub fn prepare_model_change(&mut self) -> Option<crate::models::ModelChange> {
@@ -455,9 +966,7 @@ impl App {
             .selection
             .clone();
         self.models.open = false;
-        if self.current_model().is_some_and(|current| {
-            current.instance_id == selection.instance_id && current.model == selection.model
-        }) {
+        if self.current_model() == Some(&selection) {
             return None;
         }
         let request = crate::models::ModelChange {
@@ -498,6 +1007,7 @@ impl App {
     }
 
     pub fn prepare_send(&mut self) -> Option<SendRequest> {
+        let steer = std::mem::take(&mut self.steer_requested);
         self.send_notice = None;
         let id = match self.selection() {
             Some(Selection::Thread(id)) if self.authenticated => id.clone(),
@@ -514,7 +1024,11 @@ impl App {
             self.send_notice = Some("A message is still being sent. Please wait.".into());
             return None;
         }
-        if self.draft.trim().is_empty() {
+        if self.paste_pending {
+            self.send_notice = Some("Wait for clipboard paste to finish.".into());
+            return None;
+        }
+        if self.draft.trim().is_empty() && self.images.get(&id).is_none_or(Vec::is_empty) {
             self.send_notice = Some("Type a message before sending.".into());
             return None;
         }
@@ -528,16 +1042,34 @@ impl App {
             self.send_notice = Some("Usage limit reached. When usage is available again, press r to resend the previous message.".into());
             return None;
         }
-        let request = self
+        let images = self.images.get(&id).cloned().unwrap_or_default();
+        let fresh_context = self.fresh_context_threads.contains(&id);
+        let steer = steer && !fresh_context;
+        let mut request = self
             .last_attempt
             .get(&id)
-            .filter(|request| request.text == self.draft)
+            .filter(|request| {
+                request.text == self.draft
+                    && request.attachments == images
+                    && request.fresh_context == fresh_context
+            })
             .cloned()
             .unwrap_or_else(|| SendRequest::new(id.clone(), self.draft.clone()));
+        request.attachments = images;
+        request.steer = steer;
+        request.fresh_context = fresh_context;
         self.last_attempt.insert(id.clone(), request.clone());
         self.previous_messages
             .insert(id.clone(), request.text.clone());
-        self.send_status.insert(id, "Sending…".into());
+        self.send_status.insert(
+            id,
+            if steer {
+                "Sending steering message…"
+            } else {
+                "Submitting message…"
+            }
+            .into(),
+        );
         self.send_pending = Some(request.clone());
         Some(request)
     }
@@ -592,6 +1124,10 @@ impl App {
         }
         match result {
             Ok(()) => {
+                self.fresh_context_threads.remove(&request.thread_id);
+                if let Some(images) = self.images.get_mut(&request.thread_id) {
+                    images.retain(|image| !request.attachments.contains(image));
+                }
                 if self.draft_thread.as_deref() == Some(&request.thread_id) {
                     if self.draft == request.text {
                         self.draft.clear();
@@ -604,7 +1140,12 @@ impl App {
                 self.last_attempt.remove(&request.thread_id);
                 self.send_status.insert(
                     request.thread_id,
-                    "Sent to T3. Queued after any active run.".into(),
+                    if request.steer {
+                        "Steering message accepted by T3."
+                    } else {
+                        "Message accepted by T3."
+                    }
+                    .into(),
                 );
             }
             Err(error) => {
@@ -623,6 +1164,10 @@ impl App {
             _ => None,
         };
         if self.draft_thread != draft_thread {
+            self.screen_selection = None;
+            self.screen_selection_area = None;
+            self.screen_selecting = false;
+            self.context_menu = None;
             self.drafts
                 .insert(self.draft_thread.clone(), std::mem::take(&mut self.draft));
             self.draft = self.drafts.remove(&draft_thread).unwrap_or_default();
@@ -637,6 +1182,25 @@ impl App {
         if selected == self.history_thread {
             return false;
         }
+        let wrap = self.diff_view.wrap;
+        if let Some(previous) = self.history_thread.take() {
+            self.thread_diffs.insert(
+                previous,
+                ThreadDiffs {
+                    view: std::mem::take(&mut self.diff_view),
+                    counts: std::mem::take(&mut self.run_diffs),
+                    requested: std::mem::take(&mut self.diff_requested),
+                },
+            );
+        }
+        let cached = selected
+            .as_ref()
+            .and_then(|id| self.thread_diffs.remove(id))
+            .unwrap_or_default();
+        self.diff_view = cached.view;
+        self.diff_view.wrap = wrap;
+        self.run_diffs = cached.counts;
+        self.diff_requested = cached.requested;
         self.history_thread = selected;
         self.live_model = None;
         self.history_sequence = None;
@@ -645,9 +1209,6 @@ impl App {
         self.thinking_since = None;
         self.worked_duration = None;
         self.runs.clear();
-        self.run_diffs.clear();
-        self.diff_view = Default::default();
-        self.diff_requested.clear();
         self.transcript = None;
         self.chat_revision = self.chat_revision.wrapping_add(1);
         self.history_error = None;
@@ -853,6 +1414,11 @@ impl App {
     }
 
     pub fn scroll_chat(&mut self, down: bool, amount: u16) {
+        if self.screen_selection_area == Some(self.chat_text_area) {
+            self.screen_selection = None;
+            self.screen_selection_area = None;
+            self.screen_selecting = false;
+        }
         self.chat_scroll = if down {
             self.chat_scroll
                 .saturating_add(amount)
@@ -996,12 +1562,166 @@ impl App {
         }
     }
 
+    pub fn request_quit(&mut self) {
+        let other_running = self.check_other_instances.is_some_and(|check| check());
+        if self.local_server_pid.is_some() && !other_running {
+            self.quit_dialog = Some(QuitDialog {
+                shutdown_server: false,
+            });
+        } else {
+            self.quit = true;
+        }
+    }
+
+    pub fn open_thread_menu(&mut self) {
+        if let Some(Selection::Project(project_id)) = self.selection() {
+            let project_id = project_id.clone();
+            let title = self
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.projects.iter().find(|p| p.id == project_id))
+                .map(|p| p.title.clone())
+                .unwrap_or_default();
+            self.thread_menu = Some(ThreadMenu {
+                thread_id: project_id,
+                original_title: title,
+                mode: ThreadMenuMode::ProjectOptions,
+                selected_option: 0,
+                rename_input: String::new(),
+                busy: false,
+                error: None,
+            });
+            return;
+        }
+        let Some(Selection::Thread(thread_id)) = self.selection() else {
+            return;
+        };
+        let thread_id = thread_id.clone();
+        let title = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.threads.iter().find(|t| t.id == thread_id))
+            .map(|thread| thread.title.clone())
+            .unwrap_or_else(|| "Thread".into());
+        self.thread_menu = Some(ThreadMenu {
+            thread_id,
+            original_title: title.clone(),
+            mode: ThreadMenuMode::Options,
+            selected_option: 0,
+            rename_input: title,
+            busy: false,
+            error: None,
+        });
+    }
+
+    pub fn finish_thread_action(
+        &mut self,
+        action: crate::t3::ThreadAction,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.thread_menu = None;
+                match action {
+                    crate::t3::ThreadAction::Create {
+                        project_id,
+                        thread_id,
+                        ..
+                    } => {
+                        self.restore_location = Some(crate::preferences::Location {
+                            project_id,
+                            thread_id: Some(thread_id),
+                        });
+                        self.send_notice = Some("Thread created.".into());
+                    }
+                    crate::t3::ThreadAction::Rename { thread_id, title } => {
+                        let title = title.trim().to_owned();
+                        if let Some(catalog) = self.catalog.as_mut() {
+                            if let Some(thread) =
+                                catalog.threads.iter_mut().find(|t| t.id == thread_id)
+                            {
+                                thread.title = title.clone();
+                            }
+                            self.rows = catalog.rows();
+                        }
+                        if self.history_thread.as_deref() == Some(thread_id.as_str())
+                            && let Some(transcript) = self.transcript.as_mut()
+                        {
+                            transcript.title = title;
+                        }
+                        self.send_notice = Some("Thread renamed.".into());
+                    }
+                    crate::t3::ThreadAction::Delete { thread_id } => {
+                        self.drafts.remove(&Some(thread_id.clone()));
+                        self.images.remove(&thread_id);
+                        if self.history_thread.as_deref() == Some(thread_id.as_str()) {
+                            self.history_thread = None;
+                            self.transcript = None;
+                            self.runs.clear();
+                            self.activity.clear();
+                            self.history_error = None;
+                            self.history_sequence = None;
+                            self.history_live = false;
+                            self.chat_revision = self.chat_revision.wrapping_add(1);
+                            self.chat_cache = None;
+                        }
+                        if self.draft_thread.as_deref() == Some(thread_id.as_str()) {
+                            self.draft_thread = None;
+                            self.draft.clear();
+                            self.draft_cursor = 0;
+                            self.draft_selection_anchor = None;
+                        }
+                        if let Some(mut catalog) = self.catalog.take() {
+                            catalog.threads.retain(|t| t.id != thread_id);
+                            self.update_catalog(catalog);
+                        }
+                        self.send_notice = Some("Thread deleted.".into());
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(menu) = self.thread_menu.as_mut() {
+                    menu.busy = false;
+                    menu.error = Some(error);
+                } else {
+                    self.send_notice = Some(error);
+                }
+            }
+        }
+    }
+
+    pub fn confirm_quit(&mut self, shutdown_server: bool) {
+        self.shutdown_server_on_quit = shutdown_server;
+        self.quit_dialog = None;
+        self.quit = true;
+    }
+
+    pub fn server_to_shutdown(&self) -> Option<u32> {
+        self.shutdown_server_on_quit
+            .then_some(self.local_server_pid)
+            .flatten()
+    }
+
+    pub fn is_thread_running(&self, thread_id: &str) -> bool {
+        if self.history_thread.as_deref() == Some(thread_id) && self.transcript.is_some() {
+            return self.runs.values().any(|run| run.active());
+        }
+        self.catalog.as_ref().is_some_and(|catalog| {
+            catalog
+                .threads
+                .iter()
+                .any(|thread| thread.id == thread_id && thread.is_running())
+        })
+    }
+
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Projects => Focus::Chat,
             Focus::Chat => Focus::Composer,
             Focus::Composer => Focus::Model,
-            Focus::Model => Focus::WorkspaceTabs,
+            Focus::Model => Focus::SessionUsage,
+            Focus::SessionUsage => Focus::WeeklyUsage,
+            Focus::WeeklyUsage => Focus::WorkspaceTabs,
             Focus::WorkspaceTabs => Focus::Workspace,
             Focus::Workspace => Focus::Projects,
         };
@@ -1013,10 +1733,21 @@ impl App {
             Focus::Chat => Focus::Projects,
             Focus::Composer => Focus::Chat,
             Focus::Model => Focus::Composer,
+            Focus::SessionUsage => Focus::Model,
+            Focus::WeeklyUsage => Focus::SessionUsage,
             Focus::Workspace => Focus::WorkspaceTabs,
-            Focus::WorkspaceTabs => Focus::Model,
+            Focus::WorkspaceTabs => Focus::WeeklyUsage,
         };
     }
+}
+
+fn normalize_draft_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ")
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .collect()
 }
 
 fn item_activity_summary(item: &crate::history::Item) -> Option<String> {
@@ -1056,6 +1787,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_draft_copies_and_replaces_unicode_text() {
+        let mut app = App::default();
+        app.insert_draft("a世界z");
+        app.draft_selection_anchor = Some(1);
+        app.draft_cursor = 3;
+        assert_eq!(app.selected_draft().as_deref(), Some("世界"));
+        app.insert_draft("hi");
+        assert_eq!(app.draft, "ahiz");
+        assert_eq!(app.draft_cursor, 3);
+        assert!(app.selected_draft().is_none());
+    }
+
+    #[test]
+    fn selected_screen_reads_visible_rows() {
+        let mut app = App::default();
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 5, 2));
+        buffer.set_string(0, 0, "hello", ratatui::style::Style::default());
+        buffer.set_string(0, 1, "world", ratatui::style::Style::default());
+        app.screen_buffer = Some(buffer);
+        app.screen_selection = Some(((0, 2), (1, 3)));
+        assert_eq!(app.selected_screen().as_deref(), Some("llo\nwor"));
+    }
+
+    #[test]
+    fn chat_selection_crosses_wrapped_and_real_lines_without_neighboring_panes() {
+        use ratatui::{
+            layout::Rect,
+            text::{Line, Text},
+        };
+        let mut app = App::default();
+        let chat = Rect::new(5, 0, 8, 3);
+        let viewport = crate::chat::Viewport::new(
+            Text::from(vec![Line::from("│ abcdefghijkl"), Line::from("│ next")]),
+            chat.width,
+        );
+        let mut screen = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 20, 3));
+        for y in 0..chat.height {
+            for x in 0..chat.width {
+                screen[(chat.x + x, y)] = viewport.buffer[(x, y)].clone();
+            }
+            screen.set_string(13, y, "OTHER", ratatui::style::Style::default());
+        }
+        app.chat_viewport = Some(viewport);
+        app.chat_text_area = chat;
+        app.screen_selection_area = Some(chat);
+        app.screen_selection = Some(((0, 7), (2, 10)));
+        app.screen_buffer = Some(screen);
+        assert_eq!(app.selected_screen().as_deref(), Some("abcdefghijkl\nnex"));
+    }
+
+    #[test]
     fn preserves_thread_selection_across_refresh_and_handles_removed_items() {
         let mut app = App::default();
         let mut catalog = crate::catalog::tests::snapshot();
@@ -1081,6 +1863,33 @@ mod tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn diff_results_survive_switching_threads_even_when_they_arrive_late() {
+        let mut app = App {
+            authenticated: true,
+            ..Default::default()
+        };
+        let mut catalog = crate::catalog::tests::snapshot();
+        catalog.normalize();
+        app.update_catalog(catalog);
+        app.move_selection(true);
+        app.sync_history_selection();
+        app.diff_requested.insert("r1".into());
+        app.move_selection(true);
+        app.sync_history_selection();
+        app.finish_diff(
+            "t1".into(),
+            "r1".into(),
+            Ok("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+hello\n".into()),
+        );
+        assert!(!app.diff_view.patches.contains_key("r1"));
+        app.move_selection(false);
+        app.sync_history_selection();
+        assert!(app.diff_view.patches.contains_key("r1"));
+        assert!(app.diff_requested.contains("r1"));
+        assert_eq!(app.run_diffs["r1"]["a"], (1, 0));
+    }
 
     #[test]
     fn ignores_late_results_and_keeps_read_position_during_refresh() {
@@ -1418,5 +2227,31 @@ mod model_tests {
         app.move_selection(false);
         app.sync_history_selection();
         assert_eq!(app.current_model().unwrap().model, "model-b");
+    }
+
+    #[test]
+    fn dictation_lifecycle_inserts_transcript_with_spacing() {
+        use crate::dictation::{Command, Event, Phase};
+        let mut app = ready();
+        app.draft = "Hello".into();
+        app.draft_cursor = 5;
+        app.dictation.toggle_requested = true;
+        assert_eq!(app.take_dictation_command(), Some(Command::Start));
+        assert_eq!(app.dictation.phase, Phase::Starting);
+
+        app.apply_dictation(Event::Recording {
+            program: "parecord",
+        });
+        assert_eq!(app.dictation.phase, Phase::Recording);
+
+        app.dictation.toggle_requested = true;
+        assert_eq!(app.take_dictation_command(), Some(Command::Stop));
+
+        app.apply_dictation(Event::Transcribing);
+        assert_eq!(app.dictation.phase, Phase::Transcribing);
+
+        app.apply_dictation(Event::Finished(Ok("world".into())));
+        assert_eq!(app.dictation.phase, Phase::Idle);
+        assert_eq!(app.draft, "Hello world");
     }
 }

@@ -1,9 +1,84 @@
 use crate::app::{App, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+fn copy_selection(app: &mut App) {
+    let Some(text) = app.selected_draft().or_else(|| app.selected_screen()) else {
+        app.send_notice = Some("Select text before copying.".into());
+        return;
+    };
+    app.copy_requested = Some(text);
+    app.send_notice = Some("Copying selected text…".into());
+}
+
 pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     use crate::app::ClickTarget;
     use crossterm::event::{MouseButton, MouseEventKind};
+    let point = (mouse.row, mouse.column);
+    if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+        app.context_menu = Some((mouse.column, mouse.row));
+        return;
+    }
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) && app.context_menu.take().is_some() {
+        let area = app.context_menu_area;
+        if area.contains(ratatui::layout::Position::new(mouse.column, mouse.row)) {
+            if mouse.row == area.y + 1 {
+                copy_selection(app);
+            } else if mouse.row == area.y + 2 {
+                app.context_paste_requested = true;
+            }
+            return;
+        }
+    }
+    let clamp = |point: (u16, u16), area: Option<ratatui::layout::Rect>| {
+        area.filter(|area| area.width > 0 && area.height > 0)
+            .map_or(point, |area| {
+                (
+                    point.0.clamp(area.y, area.bottom() - 1),
+                    point.1.clamp(area.x, area.right() - 1),
+                )
+            })
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+            app.screen_selection_area = app
+                .chat_text_area
+                .contains(position)
+                .then_some(app.chat_text_area);
+            app.chat_selection_scroll = app.chat_scroll;
+            let point = clamp(point, app.screen_selection_area);
+            app.screen_selection = Some((point, point));
+            app.screen_selecting = true;
+            app.draft_selection_anchor = None;
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.screen_selecting => {
+            if app.screen_selection_area.is_some() {
+                app.follow_chat = false;
+            }
+            let point = clamp(point, app.screen_selection_area);
+            app.screen_selection = app
+                .screen_selection
+                .map(|(start, _)| (start, (point.0, point.1.saturating_add(1))));
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.screen_selecting {
+                app.screen_selection = app.screen_selection.map(|(start, end)| {
+                    if start == end {
+                        (start, point)
+                    } else {
+                        (start, end)
+                    }
+                });
+            }
+            app.screen_selecting = false;
+            return;
+        }
+        _ => (),
+    }
+    if app.terminal_overlay_open {
+        return;
+    }
     if !matches!(
         mouse.kind,
         MouseEventKind::Down(MouseButton::Left)
@@ -46,8 +121,64 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         return;
     }
     match target {
+        Some(ClickTarget::RemoveAttachment(index)) => {
+            if let Some(images) = app
+                .draft_thread
+                .as_ref()
+                .and_then(|id| app.images.get_mut(id))
+                && index < images.len()
+            {
+                images.remove(index);
+                app.send_notice = Some("Attachment removed.".into());
+            }
+            app.focus = Focus::Composer;
+        }
+        Some(ClickTarget::SidebarRow(index)) => {
+            if index < app.rows.len() {
+                app.sidebar_state.select(Some(index));
+                app.focus = Focus::Projects;
+                app.editing = false;
+                app.screen_selection = None;
+                app.screen_selection_area = None;
+                app.screen_selecting = false;
+            }
+        }
         Some(ClickTarget::StartupPrimary) => crate::startup::activate(app),
         Some(ClickTarget::StartupClose) => app.startup.open = false,
+        Some(ClickTarget::QuitChoice(shutdown)) => app.confirm_quit(shutdown),
+        Some(ClickTarget::QuitCancel) => app.quit_dialog = None,
+        Some(ClickTarget::ThreadMenuOption(index)) => {
+            if let Some(menu) = app.thread_menu.as_mut()
+                && !menu.busy
+            {
+                menu.selected_option = index;
+                menu.error = None;
+                menu.mode = if index == 0 {
+                    crate::app::ThreadMenuMode::Rename
+                } else {
+                    crate::app::ThreadMenuMode::ConfirmDelete
+                };
+            }
+        }
+        Some(ClickTarget::ThreadMenuConfirm) => confirm_thread_menu(app),
+        Some(ClickTarget::SlashCommand(index)) => {
+            app.apply_slash_command(index);
+        }
+        Some(ClickTarget::ThreadMenuCancel) => {
+            if let Some(menu) = app.thread_menu.as_mut()
+                && !menu.busy
+            {
+                menu.error = None;
+                match menu.mode {
+                    crate::app::ThreadMenuMode::Options
+                    | crate::app::ThreadMenuMode::ProjectOptions => app.thread_menu = None,
+                    crate::app::ThreadMenuMode::Rename
+                    | crate::app::ThreadMenuMode::ConfirmDelete => {
+                        menu.mode = crate::app::ThreadMenuMode::Options;
+                    }
+                }
+            }
+        }
         Some(ClickTarget::AutoStart(value)) => {
             app.settings_row = 1;
             app.auto_start_t3 = value;
@@ -94,17 +225,226 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
 }
 
-pub fn handle_key(app: &mut App, key: KeyEvent) {
+pub fn handle_key(app: &mut App, mut key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
+        return;
+    }
+    let entering_text =
+        if app.quit_dialog.is_some() || app.startup.open || app.settings_open || app.models.open {
+            false
+        } else if let Some(menu) = &app.thread_menu {
+            menu.mode == crate::app::ThreadMenuMode::Rename
+        } else {
+            app.editing
+                || (app.focus == Focus::Workspace && app.workspace_tab == 3 && app.git.editing)
+        };
+    if key.code == KeyCode::Char(' ')
+        && key.modifiers.is_empty()
+        && !entering_text
+        && !app.terminal_overlay_open
+    {
+        key.code = KeyCode::Enter;
+    }
+    if app.context_menu.is_some() && key.code == KeyCode::Esc {
+        app.context_menu = None;
+        return;
+    }
+    if let Some(dialog) = app.quit_dialog.as_mut() {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'q'))
+        {
+            app.confirm_quit(false);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => app.quit_dialog = None,
+            KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
+                let shutdown = dialog.shutdown_server;
+                app.confirm_quit(shutdown);
+            }
+            KeyCode::Char('y' | 'Y') => app.confirm_quit(true),
+            KeyCode::Char('n' | 'N') => app.confirm_quit(false),
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h' | 'l') => {
+                dialog.shutdown_server = !dialog.shutdown_server;
+            }
+            _ => (),
+        }
+        return;
+    }
+    if app.thread_menu.is_some() {
+        handle_thread_menu_key(app, key);
+        return;
+    }
+    if !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+        && !app.terminal_overlay_open
+        && key.code == KeyCode::Enter
+        && key.kind != KeyEventKind::Repeat
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && (app.dictation.listening()
+            || app.dictation.phase == crate::dictation::Phase::Transcribing)
+    {
+        if app.dictation.listening() {
+            app.dictation.toggle_requested = true;
+        }
+        app.dictation.send_on_finish = true;
+        return;
+    }
+    if app.dictation.listening()
+        && !app.editing
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+        && key.code == KeyCode::Esc
+    {
+        app.dictation.cancel_requested = true;
+        return;
+    }
+    if key.code == KeyCode::Esc
+        && app.focus == Focus::Composer
+        && !app.editing
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+    {
+        let now = std::time::Instant::now();
+        if app.last_escape.is_some_and(|previous| {
+            now.duration_since(previous) <= std::time::Duration::from_millis(500)
+        }) {
+            app.draft.clear();
+            app.draft_cursor = 0;
+            app.draft_selection_anchor = None;
+            app.send_notice = None;
+            app.last_escape = None;
+        } else {
+            app.last_escape = Some(now);
+        }
+        return;
+    }
+    if key.code != KeyCode::Esc {
+        app.last_escape = None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('c')
+        && app.focus == Focus::Composer
+        && !app.terminal_overlay_open
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+    {
+        if app.selected_draft().is_some() || app.selected_screen().is_some() {
+            copy_selection(app);
+        }
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('c')
+        && (app.selected_draft().is_some() || app.selected_screen().is_some())
+    {
+        copy_selection(app);
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+        app.terminal_overlay_open = !app.terminal_overlay_open;
+        return;
+    }
+    if matches!(key.code, KeyCode::Char('T') | KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('T'))
+        && (app.terminal_overlay_open
+            || (!app.editing
+                && !app.git.editing
+                && !app.settings_open
+                && !app.models.open
+                && !app.startup.open))
+    {
+        app.terminal_overlay_open = !app.terminal_overlay_open;
+        return;
+    }
+    if app.terminal_overlay_open {
+        if key.code == KeyCode::Esc {
+            app.terminal_overlay_open = false;
+        } else if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'q'))
+        {
+            app.request_quit();
+        }
+        return;
+    }
+    if app.editing
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+        && key.code == KeyCode::Enter
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.steer_requested = true;
+        app.send_requested = true;
+        app.editing = false;
         return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(key.code, KeyCode::Char('c' | 'q')) {
-            app.quit = true;
+            app.request_quit();
+        } else if app.editing
+            && !app.settings_open
+            && !app.models.open
+            && !app.startup.open
+            && matches!(key.code, KeyCode::Backspace | KeyCode::Char('w'))
+        {
+            app.backspace_draft_word();
+        } else if app.editing
+            && !app.settings_open
+            && !app.models.open
+            && !app.startup.open
+            && key.code == KeyCode::Char('a')
+        {
+            app.select_all_draft();
+        } else if matches!(key.code, KeyCode::Backspace | KeyCode::Char('h'))
+            && matches!(app.focus, Focus::Composer | Focus::Chat)
+            && !app.settings_open
+            && !app.models.open
+            && !app.startup.open
+        {
+            let removed_images = app
+                .draft_thread
+                .as_ref()
+                .and_then(|thread| app.images.remove(thread))
+                .is_some_and(|images| !images.is_empty());
+            let canceled_paste = app.paste_pending || app.paste_requested;
+            if removed_images || canceled_paste {
+                app.paste_generation = app.paste_generation.wrapping_add(1);
+                app.paste_pending = false;
+                app.paste_requested = false;
+                app.send_notice = Some("Attached images removed.".into());
+            }
+        } else if key.code == KeyCode::Char('v')
+            && matches!(app.focus, Focus::Composer)
+            && !app.settings_open
+            && !app.models.open
+            && !app.startup.open
+        {
+            if !app.paste_pending {
+                app.context_paste_requested = true;
+            }
         } else if app.editing && !app.settings_open && !app.models.open {
             match key.code {
-                KeyCode::Left => app.move_draft_word(false),
-                KeyCode::Right => app.move_draft_word(true),
+                KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.draft_selection_anchor.get_or_insert(app.draft_cursor);
+                    app.screen_selection = None;
+                    app.move_draft_word(key.code == KeyCode::Right);
+                }
+                KeyCode::Left => {
+                    app.draft_selection_anchor = None;
+                    app.move_draft_word(false);
+                }
+                KeyCode::Right => {
+                    app.draft_selection_anchor = None;
+                    app.move_draft_word(true);
+                }
                 _ => (),
             }
         }
@@ -114,10 +454,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         match key.code {
             KeyCode::Enter if key.kind != KeyEventKind::Repeat => crate::startup::activate(app),
             KeyCode::Esc => app.startup.open = false,
-            KeyCode::Char('q') => app.quit = true,
+            KeyCode::Char('q') => app.request_quit(),
             KeyCode::Char('s') => {
                 app.startup.open = false;
                 app.settings_open = true;
+                app.clipboard_check_requested = true;
                 app.auto_start_highlight = app.auto_start_t3;
                 app.style_highlight = app.typing_style;
             }
@@ -127,8 +468,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.settings_open {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => app.settings_row = 0,
-            KeyCode::Down | KeyCode::Char('j') => app.settings_row = 1,
+            KeyCode::Char('r') => {
+                app.clipboard_status = crate::app::ClipboardStatus::Checking;
+                app.clipboard_check_requested = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.settings_row = app.settings_row.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(2),
             KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
                 app.auto_start_highlight = false
             }
@@ -137,6 +484,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 1 => {
                 app.auto_start_t3 = app.auto_start_highlight
+            }
+            KeyCode::Left | KeyCode::Char('h') if app.settings_row == 2 => {
+                app.diff_view.wrap = false
+            }
+            KeyCode::Right | KeyCode::Char('l') if app.settings_row == 2 => {
+                app.diff_view.wrap = true
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 2 => {
+                app.diff_view.wrap = app.diff_wrap_highlight
             }
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
@@ -153,9 +509,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.models.open {
         match key.code {
             KeyCode::Esc => app.models.open = false,
+            KeyCode::Enter if !app.models.reasoning_focus => app.models.reasoning_focus = true,
             KeyCode::Enter => app.models.change_requested = true,
+            KeyCode::Down | KeyCode::Char('j') if app.models.reasoning_focus => {
+                app.move_reasoning(true)
+            }
             KeyCode::Down | KeyCode::Char('j') => app.move_model(true, 1),
+            KeyCode::Up | KeyCode::Char('k') if app.models.reasoning_focus => {
+                app.move_reasoning(false)
+            }
             KeyCode::Up | KeyCode::Char('k') => app.move_model(false, 1),
+            KeyCode::Right | KeyCode::Char('l') => app.models.reasoning_focus = true,
+            KeyCode::Left | KeyCode::Char('h') => app.models.reasoning_focus = false,
+            KeyCode::Tab => app.models.reasoning_focus = !app.models.reasoning_focus,
             KeyCode::PageDown => app.move_model(true, 10),
             KeyCode::PageUp => app.move_model(false, 10),
             KeyCode::Home => app.move_model(false, usize::MAX),
@@ -171,6 +537,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if git_modal && crate::git::key(app, key) {
         return;
     }
+    if app.focus == Focus::Workspace && app.workspace_tab == 3 && crate::git::key(app, key) {
+        return;
+    }
+    if !app.editing
+        && matches!(key.code, KeyCode::Char('D') | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('D'))
+    {
+        app.dictation.toggle_requested = true;
+        return;
+    }
     if !app.editing
         && let KeyCode::Char(mut ch) = key.code
     {
@@ -178,11 +553,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             ch = ch.to_ascii_uppercase();
         }
         if let Some(index) = match ch {
-            'd' | 'D' => Some(0),
+            'd' => Some(0),
             'e' | 'E' => Some(1),
             't' => Some(2),
             'g' => Some(3),
-            'c' => Some(4),
             _ => None,
         } {
             app.workspace_tab = index;
@@ -191,19 +565,44 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
     }
-    if app.focus == Focus::Workspace && app.workspace_tab == 3 && crate::git::key(app, key) {
-        return;
-    }
     if app.editing {
-        match key.code {
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
-                app.insert_draft("\n")
+        let slash_matches = app.matching_slash_commands();
+        if !slash_matches.is_empty() {
+            match key.code {
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.slash_highlight = app.slash_highlight.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.slash_highlight = (app.slash_highlight + 1).min(slash_matches.len() - 1);
+                    return;
+                }
+                KeyCode::Tab => {
+                    let index = app.slash_highlight.min(slash_matches.len() - 1);
+                    app.apply_slash_command(index);
+                    return;
+                }
+                KeyCode::Enter
+                    if !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.kind != KeyEventKind::Repeat =>
+                {
+                    let index = app.slash_highlight.min(slash_matches.len() - 1);
+                    app.apply_slash_command(index);
+                    return;
+                }
+                KeyCode::Esc => {
+                    app.slash_dismissed = true;
+                    return;
+                }
+                _ => (),
             }
-            KeyCode::Enter => app.send_requested = true,
+        }
+        match key.code {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => app.insert_draft("\n"),
+            KeyCode::Enter => {
+                app.send_requested = true;
+                app.editing = false;
+            }
             KeyCode::Esc => app.editing = false,
             KeyCode::Tab | KeyCode::BackTab => {
                 app.editing = false;
@@ -213,15 +612,45 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.toggle_focus();
                 }
             }
-            KeyCode::Char(character) => app.insert_draft(&character.to_string()),
-            KeyCode::Backspace => app.backspace_draft(),
+            KeyCode::Char(character) => {
+                if character == '/' {
+                    app.slash_dismissed = false;
+                    app.slash_highlight = 0;
+                }
+                app.insert_draft(&character.to_string());
+                if app.slash_query().is_none() {
+                    app.slash_dismissed = false;
+                    app.slash_highlight = 0;
+                } else {
+                    let len = app.matching_slash_commands().len();
+                    app.slash_highlight = app.slash_highlight.min(len.saturating_sub(1));
+                }
+            }
+            KeyCode::Backspace => {
+                app.backspace_draft();
+                if app.slash_query().is_none() {
+                    app.slash_dismissed = false;
+                    app.slash_highlight = 0;
+                } else {
+                    let len = app.matching_slash_commands().len();
+                    app.slash_highlight = app.slash_highlight.min(len.saturating_sub(1));
+                }
+            }
             KeyCode::Delete => app.delete_draft(),
             KeyCode::Left
             | KeyCode::Right
             | KeyCode::Up
             | KeyCode::Down
             | KeyCode::Home
-            | KeyCode::End => app.move_draft_cursor(key.code),
+            | KeyCode::End => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.draft_selection_anchor.get_or_insert(app.draft_cursor);
+                } else {
+                    app.draft_selection_anchor = None;
+                }
+                app.screen_selection = None;
+                app.move_draft_cursor(key.code);
+            }
             _ => (),
         }
         return;
@@ -308,6 +737,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
     match key.code {
+        KeyCode::Char('w') if !app.editing => {
+            app.workspace_visible = !app.workspace_visible;
+            if !app.workspace_visible
+                && matches!(app.focus, Focus::Workspace | Focus::WorkspaceTabs)
+            {
+                app.focus = Focus::Chat;
+            }
+        }
+        KeyCode::Char('}') if !app.editing => {
+            app.workspace_width = (app.workspace_width + 5).min(55)
+        }
+        KeyCode::Char('{') if !app.editing => {
+            app.workspace_width = app.workspace_width.saturating_sub(5).max(20)
+        }
         KeyCode::Char('r') if !app.editing && app.focus == Focus::Chat => {
             app.retry_previous_message();
         }
@@ -316,9 +759,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.auto_start_highlight = app.auto_start_t3;
             app.style_highlight = app.typing_style;
             app.settings_open = true;
+            app.clipboard_check_requested = true;
         }
         KeyCode::Char('o') => app.startup.open = true,
-        KeyCode::Char('m') => app.focus = Focus::Model,
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => app.focus = Focus::Chat,
+        KeyCode::Char('m') => app.focus = Focus::Composer,
         KeyCode::Right | KeyCode::Char('l')
             if app.focus == Focus::Chat || app.focus == Focus::Model =>
         {
@@ -331,10 +776,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.focus = Focus::Workspace;
         }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::WorkspaceTabs => {
-            app.workspace_highlight = (app.workspace_highlight + 1) % 5;
+            app.workspace_highlight = (app.workspace_highlight + 1) % 4;
         }
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::WorkspaceTabs => {
-            app.workspace_highlight = (app.workspace_highlight + 4) % 5;
+            if app.workspace_highlight == 0 {
+                app.focus = Focus::Chat;
+            } else {
+                app.workspace_highlight -= 1;
+            }
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.focus == Focus::WorkspaceTabs => {
             app.workspace_tab = app.workspace_highlight;
@@ -351,13 +800,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::Model => {
             app.focus = Focus::Composer
         }
+        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Model => {
+            app.focus = Focus::SessionUsage
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::SessionUsage => {
+            app.focus = Focus::Model
+        }
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::SessionUsage => {
+            app.focus = Focus::WeeklyUsage
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::SessionUsage => {
+            app.focus = Focus::Composer
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::WeeklyUsage => {
+            app.focus = Focus::SessionUsage
+        }
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::WeeklyUsage => {
+            app.focus = Focus::Workspace
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::WeeklyUsage => {
+            app.focus = Focus::Composer
+        }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Composer => {
             app.focus = Focus::Workspace
         }
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Model => {
             app.focus = Focus::Composer
         }
-        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Model => (),
         KeyCode::PageDown if app.focus == Focus::Chat => app.scroll_chat(true, 10),
         KeyCode::PageUp if app.focus == Focus::Chat => app.scroll_chat(false, 10),
         KeyCode::Home if app.focus == Focus::Chat => {
@@ -389,6 +858,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') if !app.authenticated && !app.pairing_in_progress => {
             app.pairing_requested = true;
         }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
+            app.focus = Focus::Projects;
+        }
         KeyCode::Tab => app.toggle_focus(),
         KeyCode::BackTab => app.previous_focus(),
         KeyCode::Left | KeyCode::Char('h') => app.focus = Focus::Projects,
@@ -401,14 +873,146 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::Projects => {
             app.move_selection(false)
         }
-        KeyCode::Enter if app.focus == Focus::Projects => app.focus = Focus::Chat,
+        KeyCode::Enter if app.focus == Focus::Projects => {
+            app.open_thread_menu();
+        }
         KeyCode::Down | KeyCode::Char('j') => app.focus = Focus::Composer,
         KeyCode::Up | KeyCode::Char('k') => app.focus = Focus::Chat,
         KeyCode::Enter | KeyCode::Char('i') if app.focus == Focus::Composer => {
             app.editing = true;
         }
-        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('q') => app.request_quit(),
         _ => (),
+    }
+}
+
+fn confirm_thread_menu(app: &mut App) {
+    let Some(menu) = app.thread_menu.as_mut() else {
+        return;
+    };
+    if menu.busy {
+        return;
+    }
+    match menu.mode {
+        crate::app::ThreadMenuMode::ProjectOptions => {
+            let project_id = menu.thread_id.clone();
+            let model = app
+                .catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog
+                        .threads
+                        .iter()
+                        .find(|t| t.project_id == project_id && t.model_selection.is_some())
+                })
+                .and_then(|t| t.model_selection.clone());
+            menu.busy = true;
+            app.thread_action_requested = Some(crate::t3::ThreadAction::Create {
+                project_id,
+                thread_id: uuid::Uuid::new_v4().to_string(),
+                model,
+            });
+        }
+        crate::app::ThreadMenuMode::Options => {
+            menu.error = None;
+            menu.mode = if menu.selected_option == 0 {
+                crate::app::ThreadMenuMode::Rename
+            } else {
+                crate::app::ThreadMenuMode::ConfirmDelete
+            };
+        }
+        crate::app::ThreadMenuMode::Rename => {
+            let trimmed = menu.rename_input.trim().to_owned();
+            if trimmed.is_empty() {
+                menu.error = Some("Thread title cannot be empty.".into());
+                return;
+            }
+            menu.busy = true;
+            menu.error = None;
+            app.thread_action_requested = Some(crate::t3::ThreadAction::Rename {
+                thread_id: menu.thread_id.clone(),
+                title: trimmed,
+            });
+        }
+        crate::app::ThreadMenuMode::ConfirmDelete => {
+            menu.busy = true;
+            menu.error = None;
+            app.thread_action_requested = Some(crate::t3::ThreadAction::Delete {
+                thread_id: menu.thread_id.clone(),
+            });
+        }
+    }
+}
+
+fn handle_thread_menu_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'q'))
+    {
+        app.thread_menu = None;
+        app.request_quit();
+        return;
+    }
+    let Some(menu) = app.thread_menu.as_mut() else {
+        return;
+    };
+    if menu.busy {
+        return;
+    }
+    match menu.mode {
+        crate::app::ThreadMenuMode::ProjectOptions => match key.code {
+            KeyCode::Esc => app.thread_menu = None,
+            KeyCode::Enter | KeyCode::Char('n') if key.kind != KeyEventKind::Repeat => {
+                confirm_thread_menu(app)
+            }
+            _ => (),
+        },
+        crate::app::ThreadMenuMode::Options => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.thread_menu = None,
+            KeyCode::Up
+            | KeyCode::Char('k')
+            | KeyCode::Down
+            | KeyCode::Char('j')
+            | KeyCode::Tab => {
+                menu.selected_option = 1 - menu.selected_option;
+            }
+            KeyCode::Char('r') => {
+                menu.selected_option = 0;
+                menu.error = None;
+                menu.mode = crate::app::ThreadMenuMode::Rename;
+            }
+            KeyCode::Char('d') => {
+                menu.selected_option = 1;
+                menu.error = None;
+                menu.mode = crate::app::ThreadMenuMode::ConfirmDelete;
+            }
+            KeyCode::Enter if key.kind != KeyEventKind::Repeat => confirm_thread_menu(app),
+            _ => (),
+        },
+        crate::app::ThreadMenuMode::Rename => match key.code {
+            KeyCode::Esc => {
+                menu.error = None;
+                menu.mode = crate::app::ThreadMenuMode::Options;
+            }
+            KeyCode::Enter if key.kind != KeyEventKind::Repeat => confirm_thread_menu(app),
+            KeyCode::Backspace => {
+                menu.rename_input.pop();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                menu.rename_input.push(c);
+            }
+            _ => (),
+        },
+        crate::app::ThreadMenuMode::ConfirmDelete => match key.code {
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                menu.error = None;
+                menu.mode = crate::app::ThreadMenuMode::Options;
+            }
+            KeyCode::Enter if key.kind != KeyEventKind::Repeat => confirm_thread_menu(app),
+            KeyCode::Char('y' | 'Y') => confirm_thread_menu(app),
+            _ => (),
+        },
     }
 }
 
@@ -417,17 +1021,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn space_activates_menus_and_preserves_spaces_in_text_fields() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(0));
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        handle_key(&mut app, space);
+        assert_eq!(
+            app.thread_menu.as_ref().unwrap().mode,
+            crate::app::ThreadMenuMode::ProjectOptions
+        );
+        handle_key(&mut app, space);
+        assert!(matches!(
+            app.thread_action_requested,
+            Some(crate::t3::ThreadAction::Create { .. })
+        ));
+        app.thread_menu = None;
+        app.focus = Focus::Composer;
+        handle_key(&mut app, space);
+        assert!(app.editing);
+        assert!(app.draft.is_empty());
+        handle_key(&mut app, space);
+        assert_eq!(app.draft, " ");
+        assert!(!app.send_requested);
+        app.editing = false;
+        app.open_thread_menu();
+        let menu = app.thread_menu.as_mut().unwrap();
+        menu.mode = crate::app::ThreadMenuMode::Rename;
+        menu.rename_input = "Two".into();
+        handle_key(&mut app, space);
+        assert_eq!(app.thread_menu.as_ref().unwrap().rename_input, "Two ");
+    }
+
+    #[test]
+    fn project_enter_menu_creates_a_thread_in_that_project() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(0));
+        let Some(crate::catalog::Selection::Project(project_id)) = app.selection().cloned() else {
+            panic!("expected project");
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.thread_menu.as_ref().unwrap().mode,
+            crate::app::ThreadMenuMode::ProjectOptions
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.thread_action_requested, Some(crate::t3::ThreadAction::Create { project_id: id, .. }) if *id == project_id)
+        );
+        assert!(app.thread_menu.as_ref().unwrap().busy);
+    }
+
+    #[test]
+    fn clear_attachments_handles_terminal_control_h_and_invalidates_pending_paste() {
+        for code in [KeyCode::Backspace, KeyCode::Char('h')] {
+            let mut app = App::default();
+            app.focus = Focus::Chat;
+            app.draft_thread = Some("thread".into());
+            app.draft = "Keep text".into();
+            handle_key(&mut app, KeyEvent::new(code, KeyModifiers::CONTROL));
+            assert_eq!(app.send_notice, None);
+
+            app.images
+                .insert("thread".into(), vec![serde_json::json!({"id":"image"})]);
+            app.paste_pending = true;
+            handle_key(&mut app, KeyEvent::new(code, KeyModifiers::CONTROL));
+            assert!(!app.images.contains_key("thread"));
+            assert!(!app.paste_pending);
+            assert_eq!(app.paste_generation, 1);
+            assert_eq!(app.draft, "Keep text");
+            assert_eq!(app.send_notice.as_deref(), Some("Attached images removed."));
+        }
+    }
+
+    #[test]
+    fn panel_hotkeys_focus_projects_and_chat_without_intercepting_ctrl_c() {
+        let mut app = App {
+            authenticated: true,
+            focus: Focus::Composer,
+            ..App::default()
+        };
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.focus == Focus::Projects);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.focus == Focus::Chat);
+
+        app.focus = Focus::Projects;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.focus == Focus::Projects);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_enter_send_keeps_focus_on_composer_outside_typing_mode() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            ..App::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(app.send_requested);
+        assert!(app.steer_requested);
+        assert!(!app.editing);
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[test]
     fn workspace_hotkeys_are_case_sensitive_and_do_not_intercept_text_inputs() {
         let mut app = App::default();
-        for (ch, index) in [
-            ('d', 0),
-            ('D', 0),
-            ('e', 1),
-            ('E', 1),
-            ('t', 2),
-            ('g', 3),
-            ('c', 4),
-        ] {
+        for (ch, index) in [('d', 0), ('e', 1), ('E', 1), ('t', 2), ('g', 3)] {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -469,6 +1179,7 @@ mod tests {
             detail: String::new(),
             offer: crate::startup::Offer::Install,
             busy: false,
+            local_server_pid: None,
         };
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.startup.request.is_none());
@@ -610,18 +1321,24 @@ mod tests {
         assert!(app.focus == Focus::Workspace);
         handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert!(app.focus == Focus::WorkspaceTabs);
-        for index in 1..=5 {
+        for index in 1..=4 {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
             );
-            assert_eq!(app.workspace_highlight, index % 5);
+            assert_eq!(app.workspace_highlight, index % 4);
             assert_eq!(app.workspace_tab, 0);
         }
         handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.workspace_highlight, 4);
+        assert!(app.focus == Focus::Chat);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        for _ in 0..3 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        assert_eq!(app.workspace_highlight, 3);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.workspace_tab, 4);
+        assert_eq!(app.workspace_tab, 3);
         assert!(!app.editing);
         assert!(app.draft.is_empty());
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -641,6 +1358,23 @@ mod tests {
         assert_eq!(app.style_highlight, crate::preferences::TypingStyle::Vim);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.typing_style, crate::preferences::TypingStyle::Vim);
+    }
+
+    #[test]
+    fn settings_r_requests_a_clipboard_recheck() {
+        let mut app = App::default();
+        app.settings_open = true;
+        app.clipboard_check_requested = false;
+        app.clipboard_status = crate::app::ClipboardStatus::Unavailable("old failure".into());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert!(app.clipboard_check_requested);
+        assert!(matches!(
+            app.clipboard_status,
+            crate::app::ClipboardStatus::Checking
+        ));
     }
 
     #[test]
@@ -732,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_sends_only_while_typing_and_alt_enter_adds_a_newline() {
+    fn enter_sends_only_while_typing_and_shift_enter_adds_a_newline() {
         let mut app = App {
             focus: Focus::Composer,
             ..App::default()
@@ -740,11 +1474,141 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.editing);
         assert!(!app.send_requested);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(app.draft, "\n");
         assert!(!app.send_requested);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.send_requested);
+        assert!(!app.editing);
+        assert!(app.focus == Focus::Composer);
+    }
+
+    #[test]
+    fn shift_arrows_select_draft_and_plain_arrow_clears_selection() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            ..App::default()
+        };
+        app.insert_draft("abc");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.selected_draft().as_deref(), Some("bc"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.selected_draft().is_none());
+    }
+
+    #[test]
+    fn ctrl_c_copies_selected_message_text_instead_of_clearing_it() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            ..App::default()
+        };
+        app.insert_draft("draft message");
+        app.draft_selection_anchor = Some(0);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft, "draft message");
+        assert_eq!(app.copy_requested.as_deref(), Some("draft message"));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn ctrl_enter_dispatches_a_steering_message() {
+        let mut app = App {
+            authenticated: true,
+            focus: Focus::Composer,
+            editing: true,
+            ..App::default()
+        };
+        let mut catalog = crate::catalog::tests::snapshot();
+        catalog.normalize();
+        app.update_catalog(catalog);
+        app.move_selection(true);
+        app.sync_history_selection();
+        app.insert_draft("Please continue");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(app.send_requested);
+        let request = app.prepare_send().unwrap();
+        assert!(request.steer);
+        assert_eq!(
+            request.payload()["dispatchMode"]["type"],
+            "start_immediately"
+        );
+        assert_eq!(request.payload()["deliveryIntent"], "steer");
+    }
+
+    #[test]
+    fn mouse_drag_selects_across_unrelated_panels() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::default();
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 2, 3),
+        );
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Drag(MouseButton::Left), 5, 6),
+        );
+        handle_mouse(&mut app, event(MouseEventKind::Up(MouseButton::Left), 5, 6));
+        assert_eq!(app.screen_selection, Some(((3, 2), (6, 6))));
+        assert!(!app.screen_selecting);
+    }
+
+    #[test]
+    fn right_click_menu_offers_paste_without_clearing_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::default();
+        app.screen_selection = Some(((1, 2), (1, 5)));
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Right), 10, 5),
+        );
+        assert_eq!(app.context_menu, Some((10, 5)));
+        assert!(app.screen_selection.is_some());
+        app.context_menu_area = ratatui::layout::Rect::new(10, 5, 27, 4);
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 12, 7),
+        );
+        assert!(app.context_paste_requested);
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn copy_selection_queues_text_for_the_persistent_clipboard_writer() {
+        let mut app = App {
+            focus: Focus::Chat,
+            ..App::default()
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 8, 1));
+        buffer.set_string(0, 0, "copy me", ratatui::style::Style::default());
+        app.screen_buffer = Some(buffer);
+        app.screen_selection = Some(((0, 0), (0, 7)));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.copy_requested.as_deref(), Some("copy me"));
+        assert!(!app.quit);
     }
 
     #[test]
@@ -785,5 +1649,282 @@ mod tests {
         assert_eq!(app.draft, "ab!世界");
         app.backspace_draft();
         assert_eq!(app.draft, "a!世界");
+    }
+
+    #[test]
+    fn shift_d_toggles_dictation_without_conflicting_with_diffs_and_esc_cancels() {
+        let mut app = App {
+            focus: Focus::Composer,
+            ..App::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+        );
+        assert!(app.dictation.toggle_requested);
+        app.dictation.toggle_requested = false;
+        app.dictation.phase = crate::dictation::Phase::Recording;
+        app.focus = Focus::Chat;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT),
+        );
+        assert!(app.dictation.toggle_requested);
+        app.dictation.toggle_requested = false;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.dictation.cancel_requested);
+
+        app.dictation = Default::default();
+        app.focus = Focus::Composer;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert!(!app.dictation.toggle_requested);
+        assert!(app.focus == Focus::Workspace);
+        assert_eq!(app.workspace_tab, 0);
+
+        app.focus = Focus::Composer;
+        app.editing = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.draft, "D");
+        assert!(!app.dictation.toggle_requested);
+    }
+
+    #[test]
+    fn quit_prompts_to_shut_down_local_server_with_no_as_default() {
+        let mut app = App {
+            local_server_pid: Some(4242),
+            ..Default::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(!app.quit);
+        assert_eq!(
+            app.quit_dialog,
+            Some(crate::app::QuitDialog {
+                shutdown_server: false
+            })
+        );
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.quit_dialog.is_none());
+        assert!(!app.quit);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.quit);
+        assert!(!app.shutdown_server_on_quit);
+
+        let mut app = App {
+            local_server_pid: Some(4242),
+            ..Default::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.quit_dialog,
+            Some(crate::app::QuitDialog {
+                shutdown_server: true
+            })
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.quit);
+        assert!(app.shutdown_server_on_quit);
+
+        let mut app = App {
+            local_server_pid: Some(4242),
+            ..Default::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(app.quit);
+        assert!(!app.shutdown_server_on_quit);
+    }
+
+    fn always_other_instance() -> bool {
+        true
+    }
+
+    #[test]
+    fn quit_skips_prompt_when_other_tui3_instances_are_running() {
+        let mut app = App {
+            local_server_pid: Some(4242),
+            check_other_instances: Some(always_other_instance),
+            ..Default::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(app.quit);
+        assert!(app.quit_dialog.is_none());
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_word_and_ctrl_a_selects_all_when_editing() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            draft: "hello world rust".into(),
+            draft_cursor: 16,
+            ..Default::default()
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft, "hello world ");
+        assert_eq!(app.draft_cursor, 12);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft_selection_anchor, Some(0));
+        assert_eq!(app.draft_cursor, 12);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(app.draft, "");
+        assert_eq!(app.draft_cursor, 0);
+        assert_eq!(app.draft_selection_anchor, None);
+    }
+
+    #[test]
+    fn enter_while_dictating_stops_and_sends_on_finish() {
+        let mut app = App {
+            focus: Focus::Composer,
+            draft_thread: Some("t1".into()),
+            ..Default::default()
+        };
+        app.dictation.phase = crate::dictation::Phase::Recording;
+        app.dictation.thread = Some("t1".into());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.dictation.toggle_requested);
+        assert!(app.dictation.send_on_finish);
+        assert!(!app.send_requested);
+
+        app.apply_dictation(crate::dictation::Event::Finished(Ok(
+            "ship this message".into()
+        )));
+        assert_eq!(app.draft, "ship this message");
+        assert!(app.send_requested);
+    }
+
+    #[test]
+    fn enter_on_thread_in_projects_opens_thread_menu_for_rename_and_delete() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.focus = Focus::Projects;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.thread_menu.is_some());
+        assert_eq!(app.thread_menu.as_ref().unwrap().thread_id, "t1");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.thread_menu.as_ref().unwrap().mode,
+            crate::app::ThreadMenuMode::Rename
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.thread_action_requested,
+            Some(crate::t3::ThreadAction::Rename {
+                thread_id: "t1".into(),
+                title: "Conversation!".into(),
+            })
+        );
+
+        app.thread_action_requested = None;
+        app.thread_menu.as_mut().unwrap().busy = false;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.thread_menu.as_ref().unwrap().mode,
+            crate::app::ThreadMenuMode::ConfirmDelete
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.thread_action_requested,
+            Some(crate::t3::ThreadAction::Delete {
+                thread_id: "t1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn slash_command_suggestions_and_clear_sets_fresh_context_on_next_send() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        app.focus = Focus::Composer;
+        app.editing = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.matching_slash_commands().len(), 2);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        let matches = app.matching_slash_commands();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "clear");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.draft, "");
+        assert!(app.is_fresh_context());
+        assert!(!app.send_requested);
+
+        app.authenticated = true;
+        app.draft = "Start fresh here".into();
+        app.draft_cursor = app.draft.chars().count();
+        app.steer_requested = true;
+        let request = app.prepare_send().unwrap();
+        assert!(request.fresh_context);
+        assert!(!request.steer);
+        assert_eq!(request.payload()["freshContext"], true);
+        assert_eq!(
+            request.payload()["dispatchMode"]["type"],
+            "queue_after_active"
+        );
+
+        app.finish_send(request, Ok(()));
+        assert!(!app.is_fresh_context());
     }
 }

@@ -25,6 +25,8 @@ pub struct Item {
     pub id: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
+    #[serde(rename = "inputIntent")]
+    pub input_intent: Option<String>,
     #[serde(rename = "type")]
     pub kind: String,
     pub text: Option<String>,

@@ -25,6 +25,22 @@ pub struct Connection {
     pub authenticated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ThreadAction {
+    Create {
+        project_id: String,
+        thread_id: String,
+        model: Option<crate::models::ModelSelection>,
+    },
+    Rename {
+        thread_id: String,
+        title: String,
+    },
+    Delete {
+        thread_id: String,
+    },
+}
+
 pub enum Update {
     Git {
         request: crate::git::Request,
@@ -40,6 +56,7 @@ pub enum Update {
         run_id: String,
         result: Result<String, String>,
     },
+    Dictation(crate::dictation::Event),
     Ready(Connection),
     Failed(String),
     Pairing(String),
@@ -48,6 +65,10 @@ pub enum Update {
     Usage(Result<Vec<crate::usage::ProviderUsage>, String>),
     ModelChanged {
         request: crate::models::ModelChange,
+        result: Result<(), String>,
+    },
+    ThreadAction {
+        action: ThreadAction,
         result: Result<(), String>,
     },
     Sent {
@@ -436,6 +457,68 @@ impl T3Client {
             .map_err(|_| crate::message::SendFailure::uncertain("T3 acknowledgement timed out. Delivery is uncertain; check history before retrying."))?
     }
 
+    /// Check that T3's local speech service can transcribe right now.
+    async fn voice_ready(&self) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct Status {
+            supported: bool,
+            state: Option<String>,
+        }
+        let status = self.json::<Status>("/api/voice/status", true).await?;
+        match (status.supported, status.state.as_deref()) {
+            (false, _) => Err("T3 speech transcription isn't supported on this server's platform.".into()),
+            (true, Some("missing-model")) => Err(
+                "T3 has no speech model yet. Download one in T3 Code → Settings → Voice, then press Shift+D again.".into(),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Transcribe 16 kHz mono f32le PCM through `POST /api/voice/transcribe`.
+    async fn transcribe(&self, pcm: &[u8]) -> Result<String, String> {
+        let mut request = self
+            .http
+            .post(
+                self.config
+                    .origin
+                    .join("/api/voice/transcribe")
+                    .expect("constant API path"),
+            )
+            .timeout(Duration::from_secs(130))
+            .header("content-type", "application/octet-stream")
+            .body(crate::dictation::transcribe_body(pcm));
+        if let Some(token) = &self.config.access_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                "T3 transcription timed out."
+            } else {
+                "Cannot reach T3 server for transcription."
+            }
+        })?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        if !status.is_success() {
+            let code = body["code"]
+                .as_str()
+                .or(body["reason"].as_str())
+                .unwrap_or("");
+            return Err(match code {
+                "speech_busy" => "T3's speech service is busy. Try again in a moment.".into(),
+                "speech_unavailable" => {
+                    "T3 speech transcription is unavailable on this server.".into()
+                }
+                "invalid_audio" => "T3 rejected the recorded audio.".into(),
+                _ => format!("T3 transcription failed (HTTP {}).", status.as_u16()),
+            });
+        }
+        body["text"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "Unexpected T3 transcription response.".into())
+    }
+
     async fn git_request(
         &self,
         request: &crate::git::Request,
@@ -582,13 +665,77 @@ impl T3Client {
         &self,
         request: &crate::message::SendRequest,
     ) -> Result<(), crate::message::SendFailure> {
-        let result = self
-            .rpc("orchestration.dispatchCommand", request.payload())
-            .await?;
+        let mut payload = request.payload();
+        if !request.attachments.is_empty() {
+            let uploaded = self
+                .rpc(
+                    "assets.persistChatAttachments",
+                    serde_json::json!({
+                        "threadId": request.thread_id, "messageId": request.message_id,
+                        "attachments": request.attachments
+                    }),
+                )
+                .await?;
+            payload["attachments"] = uploaded
+                .get("attachments")
+                .filter(|v| v.is_array())
+                .cloned()
+                .ok_or("T3 returned invalid attachment references. Your draft is kept.")?;
+        }
+        let result = self.rpc("orchestration.dispatchCommand", payload).await?;
         if result["sequence"].as_u64().is_none() {
             return Err(crate::message::SendFailure::uncertain(
                 "Unexpected T3 acknowledgement. Check history before retrying.",
             ));
+        }
+        Ok(())
+    }
+
+    pub async fn run_thread_action(&self, action: &ThreadAction) -> Result<(), String> {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let payload = match action {
+            ThreadAction::Create {
+                project_id,
+                thread_id,
+                model,
+            } => {
+                let model = match model {
+                    Some(model) => model.clone(),
+                    None => self.available_models().await?.into_iter().next()
+                        .ok_or("No available model. Configure a provider in T3 before creating a thread.")?.selection,
+                };
+                let payload = serde_json::json!({
+                    "type": "thread.create", "commandId": command_id,
+                    "threadId": thread_id, "projectId": project_id, "title": "New thread",
+                    "createdBy": "user", "creationSource": "web", "branch": null, "worktreePath": null,
+                    "runtimeMode": "approval-required", "interactionMode": "default", "modelSelection": model
+                });
+                payload
+            }
+            ThreadAction::Rename { thread_id, title } => {
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err("Thread title cannot be empty.".into());
+                }
+                serde_json::json!({
+                    "type": "thread.metadata.update",
+                    "commandId": command_id,
+                    "threadId": thread_id,
+                    "title": title,
+                })
+            }
+            ThreadAction::Delete { thread_id } => serde_json::json!({
+                "type": "thread.delete",
+                "commandId": command_id,
+                "threadId": thread_id,
+            }),
+        };
+        let result = self
+            .rpc("orchestration.dispatchCommand", payload)
+            .await
+            .map_err(|error| error.message)?;
+        if result["sequence"].as_u64().is_none() {
+            return Err("Unexpected T3 acknowledgement.".into());
         }
         Ok(())
     }
@@ -734,6 +881,8 @@ pub struct Backend {
     pub selected_thread: tokio::sync::watch::Sender<Option<String>>,
     pub messages: tokio::sync::mpsc::Sender<crate::message::SendRequest>,
     pub models: tokio::sync::mpsc::Sender<crate::models::ModelCommand>,
+    pub dictation: tokio::sync::mpsc::Sender<crate::dictation::Command>,
+    pub thread_actions: tokio::sync::mpsc::Sender<ThreadAction>,
 }
 
 pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
@@ -835,6 +984,106 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
                 }
             };
             if model_updates.send(update).is_err() {
+                break;
+            }
+        }
+    });
+    let dictation_authorization = authorization.clone();
+    let dictation_updates = sender.clone();
+    let (dictation, mut dictation_commands) =
+        tokio::sync::mpsc::channel::<crate::dictation::Command>(4);
+    runtime.spawn(async move {
+        use crate::dictation::{Command, Event, Recorder};
+        let send = |event| dictation_updates.send(Update::Dictation(event)).is_ok();
+        let mut recording: Option<(Recorder, T3Client)> = None;
+        while let Some(command) = dictation_commands.recv().await {
+            let alive = match command {
+                Command::Start if recording.is_none() => {
+                    let client = dictation_authorization
+                        .borrow()
+                        .clone()
+                        .ok_or_else(|| "Sign in to T3 before dictating.".to_owned())
+                        .and_then(T3Client::new);
+                    let ready = match client {
+                        Ok(client) => client.voice_ready().await.map(|()| client),
+                        Err(error) => Err(error),
+                    };
+                    match ready {
+                        Ok(client) => {
+                            let levels = dictation_updates.clone();
+                            match Recorder::start(move |level| {
+                                let _ = levels.send(Update::Dictation(Event::Level(level)));
+                            })
+                            .await
+                            {
+                                Ok((recorder, program)) => {
+                                    recording = Some((recorder, client));
+                                    send(Event::Recording { program })
+                                }
+                                Err(error) => send(Event::Finished(Err(error))),
+                            }
+                        }
+                        Err(error) => send(Event::Finished(Err(error))),
+                    }
+                }
+                Command::Stop => match recording.take() {
+                    Some((recorder, client)) => {
+                        send(Event::Transcribing);
+                        let result = match recorder.stop().await {
+                            Ok(pcm) => client.transcribe(&pcm).await,
+                            Err(error) => Err(error),
+                        };
+                        send(Event::Finished(result))
+                    }
+                    None => true,
+                },
+                Command::Cancel => match recording.take() {
+                    Some((recorder, _)) => {
+                        recorder.cancel().await;
+                        send(Event::Cancelled)
+                    }
+                    None => true,
+                },
+                Command::Start => true,
+            };
+            if !alive {
+                break;
+            }
+        }
+    });
+    let thread_action_authorization = authorization.clone();
+    let (thread_actions, mut thread_action_requests) =
+        tokio::sync::mpsc::channel::<ThreadAction>(4);
+    let thread_action_updates = sender.clone();
+    runtime.spawn(async move {
+        while let Some(action) = thread_action_requests.recv().await {
+            let config = thread_action_authorization.borrow().clone();
+            let (result, refreshed) = match config {
+                Some(config) => match T3Client::new(config) {
+                    Ok(client) => {
+                        let result = client.run_thread_action(&action).await;
+                        let refreshed = if result.is_ok() {
+                            Some(client.catalog().await)
+                        } else {
+                            None
+                        };
+                        (result, refreshed)
+                    }
+                    Err(error) => (Err(error), None),
+                },
+                None => (Err("Sign in to T3 before modifying threads.".into()), None),
+            };
+            if thread_action_updates
+                .send(Update::ThreadAction { action, result })
+                .is_err()
+            {
+                break;
+            }
+            if let Some(catalog) = refreshed
+                && thread_action_updates
+                    .send(Update::Catalog(catalog))
+                    .is_err()
+            {
                 break;
             }
         }
@@ -960,6 +1209,8 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         selected_thread,
         messages,
         models,
+        dictation,
+        thread_actions,
     }
 }
 

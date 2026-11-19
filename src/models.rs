@@ -11,10 +11,40 @@ pub struct ModelSelection {
     pub options: Option<Value>,
 }
 
+impl ModelSelection {
+    pub fn option_value(&self, id: &str) -> Option<&str> {
+        let options = self.options.as_ref()?;
+        if let Some(array) = options.as_array() {
+            array.iter().find(|option| option["id"] == id)?["value"].as_str()
+        } else {
+            options.get(id)?.as_str()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelChoice {
     pub selection: ModelSelection,
     pub label: String,
+    pub reasoning: Option<ReasoningOption>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningOption {
+    pub id: String,
+    pub label: String,
+    pub options: Vec<OptionChoice>,
+    pub current_value: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +68,14 @@ struct Auth {
 struct ProviderModel {
     slug: String,
     name: String,
+    #[serde(default)]
+    capabilities: ModelCapabilities,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCapabilities {
+    #[serde(default)]
+    option_descriptors: Vec<Value>,
 }
 
 pub fn choices(value: Value) -> Result<Vec<ModelChoice>, String> {
@@ -60,13 +98,41 @@ pub fn choices(value: Value) -> Result<Vec<ModelChoice>, String> {
         }
         let name = provider.display_name.as_deref().unwrap_or(&provider.driver);
         for model in provider.models {
+            let reasoning: Option<ReasoningOption> = model
+                .capabilities
+                .option_descriptors
+                .into_iter()
+                .find_map(|value| {
+                    let role = value.get("role").and_then(Value::as_str);
+                    let id = value.get("id").and_then(Value::as_str);
+                    if value.get("type").and_then(Value::as_str) != Some("select")
+                        || (role != Some("reasoning") && id != Some("reasoningEffort"))
+                    {
+                        return None;
+                    }
+                    serde_json::from_value(value).ok()
+                });
+            let default = reasoning.as_ref().and_then(|descriptor| {
+                descriptor.current_value.clone().or_else(|| {
+                    descriptor
+                        .options
+                        .iter()
+                        .find(|option| option.is_default)
+                        .map(|option| option.id.clone())
+                })
+            });
+            let options = reasoning
+                .as_ref()
+                .zip(default)
+                .map(|(descriptor, value)| json!([{"id": descriptor.id, "value": value}]));
             choices.push(ModelChoice {
                 label: format!("{name} · {}", model.name),
                 selection: ModelSelection {
                     instance_id: provider.instance_id.clone(),
                     model: model.slug,
-                    options: None,
+                    options,
                 },
+                reasoning,
             });
         }
     }
@@ -87,6 +153,55 @@ impl ModelChange {
     }
 }
 
+impl ModelChoice {
+    pub fn reasoning_value(&self) -> Option<&str> {
+        let id = &self.reasoning.as_ref()?.id;
+        self.selection.option_value(id)
+    }
+
+    pub fn cycle_reasoning(&mut self, forward: bool) {
+        let Some(descriptor) = &self.reasoning else {
+            return;
+        };
+        if descriptor.options.is_empty() {
+            return;
+        }
+        let current = self
+            .reasoning_value()
+            .and_then(|value| {
+                descriptor
+                    .options
+                    .iter()
+                    .position(|option| option.id == value)
+            })
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % descriptor.options.len()
+        } else {
+            (current + descriptor.options.len() - 1) % descriptor.options.len()
+        };
+        let mut selections = self
+            .selection
+            .options
+            .as_ref()
+            .map_or_else(Vec::new, |options| {
+                if let Some(array) = options.as_array() {
+                    array.clone()
+                } else {
+                    options.as_object().map_or_else(Vec::new, |object| {
+                        object
+                            .iter()
+                            .map(|(id, value)| json!({"id": id, "value": value}))
+                            .collect()
+                    })
+                }
+            });
+        selections.retain(|option| option["id"] != descriptor.id);
+        selections.push(json!({"id": descriptor.id, "value": descriptor.options[next].id}));
+        self.selection.options = Some(Value::Array(selections));
+    }
+}
+
 pub enum ModelCommand {
     Load,
     Set(ModelChange),
@@ -100,6 +215,7 @@ pub struct ModelPicker {
     pub load_requested: bool,
     pub thread_id: Option<String>,
     pub list_state: ListState,
+    pub reasoning_focus: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
     pub notice_thread: Option<String>,

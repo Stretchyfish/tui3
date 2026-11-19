@@ -6,6 +6,9 @@ pub struct SendRequest {
     pub command_id: String,
     pub message_id: String,
     pub text: String,
+    pub attachments: Vec<Value>,
+    pub steer: bool,
+    pub fresh_context: bool,
 }
 
 impl SendRequest {
@@ -13,18 +16,29 @@ impl SendRequest {
         Self {
             thread_id,
             text,
+            attachments: Vec::new(),
+            steer: false,
+            fresh_context: false,
             command_id: uuid::Uuid::new_v4().to_string(),
             message_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
     pub fn payload(&self) -> Value {
-        json!({
+        let steer = self.steer && !self.fresh_context;
+        let mut payload = json!({
             "type": "message.dispatch", "commandId": self.command_id,
             "threadId": self.thread_id, "messageId": self.message_id,
-            "text": self.text, "attachments": [], "createdBy": "user", "creationSource": "web",
-            "dispatchMode": { "type": "queue_after_active" }
-        })
+            "text": self.text, "attachments": self.attachments, "createdBy": "user", "creationSource": "web",
+            "dispatchMode": if steer { json!({ "type": "start_immediately" }) } else { json!({ "type": "queue_after_active" }) }
+        });
+        if steer {
+            payload["deliveryIntent"] = json!("steer");
+        }
+        if self.fresh_context {
+            payload["freshContext"] = json!(true);
+        }
+        payload
     }
 }
 

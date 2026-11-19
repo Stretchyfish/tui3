@@ -74,6 +74,17 @@ fn render_lines(
 }
 
 impl Viewport {
+    pub fn same_source_line(&self, first_row: u16, second_row: u16) -> bool {
+        let mut start = 0usize;
+        for height in &self.heights {
+            let end = start + height;
+            if (first_row as usize) < end {
+                return (second_row as usize) < end;
+            }
+            start = end;
+        }
+        false
+    }
     pub fn new(content: Text<'static>, width: u16) -> Self {
         let heights: Vec<_> = content
             .lines
@@ -158,8 +169,31 @@ pub fn conversation(
     });
     for (index, entry) in messages.iter().enumerate() {
         let item = &entry.item;
+        let queued = item.kind == "user_message"
+            && (matches!(item.status.as_deref(), Some("pending" | "queued"))
+                || item
+                    .run_id
+                    .as_ref()
+                    .and_then(|id| runs.get(id))
+                    .is_some_and(|run| run.status == "queued"));
+        let steered = matches!(
+            item.input_intent.as_deref(),
+            Some("steer" | "promoted_queued_to_steer")
+        );
         let (label, accent, body) = match item.kind.as_str() {
-            "user_message" => ("YOU", Color::Cyan, Color::Rgb(190, 225, 235)),
+            "user_message" => (
+                if queued && steered {
+                    "YOU · steer · queued"
+                } else if queued {
+                    "YOU · queued"
+                } else if steered {
+                    "YOU · steer"
+                } else {
+                    "YOU"
+                },
+                Color::Cyan,
+                Color::Rgb(190, 225, 235),
+            ),
             "assistant_message" => ("AGENT", Color::Green, Color::Rgb(225, 228, 235)),
             _ => ("SYSTEM", Color::Yellow, Color::Gray),
         };
@@ -346,6 +380,36 @@ pub fn notice(content: &mut Text<'static>, message: impl Into<String>, color: Co
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn steering_user_messages_are_labeled_from_t3_input_intent() {
+        let history = serde_json::from_value(serde_json::json!({
+            "threadId": "t1", "title": "Chat", "items": [
+                {"position": 0, "item": {"type": "user_message", "text": "Continue", "inputIntent": "steer"}},
+                {"position": 1, "item": {"type": "user_message", "text": "Next question", "inputIntent": "turn_start"}}
+            ]
+        })).unwrap();
+        let text = super::conversation(&history, &Default::default(), None, &Default::default())
+            .to_string();
+        assert!(text.contains("YOU · steer"));
+        assert_eq!(text.matches("YOU · steer").count(), 1);
+        assert_eq!(text.matches("╭─ YOU").count(), 2);
+    }
+
+    #[test]
+    fn queued_user_message_has_a_waiting_label() {
+        let history = serde_json::from_value(serde_json::json!({
+            "threadId": "t1", "title": "Chat", "items": [
+                {"position": 0, "item": {"type": "user_message", "text": "Next", "runId": "r2"}}
+            ]
+        }))
+        .unwrap();
+        let run: crate::history::Run =
+            serde_json::from_value(serde_json::json!({"id": "r2", "status": "queued"})).unwrap();
+        let runs = [(run.id.clone(), run)].into_iter().collect();
+        let text = super::conversation(&history, &runs, None, &Default::default()).to_string();
+        assert!(text.contains("YOU · queued"));
+    }
+
     #[test]
     fn message_gutter_continues_on_wrapped_rows_during_streaming_and_resize() {
         use ratatui::{

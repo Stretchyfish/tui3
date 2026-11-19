@@ -39,6 +39,7 @@ struct Window {
     kind: String,
     label: String,
     used_percent: f64,
+    resets_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,6 +52,7 @@ pub struct UsageState {
 pub struct Remaining {
     pub percent: f64,
     pub stale: bool,
+    pub resets_at: Option<String>,
 }
 
 impl UsageState {
@@ -139,13 +141,13 @@ impl UsageState {
             .collect();
         // Where a provider reports both a general and a model-specific allowance,
         // the more restrictive applicable window determines how much remains.
-        let used = applicable
+        let selected = applicable
             .into_iter()
-            .map(|window| window.used_percent)
-            .reduce(f64::max)?;
+            .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent))?;
         Some(Remaining {
-            percent: 100.0 - used,
+            percent: 100.0 - selected.used_percent,
             stale: self.error.is_some() || reason == Some("probeFailed"),
+            resets_at: selected.resets_at.clone(),
         })
     }
 }

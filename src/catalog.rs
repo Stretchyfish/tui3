@@ -80,6 +80,15 @@ impl Catalog {
     }
 }
 
+impl Thread {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "preparing" | "queued" | "starting" | "running" | "waiting"
+        )
+    }
+}
+
 fn archived_label(value: &Option<String>) -> &'static str {
     if value.is_some() { " [archived]" } else { "" }
 }

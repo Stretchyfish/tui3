@@ -41,6 +41,50 @@ pub fn layout(text: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, 
     (lines, caret.unwrap_or((row, column)))
 }
 
+pub fn highlight_selection(
+    frame: &mut Frame,
+    text: &str,
+    cursor: usize,
+    anchor: usize,
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (_, (cursor_row, _)) = layout(text, cursor, area.width as usize);
+    let scroll = cursor_row.saturating_sub(area.height.saturating_sub(1) as usize);
+    let start = anchor.min(cursor);
+    let end = anchor.max(cursor);
+    let (mut row, mut col, mut offset) = (0, 0, 0);
+    for grapheme in text.graphemes(true) {
+        let width = grapheme.width();
+        if grapheme != "\n" && col + width > area.width as usize {
+            row += 1;
+            col = 0;
+        }
+        if offset < end
+            && offset + grapheme.chars().count() > start
+            && row >= scroll
+            && row < scroll + area.height as usize
+        {
+            for dx in 0..width.max(1).min(area.width as usize - col) {
+                let x = area.x + (col + dx) as u16;
+                let y = area.y + (row - scroll) as u16;
+                if x < area.right() {
+                    frame.buffer_mut()[(x, y)].set_bg(ratatui::style::Color::Blue);
+                }
+            }
+        }
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+        } else {
+            col += width;
+        }
+        offset += grapheme.chars().count();
+    }
+}
+
 pub fn draw(
     frame: &mut Frame,
     text: &str,

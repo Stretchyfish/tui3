@@ -23,6 +23,7 @@ pub struct DiffView {
     pub scroll: u16,
     pub max_scroll: u16,
     pub horizontal: u16,
+    pub wrap: bool,
 }
 
 impl DiffView {
@@ -160,13 +161,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         app.diff_view.file_focus = true;
         app.diff_view.displayed_run = id.clone();
     }
-    let run = id.as_ref().and_then(|id| app.runs.get(id));
-    let title = run
-        .and_then(|run| run.ordinal)
-        .map_or(" Diffs ".into(), |n| format!(" Diffs · run {n} "));
-    let block = super::ui::panel(&title, app.focus == Focus::Workspace);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = area;
     if let Some(patch) = id.as_ref().and_then(|id| app.diff_view.patches.get(id))
         && !patch.files.is_empty()
     {
@@ -283,21 +278,42 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             heading,
         );
         let file = &patch.files[app.diff_view.file];
-        app.diff_view.max_scroll = file
-            .lines
-            .len()
+        let visual_lines = if app.diff_view.wrap && body.width > 0 {
+            file.lines
+                .iter()
+                .map(|line| line.width().max(1).div_ceil(body.width as usize))
+                .sum()
+        } else {
+            file.lines.len()
+        };
+        app.diff_view.max_scroll = visual_lines
             .saturating_sub(body.height as usize)
             .min(u16::MAX as usize) as u16;
         app.diff_view.scroll = app.diff_view.scroll.min(app.diff_view.max_scroll);
         let lines = file
             .lines
             .iter()
-            .skip(app.diff_view.scroll as usize)
-            .take(body.height as usize)
+            .skip(if app.diff_view.wrap {
+                0
+            } else {
+                app.diff_view.scroll as usize
+            })
+            .take(if app.diff_view.wrap {
+                usize::MAX
+            } else {
+                body.height as usize
+            })
             .cloned()
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).scroll((0, app.diff_view.horizontal)),
+            if app.diff_view.wrap {
+                Paragraph::new(Text::from(lines))
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((app.diff_view.scroll, 0))
+            } else {
+                Paragraph::new(Text::from(lines))
+                    .scroll((app.diff_view.scroll, app.diff_view.horizontal))
+            },
             body,
         );
         return;

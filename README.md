@@ -6,6 +6,19 @@ and model selection.
 
 Run with `cargo run`. Use arrows or `h/j/k/l` to switch panes, Enter or `i` in the
 composer to type, Esc to return to navigation, and Ctrl+Q to quit.
+Space also activates navigation controls and menu choices, including opening the
+Message composer and project/thread menus. In text fields it inserts a normal space.
+Press `m` from navigation mode to focus the Message composer directly.
+While typing, Enter queues a message after the current run; Ctrl+Enter sends it as a
+steering message to the active run. Shift+Enter inserts a newline.
+Drag with the mouse to highlight text anywhere in the TUI, then press Ctrl+C to
+copy it to the desktop clipboard. While typing in Message, Shift+arrows selects draft text; typing or
+deleting replaces the selection. Ctrl+Q always quits.
+Chat drags stay inside the Chat pane; copied text keeps paragraph line breaks and
+joins display-wrapped lines. Right-click to open a menu with **Copy selection**
+and **Paste to Message**. Paste accepts clipboard text or an image.
+Copy runs through a persistent clipboard worker, so Linux clipboard managers can
+retrieve the selection after the copy action finishes.
 
 Press `s` in navigation mode to open Settings. Use Left/Right or `h/l` to choose
 Regular, Vim, or Helix typing style; all three appear in adjacent boxes with the
@@ -16,14 +29,24 @@ this setting currently records your preferred style. The panel also shows the co
 and model. Press Esc or `s` to close it and
 return to the same pane. While typing a prompt, `s` inserts text normally.
 Clicking a typing-style box activates and saves it immediately.
+Settings also shows whether tui3 can access the desktop clipboard. The check runs
+without changing clipboard contents; press `r` in Settings to check again. An
+empty clipboard is reported as available when the desktop clipboard responds.
 
 ## Workspace panel
 
+Press `Ctrl+J` or `Shift+T` in navigation mode to open the floating Terminal
+placeholder over the interface. Press either shortcut again or Esc to close it.
+
+Press `w` to show or hide the workspace panel. Use `{` and `}` to shrink or grow
+its width in 5% steps. Below 100 terminal columns, tui3 hides the panel automatically;
+it returns when the terminal is wide enough and the panel is enabled.
+
 The right-side workspace panel includes Diffs, an Editor, and Git tools. The Editor,
-Terminal (t), and Side chat (c) currently show letter placeholders.
+Terminal (t), and Chat (c) currently show letter placeholders.
 From chat or the message panel in navigation mode, press Right or `l` to focus it.
-The tool selector sits at the top inside a shared **Workspace** frame, whose title
-names the active tool. Up or `k` at the top of a file/control list (or from the patch)
+The tool selector connects directly to a shared content frame, with an opening
+under the active tab. Up or `k` at the top of a file/control list (or from the patch)
 focuses this selector. All five boxes stay on one row, progressively shortening their names as
 space shrinks and showing full names when they fit.
 Left/Right or `h/l` moves the blue outer outline; Enter or Space activates the tool,
@@ -31,14 +54,20 @@ shown with a green inner outline. Down or `j` returns to the
 panel, then Left or `h` returns to chat. Tab/Shift+Tab also cycle through these panes.
 You can also click panes to focus them, or click a tool box to activate it directly.
 Navigation-mode shortcuts open and focus a tool directly: `d` or `D` Diffs, `e` Editor,
-`t` Terminal, `g` Git, and `c` Side chat. These are case-sensitive and
+`t` Terminal, `g` Git, and `c` Chat. These are case-sensitive and
 do not intercept text input, settings, pickers, or confirmations.
 Clicking the message box highlights it; Enter or `i` still starts typing.
+In the project sidebar, Enter opens a compact menu beside the selected row.
+Projects offer **New thread**; threads offer rename and delete. New threads use
+an existing project thread's model when available, otherwise the first model T3
+reports as available, and open with approvals required.
 
 The Diffs tab shows the latest completed run's checkpoint patch from T3, with green
 additions, red deletions, and yellow hunk headers. While focused on the panel, use
 `[`/`]` to browse completed runs. A full-height file list stays visible to the right of the
 selected file's patch. Use Up/Down, `j/k`, or the wheel over the list to select a file.
+Press `w` while the patch is focused to toggle line wrapping; wrapped lines scroll
+vertically, while unwrapped lines can be panned with Shift+Left/Right.
 Left/`h` or Enter focuses the patch; Right/`l` returns to the file list. Clicking
 either side focuses it. Esc also returns from the patch to the list.
 Line counts appear beside files when space permits and above the selected patch.
@@ -72,8 +101,7 @@ Use Up/Down or `j/k` to highlight a control and Enter to open it:
 
 - **Branch:** choose a local branch with Up/Down, then Enter to review the switch.
 - **Commit message:** type a message; Enter or Esc finishes text entry.
-- **Generate:** click the button beside the message, press `G`, or highlight it
-  with Right/`l` from the message field and press Enter. It refreshes T3's file list
+- **Generate:** press `g` anywhere in the Git panel. It refreshes T3's file list
   and generates an AI subject/body from the actual working-tree diff fetched through
   T3. Generation uses the installed, signed-in `codex` CLI in an ephemeral read-only
   temporary workspace, with structured output. It requires local Codex CLI access;
@@ -233,8 +261,7 @@ five seconds; healthy chat streams do not poll the transcript endpoint.
 ## Sending messages
 
 Select a thread, use Tab to focus its composer, then press Enter or `i` to type.
-While typing, **Enter sends** and **Alt+Enter** adds a newline (Shift+Enter also works
-in terminals that report it). Arrow keys move the cursor; Up/Down keep its column
+While typing, **Enter sends** and **Shift+Enter** adds a newline. Arrow keys move the cursor; Up/Down keep its column
 when moving between lines. Home/End move to the current line's start/end, and Delete
 removes the character after the cursor. Backspace removes the character before it.
 Ctrl+Left/Right jumps to the previous/next word start, skipping punctuation and
@@ -253,8 +280,11 @@ made while sending and drafts in other threads are preserved.
 Messages use T3's authenticated `/ws?orchestrationProtocol=2` connection and
 `orchestration.dispatchCommand` with `message.dispatch`, matching the GUI's command
 API. The existing thread's provider and model are used. A message starts a turn when
-the thread is idle, or queues after the active run. This version sends text only.
+the thread is idle, or queues after the active run. Text and attached clipboard images are supported.
 Sent messages and replies arrive through the live thread stream.
+Queued runs show a yellow waiting notice in Chat and the Message panel; queued
+user messages are labeled in their Chat header. Ctrl+Enter sends a steering
+message to the active run.
 
 Only one message is submitted at a time. Failed sends keep the draft. If a connection
 is lost before acknowledgement, delivery may have succeeded: check the conversation,
@@ -281,6 +311,10 @@ The new setting applies to future messages and does not interrupt a running resp
 Choosing a different model uses its default options; selecting the current model
 leaves its existing options unchanged. Model changes made in T3's GUI update the box
 through the live stream.
+The model picker lists models on the left and reasoning levels on the right. Use
+Left/Right or `h/l` to switch between them, and Up/Down or `j/k` to choose within
+the focused panel. Enter on a model also moves focus to reasoning; Enter there applies
+both. The compact Model box shows the active reasoning level beside the model name.
 
 The previous model remains displayed until T3 acknowledges the change. Failures
 show an error and preserve the prompt. Sending waits for an in-flight model change,
@@ -298,6 +332,9 @@ thread's provider account. Session refers to the provider's session quota window
 (often a rolling five-hour window), not the number of tokens in this chat. Weekly
 values use the provider's weekly window; monthly-only allowances are not relabeled.
 Where applicable, model-specific limits are combined with the general allowance.
+The boxes show the time remaining until T3's reported reset. Use Tab to focus the
+controls, then Left/Right to move between Model, Session left, and Week left; the
+focused box gets the blue outline.
 
 Missing or unsupported windows show **N/A**. Disconnected or failed-probe data is
 marked **stale**; known account data is retained while reconnecting. Signing out or
@@ -323,3 +360,17 @@ cargo test live_server_thread_subscription -- --ignored
 cargo test live_server_model_catalog -- --ignored
 cargo test live_server_usage_subscription -- --ignored
 ```
+
+## Clipboard images
+
+With the Message box focused, press Ctrl+V to attach an image from the desktop
+clipboard. Attached images appear in an **Unsent attachments** block at the bottom of chat
+with a filename, size, and clickable **×** control. The header shows the attachment count; Enter sends them with
+your text (or by themselves). Ctrl+Backspace removes the draft’s images from either Chat or Message (Ctrl+H
+is also supported for terminals that encode the shortcut that way). Images
+stay with their thread when switching conversations and remain attached after a
+failed send. T3 limits each image to 10 MiB and all images in a message to 80 MiB.
+
+The terminal must forward Ctrl+V to tui3. If it intercepts that key, change its
+paste binding. Clipboard access uses the desktop session running tui3; an SSH
+session does not automatically have access to your local desktop clipboard.

@@ -22,6 +22,7 @@ pub struct Event {
     pub detail: String,
     pub offer: Offer,
     pub busy: bool,
+    pub local_server_pid: Option<u32>,
 }
 #[derive(Clone, Copy)]
 pub enum Command {
@@ -56,7 +57,157 @@ fn event(message: &str, detail: &str, offer: Offer, busy: bool) -> Event {
         detail: detail.into(),
         offer,
         busy,
+        local_server_pid: None,
     }
+}
+
+fn event_with_pid(
+    message: &str,
+    detail: &str,
+    offer: Offer,
+    busy: bool,
+    local_server_pid: Option<u32>,
+) -> Event {
+    Event {
+        message: message.into(),
+        detail: detail.into(),
+        offer,
+        busy,
+        local_server_pid,
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn runtime_server_pid(target: &Target) -> Option<u32> {
+    if target.remote {
+        return None;
+    }
+    #[derive(Deserialize)]
+    struct Runtime {
+        pid: Option<u32>,
+        origin: Option<String>,
+    }
+    let data = std::fs::read(target.state.join("server-runtime.json")).ok()?;
+    let runtime = serde_json::from_slice::<Runtime>(&data).ok()?;
+    let origin = runtime.origin.as_deref()?;
+    let parsed = Url::parse(origin).ok()?;
+    if parsed != target.origin {
+        return None;
+    }
+    let pid = runtime.pid?;
+    process_alive(pid).then_some(pid)
+}
+
+pub fn local_server_pid() -> Option<u32> {
+    let target = Target::load().ok()?;
+    runtime_server_pid(&target)
+}
+
+pub fn shutdown_local_server(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn instances_dir() -> Option<PathBuf> {
+    let session = crate::pairing::session_path().ok()?;
+    Some(session.parent()?.join("instances"))
+}
+
+pub struct InstanceGuard {
+    path: Option<PathBuf>,
+}
+
+impl InstanceGuard {
+    pub fn register() -> Self {
+        let Some(dir) = instances_dir() else {
+            return Self { path: None };
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Self { path: None };
+        }
+        let pid = std::process::id();
+        let path = dir.join(pid.to_string());
+        if std::fs::write(&path, pid.to_string()).is_ok() {
+            Self { path: Some(path) }
+        } else {
+            Self { path: None }
+        }
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub fn other_tui3_instances_running() -> bool {
+    let Some(dir) = instances_dir() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let current = std::process::id();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == current {
+            continue;
+        }
+        if process_alive(pid) {
+            return true;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    false
 }
 pub fn cli_path() -> Option<PathBuf> {
     let filename = if cfg!(windows) { "t3.exe" } else { "t3" };
@@ -213,9 +364,13 @@ fn start_command(cli: &Path, target: &Target) -> Result<tokio::process::Command,
     command.kill_on_drop(false);
     Ok(command)
 }
-async fn start_local(client: &reqwest::Client, target: &Target, cli: &Path) -> Result<(), String> {
+async fn start_local(
+    client: &reqwest::Client,
+    target: &Target,
+    cli: &Path,
+) -> Result<Option<u32>, String> {
     if running(client, target).await {
-        return Ok(());
+        return Ok(runtime_server_pid(target));
     }
     // Never start over an occupied port, even when its listener is not T3.
     let host = target
@@ -239,10 +394,11 @@ async fn start_local(client: &reqwest::Client, target: &Target, cli: &Path) -> R
     let mut child = start_command(cli, target)?
         .spawn()
         .map_err(|_| "Could not launch the T3 CLI.".to_owned())?;
+    let child_pid = child.id();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if running(client, target).await {
-            return Ok(());
+            return Ok(runtime_server_pid(target).or(child_pid));
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -353,10 +509,11 @@ pub fn spawn(runtime: &tokio::runtime::Runtime, auto_start: bool) -> Backend {
                 let target = Target::load()?;
                 let was_running = running(&client, &target).await;
                 if was_running && !(matches!(next, Command::Install) && cli_path().is_none()) {
+                    let pid = runtime_server_pid(&target);
                     if !target.remote && cli_path().is_none() {
-                        return Ok(event("T3 is running, but its CLI is missing", "Install the official CLI to enable local pairing without copying tokens. The running server will be reused.", Offer::Install, false));
+                        return Ok(event_with_pid("T3 is running, but its CLI is missing", "Install the official CLI to enable local pairing without copying tokens. The running server will be reused.", Offer::Install, false, pid));
                     }
-                    return Ok(event("T3 server is running", "Using the existing server.", Offer::None, false));
+                    return Ok(event_with_pid("T3 server is running", "Using the existing server.", Offer::None, false, pid));
                 }
                 if target.remote { return Ok(event("Remote T3 server is unavailable", "Check its address and start it on the remote machine. Local auto-start and installation do not apply to remote URLs.", Offer::Retry, false)); }
                 let mut cli = cli_path();
@@ -365,12 +522,15 @@ pub fn spawn(runtime: &tokio::runtime::Runtime, auto_start: bool) -> Backend {
                     let _ = sender.send(event("Downloading and installing T3…", "Using the official t3.codes installer for this user. This may take a few minutes.", Offer::None, true));
                     install(&sender).await?; cli = cli_path();
                 }
-                if was_running { return Ok(event("T3 CLI installed", "The running server was reused. Connect to save your local pairing session.", Offer::Pair, false)); }
+                if was_running {
+                    let pid = runtime_server_pid(&target);
+                    return Ok(event_with_pid("T3 CLI installed", "The running server was reused. Connect to save your local pairing session.", Offer::Pair, false, pid));
+                }
                 let Some(cli) = cli else { return Ok(event("T3 CLI/server is not installed", "Install the official T3 CLI for this user, then start its local server. No system service will be installed. Download source: https://t3.codes", Offer::Install, false)); };
                 if matches!(next, Command::Start | Command::Install) || *settings.borrow() {
                     let _ = sender.send(event("T3 is not running. Starting it…", "Launching a local, loopback-only T3 server without opening a browser.", Offer::None, true));
-                    start_local(&client, &target, &cli).await?;
-                    Ok(event("T3 is ready", "The server will keep running when tui3 closes. Connect to save a local pairing session without copying tokens.", Offer::Pair, false))
+                    let pid = start_local(&client, &target, &cli).await?;
+                    Ok(event_with_pid("T3 is ready", "Connect to save a local pairing session without copying tokens.", Offer::Pair, false, pid))
                 } else { Ok(event("T3 is installed but not running", "Automatic startup is disabled. Start it now, or close this panel and start it yourself.", Offer::Start, false)) }
             }.await;
             let outcome: Result<Event, String> = outcome;
@@ -490,6 +650,44 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut crate::app::App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn declining_shutdown_keeps_server_alive_after_runtime_drops() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-t3");
+        std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let child = {
+            let _entered = runtime.enter();
+            start_command(&cli, &target(12345, dir.path()))
+                .unwrap()
+                .spawn()
+                .unwrap()
+        };
+        let pid = child.id().unwrap();
+        let mut app = crate::app::App {
+            local_server_pid: Some(pid),
+            ..Default::default()
+        };
+        app.request_quit();
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(app.quit);
+        assert_eq!(app.server_to_shutdown(), None);
+        drop(child);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        let alive = process_alive(pid);
+        shutdown_local_server(pid);
+        assert!(
+            alive,
+            "No must preserve the server after the app runtime exits"
+        );
+    }
     fn target(port: u16, root: &Path) -> Target {
         Target {
             origin: Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),

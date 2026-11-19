@@ -1,8 +1,10 @@
 mod app;
 mod catalog;
 mod chat;
+mod clipboard;
 mod commit_message;
 mod composer;
+mod dictation;
 mod diff;
 mod git;
 mod history;
@@ -26,6 +28,7 @@ use crossterm::{
 use std::{io, time::Duration};
 
 fn main() -> io::Result<()> {
+    let _instance_guard = startup::InstanceGuard::register();
     let runtime = tokio::runtime::Runtime::new()?;
     let mut resume = preferences::ResumeStore::load();
     let startup = startup::spawn(&runtime, resume.auto_start_t3());
@@ -37,11 +40,11 @@ fn main() -> io::Result<()> {
         EnableMouseCapture
     )
     .and_then(|_| {
-        // Keep click reporting, but disable Crossterm's pointer-motion reporting.
+        // Track drags for text selection without reporting idle pointer motion.
         #[cfg(not(windows))]
         execute!(
             terminal.backend_mut(),
-            crossterm::style::Print("\x1b[?1003l\x1b[?1002l\x1b[?1000h")
+            crossterm::style::Print("\x1b[?1003l\x1b[?1002h\x1b[?1000h")
         )?;
         run(&mut terminal, backend, &mut resume, startup)
     });
@@ -51,12 +54,15 @@ fn main() -> io::Result<()> {
         DisableMouseCapture
     );
     ratatui::restore();
+    if let Ok(Some(pid)) = &result {
+        startup::shutdown_local_server(*pid);
+    }
     resume.flush();
     if let Some(warning) = resume.warning {
         eprintln!("Could not save UI preferences: {warning}");
     }
     runtime.shutdown_timeout(Duration::from_millis(100));
-    result
+    result.map(|_| ())
 }
 
 fn run(
@@ -64,14 +70,114 @@ fn run(
     backend: t3::Backend,
     resume: &mut preferences::ResumeStore,
     startup: startup::Backend,
-) -> io::Result<()> {
+) -> io::Result<Option<u32>> {
     let mut app = app::App {
         typing_style: resume.typing_style(),
         auto_start_t3: resume.auto_start_t3(),
+        check_other_instances: Some(startup::other_tui3_instances_running),
         ..app::App::default()
     };
+    let (paste_sender, paste_results) = std::sync::mpsc::channel();
+    let clipboard_writer = clipboard::Writer::start();
+    let (context_paste_sender, context_paste_results) =
+        std::sync::mpsc::channel::<(String, u64, Result<clipboard::Content, String>)>();
+    let (clipboard_sender, clipboard_results) = std::sync::mpsc::channel();
     while !app.quit {
+        while let Ok(result) = clipboard_writer.results.try_recv() {
+            match result {
+                Ok(()) => {
+                    app.clipboard_status = app::ClipboardStatus::Available;
+                    app.send_notice = Some("Selected text copied.".into());
+                }
+                Err(error) => {
+                    app.clipboard_status = app::ClipboardStatus::Unavailable(error.clone());
+                    app.send_notice = Some(error);
+                }
+            }
+        }
+        if let Some(text) = app.copy_requested.take()
+            && let Err(error) = clipboard_writer.copy(text)
+        {
+            app.send_notice = Some(error);
+        }
+        while let Ok(result) = clipboard_results.try_recv() {
+            app.clipboard_check_pending = false;
+            app.clipboard_status = match result {
+                Ok(()) => app::ClipboardStatus::Available,
+                Err(error) => app::ClipboardStatus::Unavailable(error),
+            };
+        }
+        if app.clipboard_check_requested && !app.clipboard_check_pending {
+            app.clipboard_check_requested = false;
+            app.clipboard_check_pending = true;
+            app.clipboard_status = app::ClipboardStatus::Checking;
+            let sender = clipboard_sender.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(clipboard::status());
+            });
+        }
+        while let Ok((thread, generation, result)) = paste_results.try_recv() {
+            if generation != app.paste_generation {
+                continue;
+            }
+            app.paste_pending = false;
+            match result {
+                Ok(image) => app.attach_clipboard_image(thread, image),
+                Err(error) => app.send_notice = Some(error),
+            }
+        }
+        while let Ok((thread, generation, result)) = context_paste_results.try_recv() {
+            if generation != app.paste_generation {
+                continue;
+            }
+            app.paste_pending = false;
+            match result {
+                Ok(clipboard::Content::Text(text)) => {
+                    if app.insert_into_thread_draft(&thread, &text) {
+                        app.focus = app::Focus::Composer;
+                        app.editing = true;
+                        app.send_notice = Some("Clipboard text pasted into Message.".into());
+                    } else {
+                        app.send_notice =
+                            Some("Clipboard text added to the original thread's draft.".into());
+                    }
+                }
+                Ok(clipboard::Content::Image(image)) => app.attach_clipboard_image(thread, image),
+                Err(error) => app.send_notice = Some(error),
+            }
+        }
+        if app.context_paste_requested {
+            app.context_paste_requested = false;
+            if app.paste_pending {
+                app.send_notice = Some("Wait for the current clipboard paste to finish.".into());
+            } else if let Some(thread) = app.draft_thread.clone() {
+                app.paste_pending = true;
+                app.send_notice = Some("Reading desktop clipboard…".into());
+                let sender = context_paste_sender.clone();
+                let generation = app.paste_generation;
+                std::thread::spawn(move || {
+                    let _ = sender.send((thread, generation, clipboard::content()));
+                });
+            } else {
+                app.send_notice = Some("Select a thread before pasting into Message.".into());
+            }
+        }
+        if app.paste_requested {
+            app.paste_requested = false;
+            if let Some(thread) = app.draft_thread.clone() {
+                app.paste_pending = true;
+                app.send_notice = Some("Reading clipboard image…".into());
+                let sender = paste_sender.clone();
+                let generation = app.paste_generation;
+                std::thread::spawn(move || {
+                    let _ = sender.send((thread, generation, clipboard::image()));
+                });
+            }
+        }
         while let Ok(event) = startup.updates.try_recv() {
+            if !event.busy {
+                app.local_server_pid = event.local_server_pid;
+            }
             app.startup.apply(event);
         }
         startup.auto_start.send_if_modified(|value| {
@@ -109,20 +215,7 @@ fn run(
                     run_id,
                     result,
                 } => {
-                    if app.history_thread.as_deref() == Some(&thread_id) {
-                        match result {
-                            Ok(patch) => {
-                                app.chat_revision = app.chat_revision.wrapping_add(1);
-                                app.run_diffs
-                                    .entry(run_id.clone())
-                                    .or_insert_with(|| crate::history::diff_counts(&patch));
-                                app.diff_view.patches.insert(run_id, patch.into());
-                            }
-                            Err(error) => {
-                                app.diff_view.errors.insert(run_id, error);
-                            }
-                        }
-                    }
+                    app.finish_diff(thread_id, run_id, result);
                     continue;
                 }
                 t3::Update::Usage(result) => {
@@ -150,6 +243,10 @@ fn run(
                     app.finish_model_change(request, result);
                     continue;
                 }
+                t3::Update::ThreadAction { action, result } => {
+                    app.finish_thread_action(action, result);
+                    continue;
+                }
                 t3::Update::Live { thread_id, result } => {
                     app.sync_history_selection();
                     app.apply_live(&thread_id, result);
@@ -173,6 +270,10 @@ fn run(
                     }
                     continue;
                 }
+                t3::Update::Dictation(event) => {
+                    app.apply_dictation(event);
+                    continue;
+                }
                 t3::Update::Pairing(message) => {
                     app.pairing_message = message;
                     app.pairing_in_progress = false;
@@ -183,6 +284,10 @@ fn run(
             app.connection = match update {
                 t3::Update::Ready(connection) => {
                     resume.activate(&connection.environment.environment_id, &mut app);
+                    app.environment_label = Some(connection.environment.label.clone());
+                    if app.local_server_pid.is_none() {
+                        app.local_server_pid = startup::local_server_pid();
+                    }
                     app.authenticated = connection.authenticated;
                     if app.authenticated {
                         app.pairing_in_progress = false;
@@ -209,6 +314,7 @@ fn run(
                     format!("Disconnected | {error}")
                 }
                 t3::Update::Pairing(_)
+                | t3::Update::Dictation(_)
                 | t3::Update::Catalog(_)
                 | t3::Update::History { .. }
                 | t3::Update::Sent { .. }
@@ -218,7 +324,8 @@ fn run(
                 | t3::Update::Git { .. }
                 | t3::Update::GitProgress { .. }
                 | t3::Update::RunDiff { .. }
-                | t3::Update::ModelChanged { .. } => {
+                | t3::Update::ModelChanged { .. }
+                | t3::Update::ThreadAction { .. } => {
                     unreachable!()
                 }
             };
@@ -236,7 +343,7 @@ fn run(
         if app.authenticated
             && let Some(thread) = app.history_thread.as_ref()
         {
-            let viewed = if app.workspace_tab == 0 {
+            let viewed = if app.workspace_visible && app.workspace_tab == 0 {
                 app.diff_view.run_id(&app.runs).map(str::to_owned)
             } else {
                 None
@@ -250,7 +357,14 @@ fn run(
                 .filter_map(|entry| entry.item.run_id.as_ref())
                 .filter(|id| !app.run_diffs.contains_key(*id))
                 .collect();
-            for run in app.runs.values() {
+            let mut runs: Vec<_> = app.runs.values().collect();
+            runs.sort_by_key(|run| {
+                (
+                    viewed.as_ref() != Some(&run.id),
+                    std::cmp::Reverse(run.ordinal),
+                )
+            });
+            for run in runs {
                 if run.status != "completed" || app.diff_requested.contains(&run.id) {
                     continue;
                 }
@@ -275,10 +389,23 @@ fn run(
                 true
             }
         });
+        app.check_dictation_limit();
+        if let Some(action) = app.thread_action_requested.take()
+            && backend.thread_actions.try_send(action.clone()).is_err()
+        {
+            app.finish_thread_action(action, Err("T3 thread action queue is busy.".into()));
+        }
+        if let Some(command) = app.take_dictation_command()
+            && backend.dictation.try_send(command).is_err()
+        {
+            app.apply_dictation(dictation::Event::Finished(Err(
+                "Dictation is busy. Please wait and try again.".into(),
+            )));
+        }
         resume.remember(&app);
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
-            // Discard unused motion/release events in a batch instead of rendering
+            // Discard unused motion events in a batch instead of rendering
             // the full transcript for each queued pointer event.
             let mut next = event::read()?;
             let mut ignored = 0;
@@ -290,13 +417,16 @@ fn run(
                 Event::Key(key) => input::handle_key(&mut app, key),
                 Event::Mouse(mouse) => input::handle_mouse(&mut app, mouse),
                 Event::Paste(text)
-                    if app.git.editing
+                    if !app.terminal_overlay_open
+                        && app.git.editing
                         && app.focus == app::Focus::Workspace
                         && app.workspace_tab == 3 =>
                 {
                     app.git.message.push_str(&text.replace(['\r', '\n'], " "))
                 }
-                Event::Paste(text) if app.editing => app.insert_draft(&text),
+                Event::Paste(text) if app.editing && !app.terminal_overlay_open => {
+                    app.insert_draft(&text)
+                }
                 _ => (),
             }
             if app.models.load_requested {
@@ -349,7 +479,7 @@ fn run(
         }
     }
     resume.remember(&app);
-    Ok(())
+    Ok(app.server_to_shutdown())
 }
 
 fn useful_input(event: &Event) -> bool {
@@ -358,6 +488,9 @@ fn useful_input(event: &Event) -> bool {
         Event::Mouse(mouse) => matches!(
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Down(MouseButton::Right)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
                 | MouseEventKind::ScrollUp
                 | MouseEventKind::ScrollDown
         ),
