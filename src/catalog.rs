@@ -21,6 +21,8 @@ pub struct Thread {
     pub title: String,
     pub status: String,
     pub model_selection: Option<crate::models::ModelSelection>,
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
     pub archived_at: Option<String>,
     pub deleted_at: Option<String>,
 }

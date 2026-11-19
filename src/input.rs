@@ -531,6 +531,49 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         }
         return;
     }
+    if app.access_open {
+        let count = crate::app::RUNTIME_MODES.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.access_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.access_highlight = app.access_highlight.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.access_highlight = (app.access_highlight + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
+                app.confirm_access_picker();
+            }
+            _ => (),
+        }
+        return;
+    }
+    if let Some(pending) = app.active_approval_popup() {
+        let count = pending.options.len();
+        match key.code {
+            KeyCode::Esc => {
+                app.approval_dismissed_id = Some(pending.request_id);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.approval_highlight = app.approval_highlight.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.approval_highlight = (app.approval_highlight + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
+                app.confirm_approval();
+            }
+            KeyCode::Char(ch @ '1'..='5') if key.kind != KeyEventKind::Repeat => {
+                let idx = (ch as usize) - ('1' as usize);
+                if idx < count {
+                    app.approval_highlight = idx;
+                    app.confirm_approval();
+                }
+            }
+            _ => (),
+        }
+        return;
+    }
     let git_modal = app.focus == Focus::Workspace
         && app.workspace_tab == 3
         && (app.git.editing || app.git.picking || app.git.confirm.is_some());
@@ -764,10 +807,11 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         KeyCode::Char('o') => app.startup.open = true,
         KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => app.focus = Focus::Chat,
         KeyCode::Char('m') => app.focus = Focus::Composer,
-        KeyCode::Right | KeyCode::Char('l')
-            if app.focus == Focus::Chat || app.focus == Focus::Model =>
-        {
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Chat => {
             app.focus = Focus::Workspace;
+        }
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Model => {
+            app.focus = Focus::Access;
         }
         KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::Workspace => {
             app.focus = Focus::WorkspaceTabs;
@@ -793,7 +837,15 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k')
             if matches!(app.focus, Focus::Workspace | Focus::WorkspaceTabs) => {}
-        KeyCode::Enter if app.focus == Focus::Model => app.open_models(),
+        KeyCode::Enter | KeyCode::Char(' ') if app.focus == Focus::Model => app.open_models(),
+        KeyCode::Enter | KeyCode::Char(' ') if app.focus == Focus::Access => {
+            app.open_access_picker()
+        }
+        KeyCode::Enter | KeyCode::Char('a')
+            if app.focus == Focus::Chat && app.pending_approval().is_some() =>
+        {
+            app.approval_dismissed_id = None;
+        }
         KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Composer => {
             app.focus = Focus::Model
         }
@@ -803,8 +855,20 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Model => {
             app.focus = Focus::SessionUsage
         }
-        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::SessionUsage => {
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Access => {
             app.focus = Focus::Model
+        }
+        KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Access => {
+            app.focus = Focus::SessionUsage
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.focus == Focus::Access => {
+            app.focus = Focus::Composer
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.focus == Focus::Access => {
+            app.focus = Focus::SessionUsage
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::SessionUsage => {
+            app.focus = Focus::Access
         }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::SessionUsage => {
             app.focus = Focus::WeeklyUsage
@@ -1132,6 +1196,73 @@ mod tests {
         assert!(app.steer_requested);
         assert!(!app.editing);
         assert!(app.focus == Focus::Composer);
+    }
+
+    #[test]
+    fn access_level_picker_updates_runtime_mode() {
+        let mut app = App::default();
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        app.focus = Focus::Model;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.focus == Focus::Access);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.access_open);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.access_open);
+        let req = app.access_requested.take().unwrap();
+        assert_eq!(req.thread_id, "t1");
+        assert_eq!(req.runtime_mode, "auto-accept-edits");
+        assert_eq!(req.payload()["type"], "thread.runtime-mode.set");
+
+        app.apply_runtime_mode_change(req, Ok(()));
+        assert_eq!(app.current_runtime_mode(), Some("auto-accept-edits"));
+    }
+
+    #[test]
+    fn approval_popup_responds_and_can_be_minimized() {
+        let mut app = App::default();
+        app.authenticated = true;
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        app.history_thread = Some("t1".into());
+        app.transcript = Some(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "t1",
+                "title": "Chat",
+                "items": [{
+                    "position": 0,
+                    "item": {
+                        "type": "approval_request",
+                        "requestId": "req-1",
+                        "requestKind": "command",
+                        "prompt": "Run cargo test"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        assert!(app.active_approval_popup().is_some());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.active_approval_popup().is_none());
+
+        app.focus = Focus::Chat;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.active_approval_popup().is_some());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let req = app.approval_requested.take().unwrap();
+        assert_eq!(req.request_id, "req-1");
+        assert_eq!(req.decision, "acceptForSession");
+        assert_eq!(req.payload()["type"], "runtime-request.respond");
     }
 
     #[test]

@@ -56,10 +56,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(3),
     ])
     .areas(main);
-    let [model, session, weekly] = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(30),
-        Constraint::Percentage(30),
+    let [model, access, session, weekly] = Layout::horizontal([
+        Constraint::Percentage(28),
+        Constraint::Percentage(22),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
     ])
     .areas(controls);
     for (area, focus) in [
@@ -67,6 +68,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (chat, Focus::Chat),
         (composer, Focus::Composer),
         (model, Focus::Model),
+        (access, Focus::Access),
     ] {
         app.click_targets
             .push((area, crate::app::ClickTarget::Pane(focus)));
@@ -177,8 +179,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         *revision == app.chat_revision && *cached_tick == tick
                     })
                 {
-                    let text =
-                        crate::chat::conversation(history, &app.runs, elapsed, &app.run_diffs);
+                    let text = crate::chat::conversation(
+                        history,
+                        &app.runs,
+                        elapsed,
+                        &app.run_diffs,
+                        &app.runtime_requests,
+                    );
                     app.chat_cache = Some((app.chat_revision, tick, text));
                 }
                 let mut text = app.chat_cache.as_ref().unwrap().2.clone();
@@ -526,6 +533,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         model_block
     };
     frame.render_widget(Paragraph::new(current).block(model_block), model);
+    let access_value = if app.selected_thread_id().is_none() {
+        "Select a thread".to_owned()
+    } else if app.access_pending.is_some() {
+        "Updating…".to_owned()
+    } else if let Some(mode) = app.current_runtime_mode() {
+        crate::app::runtime_mode_label(mode).to_owned()
+    } else {
+        "Default".to_owned()
+    };
+    let access_block = panel(
+        if app.focus == Focus::Access {
+            " Access (Enter/Space: change) "
+        } else {
+            " Access "
+        },
+        app.focus == Focus::Access,
+    );
+    let access_block = if app.access_error.is_some() {
+        access_block.title_bottom(" Error updating ")
+    } else {
+        access_block
+    };
+    frame.render_widget(Paragraph::new(access_value).block(access_block), access);
     usage_panel(frame, session, " Session left ", app, "session");
     usage_panel(frame, weekly, " Week left ", app, "weekly");
     app.click_targets
@@ -551,7 +581,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.focus == Focus::Chat {
         " ↓/j or m: Message | Shift+j/k/↑↓: scroll | s: settings "
     } else if app.focus == Focus::Model {
-        " Enter/Space: choose model | k/↑: prompt | Tab: pane | s: settings "
+        " Enter/Space: choose model | l/→: access | k/↑: prompt | Tab: pane | s: settings "
+    } else if app.focus == Focus::Access {
+        " Enter/Space: access level | h/←: model | l/→: usage | k/↑: prompt | Tab: pane "
     } else {
         " ↓/j: model | ↑/k: chat | Enter/Space/i: type | Shift+D: dictate | m: Message | s: settings "
     };
@@ -671,6 +703,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 reasoning_area,
             );
         }
+    }
+    if app.access_open {
+        app.click_targets.clear();
+        access_panel(frame, app);
+    }
+    if let Some(pending) = app.active_approval_popup() {
+        app.click_targets.clear();
+        approval_panel(frame, app, &pending);
     }
     if app.startup.open {
         app.click_targets.clear();
@@ -1329,6 +1369,122 @@ fn selector_box(frame: &mut Frame, area: Rect, label: &str, active: bool, highli
             .style(Style::default().fg(Color::Gray).bg(Color::Black)),
         inner,
     );
+}
+
+fn access_panel(frame: &mut Frame, app: &App) {
+    let area = centered_box(frame.area(), 62, 11);
+    frame.render_widget(Clear, area);
+    let block = panel(" Access level — for this thread ", true)
+        .title_bottom(" ↑↓/jk: select · Enter/Space: apply · Esc: close ");
+    let current = app.current_runtime_mode();
+    let mut lines = Vec::new();
+    for (index, (id, label, desc)) in crate::app::RUNTIME_MODES.iter().enumerate() {
+        let selected = index == app.access_highlight;
+        let active = current == Some(*id);
+        let marker = if selected { "▸ " } else { "  " };
+        let badge = if active { " (current)" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{label}{badge}"),
+                Style::default()
+                    .fg(if selected { Color::Cyan } else { Color::White })
+                    .add_modifier(if selected {
+                        ratatui::style::Modifier::BOLD
+                    } else {
+                        ratatui::style::Modifier::empty()
+                    }),
+            ),
+            Span::styled(format!(" — {desc}"), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if let Some(error) = &app.access_error {
+        lines.push(Line::default());
+        lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn approval_panel(frame: &mut Frame, app: &App, pending: &crate::app::PendingApproval) {
+    let area = centered_box(frame.area(), 72, 16);
+    frame.render_widget(Clear, area);
+    let title = format!(" Approval required · {} ", pending.kind);
+    let block = panel(&title, true)
+        .title_bottom(" ↑↓/jk or 1-5: choose · Enter/Space: confirm · Esc: minimize ");
+    let mut lines = Vec::new();
+    if let Some(app_name) = &pending.app_name {
+        lines.push(Line::styled(
+            format!("Tool / App: {app_name}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if let Some(prompt) = &pending.prompt {
+        for line in prompt.lines().take(4) {
+            lines.push(Line::styled(
+                line.to_owned(),
+                Style::default().fg(Color::White),
+            ));
+        }
+    }
+    if let Some(reason) = &pending.reason {
+        lines.push(Line::styled(
+            reason.clone(),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    lines.push(Line::default());
+    let highlight = app
+        .approval_highlight
+        .min(pending.options.len().saturating_sub(1));
+    for (index, option) in pending.options.iter().enumerate() {
+        let selected = index == highlight;
+        let prefix = if selected { "▸ " } else { "  " };
+        lines.push(Line::styled(
+            format!("{prefix}[{}] {}", index + 1, option.label),
+            Style::default()
+                .fg(if selected {
+                    Color::Yellow
+                } else {
+                    Color::White
+                })
+                .add_modifier(if selected {
+                    ratatui::style::Modifier::BOLD
+                } else {
+                    ratatui::style::Modifier::empty()
+                }),
+        ));
+        if selected && let Some(warning) = &option.warning {
+            lines.push(Line::styled(
+                format!("    ⚠ {warning}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+    if app.approval_pending.is_some() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Sending response…",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(error) = &app.approval_error {
+        lines.push(Line::default());
+        lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
+fn centered_box(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width.saturating_sub(2)).max(20.min(area.width));
+    let h = height
+        .min(area.height.saturating_sub(2))
+        .max(7.min(area.height));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
 }
 
 pub(crate) fn panel(title: &str, focused: bool) -> Block<'_> {
@@ -2033,5 +2189,58 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Transcribing"));
+    }
+
+    #[test]
+    fn renders_access_panel_and_approval_popup() {
+        let mut app = App::default();
+        app.authenticated = true;
+        app.update_catalog(crate::catalog::tests::snapshot());
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+        app.set_thread_runtime_mode("t1", "approval-required".into());
+        app.history_thread = Some("t1".into());
+        app.transcript = Some(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "t1",
+                "title": "Chat",
+                "items": [{
+                    "position": 0,
+                    "item": {
+                        "type": "approval_request",
+                        "requestId": "req-1",
+                        "requestKind": "command",
+                        "prompt": "Run cargo test"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Access"));
+        assert!(text.contains("Approval required"));
+        assert!(text.contains("Run cargo test"));
+        assert!(text.contains("Approve once"));
+
+        app.approval_dismissed_id = Some("req-1".into());
+        app.open_access_picker();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Access level"));
+        assert!(text.contains("Auto-accept edits"));
     }
 }

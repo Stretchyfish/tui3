@@ -41,6 +41,44 @@ pub enum ThreadAction {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeModeChange {
+    pub command_id: String,
+    pub thread_id: String,
+    pub runtime_mode: String,
+}
+
+impl RuntimeModeChange {
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "thread.runtime-mode.set",
+            "commandId": self.command_id,
+            "threadId": self.thread_id,
+            "runtimeMode": self.runtime_mode,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalResponse {
+    pub command_id: String,
+    pub thread_id: String,
+    pub request_id: String,
+    pub decision: String,
+}
+
+impl ApprovalResponse {
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "runtime-request.respond",
+            "commandId": self.command_id,
+            "threadId": self.thread_id,
+            "requestId": self.request_id,
+            "decision": self.decision,
+        })
+    }
+}
+
 pub enum Update {
     Git {
         request: crate::git::Request,
@@ -65,6 +103,14 @@ pub enum Update {
     Usage(Result<Vec<crate::usage::ProviderUsage>, String>),
     ModelChanged {
         request: crate::models::ModelChange,
+        result: Result<(), String>,
+    },
+    RuntimeModeChanged {
+        request: RuntimeModeChange,
+        result: Result<(), String>,
+    },
+    ApprovalResponded {
+        request: ApprovalResponse,
         result: Result<(), String>,
     },
     ThreadAction {
@@ -661,6 +707,28 @@ impl T3Client {
         Ok(())
     }
 
+    async fn change_runtime_mode(&self, request: &RuntimeModeChange) -> Result<(), String> {
+        let value = self
+            .rpc("orchestration.dispatchCommand", request.payload())
+            .await
+            .map_err(|error| error.message)?;
+        if value["sequence"].as_u64().is_none() {
+            return Err("Unexpected access-level acknowledgement.".into());
+        }
+        Ok(())
+    }
+
+    async fn respond_approval(&self, request: &ApprovalResponse) -> Result<(), String> {
+        let value = self
+            .rpc("orchestration.dispatchCommand", request.payload())
+            .await
+            .map_err(|error| error.message)?;
+        if value["sequence"].as_u64().is_none() {
+            return Err("Unexpected approval-response acknowledgement.".into());
+        }
+        Ok(())
+    }
+
     async fn send_message(
         &self,
         request: &crate::message::SendRequest,
@@ -881,6 +949,8 @@ pub struct Backend {
     pub selected_thread: tokio::sync::watch::Sender<Option<String>>,
     pub messages: tokio::sync::mpsc::Sender<crate::message::SendRequest>,
     pub models: tokio::sync::mpsc::Sender<crate::models::ModelCommand>,
+    pub runtime_modes: tokio::sync::mpsc::Sender<RuntimeModeChange>,
+    pub approvals: tokio::sync::mpsc::Sender<ApprovalResponse>,
     pub dictation: tokio::sync::mpsc::Sender<crate::dictation::Command>,
     pub thread_actions: tokio::sync::mpsc::Sender<ThreadAction>,
 }
@@ -963,6 +1033,10 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
     });
     let model_authorization = authorization.clone();
     let model_updates = sender.clone();
+    let runtime_mode_authorization = authorization.clone();
+    let runtime_mode_updates = sender.clone();
+    let approval_authorization = authorization.clone();
+    let approval_updates = sender.clone();
     let (models, mut model_requests) = tokio::sync::mpsc::channel::<crate::models::ModelCommand>(2);
     runtime.spawn(async move {
         while let Some(command) = model_requests.recv().await {
@@ -1201,6 +1275,45 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
             }
         }
     });
+    let (runtime_modes, mut runtime_mode_requests) =
+        tokio::sync::mpsc::channel::<RuntimeModeChange>(4);
+    runtime.spawn(async move {
+        while let Some(request) = runtime_mode_requests.recv().await {
+            let config = runtime_mode_authorization.borrow().clone();
+            let result = match config
+                .ok_or_else(|| "Sign in to T3 first.".to_owned())
+                .and_then(T3Client::new)
+            {
+                Ok(client) => client.change_runtime_mode(&request).await,
+                Err(error) => Err(error),
+            };
+            if runtime_mode_updates
+                .send(Update::RuntimeModeChanged { request, result })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let (approvals, mut approval_requests) = tokio::sync::mpsc::channel::<ApprovalResponse>(4);
+    runtime.spawn(async move {
+        while let Some(request) = approval_requests.recv().await {
+            let config = approval_authorization.borrow().clone();
+            let result = match config
+                .ok_or_else(|| "Sign in to T3 first.".to_owned())
+                .and_then(T3Client::new)
+            {
+                Ok(client) => client.respond_approval(&request).await,
+                Err(error) => Err(error),
+            };
+            if approval_updates
+                .send(Update::ApprovalResponded { request, result })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     Backend {
         git,
         diffs,
@@ -1209,6 +1322,8 @@ pub fn start(runtime: &tokio::runtime::Runtime) -> Backend {
         selected_thread,
         messages,
         models,
+        runtime_modes,
+        approvals,
         dictation,
         thread_actions,
     }

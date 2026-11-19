@@ -243,6 +243,14 @@ fn run(
                     app.finish_model_change(request, result);
                     continue;
                 }
+                t3::Update::RuntimeModeChanged { request, result } => {
+                    app.apply_runtime_mode_change(request, result);
+                    continue;
+                }
+                t3::Update::ApprovalResponded { request, result } => {
+                    app.apply_approval_response(request, result);
+                    continue;
+                }
                 t3::Update::ThreadAction { action, result } => {
                     app.finish_thread_action(action, result);
                     continue;
@@ -325,6 +333,8 @@ fn run(
                 | t3::Update::GitProgress { .. }
                 | t3::Update::RunDiff { .. }
                 | t3::Update::ModelChanged { .. }
+                | t3::Update::RuntimeModeChanged { .. }
+                | t3::Update::ApprovalResponded { .. }
                 | t3::Update::ThreadAction { .. } => {
                     unreachable!()
                 }
@@ -450,6 +460,22 @@ fn run(
                         Err("Model changes are unavailable. Please retry.".into()),
                     );
                 }
+            }
+            if let Some(request) = app.access_requested.take()
+                && backend.runtime_modes.try_send(request.clone()).is_err()
+            {
+                app.apply_runtime_mode_change(
+                    request,
+                    Err("Access level changes are unavailable. Please retry.".into()),
+                );
+            }
+            if let Some(request) = app.approval_requested.take()
+                && backend.approvals.try_send(request.clone()).is_err()
+            {
+                app.apply_approval_response(
+                    request,
+                    Err("Approval responses are unavailable. Please retry.".into()),
+                );
             }
             if app.send_requested {
                 app.send_requested = false;

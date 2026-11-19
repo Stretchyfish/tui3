@@ -16,6 +16,24 @@ pub struct ProjectedItem {
     pub item: Item,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalOption {
+    pub decision: String,
+    pub label: String,
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeRequest {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub decision: Option<String>,
+    pub feedback: Option<String>,
+}
+
 #[derive(Clone, Deserialize)]
 pub struct Item {
     #[serde(rename = "fileName")]
@@ -34,6 +52,16 @@ pub struct Item {
     pub streaming: bool,
     #[serde(default)]
     pub attachments: Vec<serde_json::Value>,
+    #[serde(rename = "requestId")]
+    pub request_id: Option<String>,
+    #[serde(rename = "requestKind")]
+    pub request_kind: Option<String>,
+    pub prompt: Option<String>,
+    pub reason: Option<String>,
+    #[serde(rename = "appName")]
+    pub app_name: Option<String>,
+    #[serde(default)]
+    pub options: Vec<ApprovalOption>,
 }
 
 impl Transcript {
@@ -44,7 +72,7 @@ impl Transcript {
             .filter(|entry| {
                 matches!(
                     entry.item.kind.as_str(),
-                    "user_message" | "assistant_message" | "system_message"
+                    "user_message" | "assistant_message" | "system_message" | "approval_request"
                 )
             })
             .collect();
@@ -144,6 +172,8 @@ pub struct Projection {
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
     pub runs: Vec<Run>,
+    #[serde(default)]
+    pub runtime_requests: Vec<RuntimeRequest>,
     pub thread: ThreadIdentity,
     pub visible_turn_items: Vec<ProjectedItem>,
 }
@@ -240,6 +270,8 @@ pub struct ThreadIdentity {
     pub title: String,
     #[serde(rename = "modelSelection")]
     pub model_selection: Option<crate::models::ModelSelection>,
+    #[serde(default, rename = "runtimeMode")]
+    pub runtime_mode: Option<String>,
 }
 
 #[derive(Deserialize)]

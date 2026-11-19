@@ -23,10 +23,43 @@ pub enum Focus {
     Chat,
     Composer,
     Model,
+    Access,
     SessionUsage,
     WeeklyUsage,
     Workspace,
     WorkspaceTabs,
+}
+
+pub const RUNTIME_MODES: [(&str, &str, &str); 4] = [
+    (
+        "approval-required",
+        "Approval required",
+        "Ask before running tools or editing",
+    ),
+    (
+        "auto-accept-edits",
+        "Auto-accept edits",
+        "Auto-approve edits, ask for commands",
+    ),
+    ("auto", "Auto", "Run autonomously with safety checks"),
+    ("full-access", "Full access", "No approval prompts"),
+];
+
+pub fn runtime_mode_label(mode: &str) -> &str {
+    RUNTIME_MODES
+        .iter()
+        .find(|(id, _, _)| *id == mode)
+        .map_or(mode, |(_, label, _)| *label)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub request_id: String,
+    pub kind: String,
+    pub prompt: Option<String>,
+    pub reason: Option<String>,
+    pub app_name: Option<String>,
+    pub options: Vec<crate::history::ApprovalOption>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +161,18 @@ pub struct App {
     pub models: crate::models::ModelPicker,
     pub usage: crate::usage::UsageState,
     pub live_model: Option<crate::models::ModelSelection>,
+    pub live_runtime_mode: Option<String>,
+    pub access_open: bool,
+    pub access_highlight: usize,
+    pub access_pending: Option<crate::t3::RuntimeModeChange>,
+    pub access_requested: Option<crate::t3::RuntimeModeChange>,
+    pub access_error: Option<String>,
+    pub runtime_requests: HashMap<String, crate::history::RuntimeRequest>,
+    pub approval_highlight: usize,
+    pub approval_dismissed_id: Option<String>,
+    pub approval_pending: Option<crate::t3::ApprovalResponse>,
+    pub approval_requested: Option<crate::t3::ApprovalResponse>,
+    pub approval_error: Option<String>,
     pub draft: String,
     pub draft_cursor: usize,
     pub draft_selection_anchor: Option<usize>,
@@ -229,6 +274,18 @@ impl Default for App {
             models: crate::models::ModelPicker::default(),
             usage: crate::usage::UsageState::default(),
             live_model: None,
+            live_runtime_mode: None,
+            access_open: false,
+            access_highlight: 0,
+            access_pending: None,
+            access_requested: None,
+            access_error: None,
+            runtime_requests: HashMap::new(),
+            approval_highlight: 0,
+            approval_dismissed_id: None,
+            approval_pending: None,
+            approval_requested: None,
+            approval_error: None,
             draft: String::new(),
             draft_cursor: 0,
             draft_selection_anchor: None,
@@ -1203,6 +1260,13 @@ impl App {
         self.diff_requested = cached.requested;
         self.history_thread = selected;
         self.live_model = None;
+        self.live_runtime_mode = None;
+        self.access_open = false;
+        self.access_error = None;
+        self.runtime_requests.clear();
+        self.approval_highlight = 0;
+        self.approval_dismissed_id = None;
+        self.approval_error = None;
         self.history_sequence = None;
         self.history_live = false;
         self.activity.clear();
@@ -1245,6 +1309,15 @@ impl App {
                     return;
                 }
                 self.live_model = projection.thread.model_selection;
+                self.live_runtime_mode = projection.thread.runtime_mode.clone();
+                if let Some(mode) = projection.thread.runtime_mode {
+                    self.set_thread_runtime_mode(thread_id, mode);
+                }
+                self.runtime_requests = projection
+                    .runtime_requests
+                    .into_iter()
+                    .map(|req| (req.id.clone(), req))
+                    .collect();
                 for checkpoint in projection.checkpoints {
                     self.apply_checkpoint(checkpoint);
                 }
@@ -1325,17 +1398,38 @@ impl App {
                     "thread.created"
                     | "thread.metadata-updated"
                     | "thread.model-selection-updated"
+                    | "thread.runtime-mode-updated"
                     | "thread.provider-switched" => {
                         if let Some(selection) = event.payload.get("modelSelection")
                             && let Ok(selection) = serde_json::from_value(selection.clone())
                         {
                             self.set_thread_model(thread_id, selection);
                         }
+                        if let Some(mode) = event
+                            .payload
+                            .get("runtimeMode")
+                            .and_then(|value| value.as_str())
+                        {
+                            self.set_thread_runtime_mode(thread_id, mode.to_owned());
+                        }
                         if let Some(title) =
                             event.payload.get("title").and_then(|value| value.as_str())
                             && let Some(history) = &mut self.transcript
                         {
                             history.title = title.into();
+                        }
+                    }
+                    "runtime-request.updated" => {
+                        if let Ok(req) = serde_json::from_value::<crate::history::RuntimeRequest>(
+                            event.payload,
+                        ) {
+                            if req.status == "pending"
+                                && self.approval_dismissed_id.as_deref() != Some(req.id.as_str())
+                            {
+                                self.approval_highlight = 0;
+                                self.approval_error = None;
+                            }
+                            self.runtime_requests.insert(req.id.clone(), req);
                         }
                     }
                     "run.created" | "run.updated" => {
@@ -1714,12 +1808,227 @@ impl App {
         })
     }
 
+    pub fn current_runtime_mode(&self) -> Option<&str> {
+        let id = self.selected_thread_id()?;
+        if self.history_thread.as_deref() == Some(id)
+            && let Some(mode) = &self.live_runtime_mode
+        {
+            return Some(mode.as_str());
+        }
+        self.catalog.as_ref().and_then(|catalog| {
+            catalog
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .and_then(|thread| thread.runtime_mode.as_deref())
+        })
+    }
+
+    pub fn set_thread_runtime_mode(&mut self, thread_id: &str, mode: String) {
+        if self.history_thread.as_deref() == Some(thread_id) {
+            self.live_runtime_mode = Some(mode.clone());
+        }
+        if let Some(catalog) = &mut self.catalog
+            && let Some(thread) = catalog
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == thread_id)
+        {
+            thread.runtime_mode = Some(mode);
+        }
+    }
+
+    pub fn open_access_picker(&mut self) {
+        self.access_error = None;
+        self.access_highlight = self
+            .current_runtime_mode()
+            .and_then(|current| RUNTIME_MODES.iter().position(|(id, _, _)| *id == current))
+            .unwrap_or(0);
+        self.access_open = true;
+    }
+
+    pub fn confirm_access_picker(&mut self) {
+        let Some(thread_id) = self.selected_thread_id().map(str::to_owned) else {
+            self.access_error = Some("Select a thread first.".into());
+            return;
+        };
+        let Some((mode, _, _)) = RUNTIME_MODES.get(self.access_highlight) else {
+            return;
+        };
+        let request = crate::t3::RuntimeModeChange {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            thread_id,
+            runtime_mode: (*mode).to_owned(),
+        };
+        self.access_error = None;
+        self.access_pending = Some(request.clone());
+        self.access_requested = Some(request);
+        self.access_open = false;
+    }
+
+    pub fn apply_runtime_mode_change(
+        &mut self,
+        request: crate::t3::RuntimeModeChange,
+        result: Result<(), String>,
+    ) {
+        if self
+            .access_pending
+            .as_ref()
+            .is_some_and(|pending| pending.command_id == request.command_id)
+        {
+            self.access_pending = None;
+        }
+        match result {
+            Ok(()) => {
+                self.set_thread_runtime_mode(&request.thread_id, request.runtime_mode);
+                self.access_error = None;
+            }
+            Err(error) => {
+                self.access_error = Some(error);
+            }
+        }
+    }
+
+    pub fn pending_approval(&self) -> Option<PendingApproval> {
+        let transcript = self.transcript.as_ref()?;
+        let mut items: Vec<_> = transcript
+            .items
+            .iter()
+            .filter(|entry| entry.item.kind == "approval_request")
+            .collect();
+        items.sort_by_key(|entry| entry.position);
+        for entry in items {
+            let item = &entry.item;
+            let request_id = item
+                .request_id
+                .as_deref()
+                .or(item.id.as_deref())
+                .unwrap_or_default();
+            if request_id.is_empty() {
+                continue;
+            }
+            let req = self.runtime_requests.get(request_id);
+            let is_pending = req.map_or_else(
+                || {
+                    item.status
+                        .as_deref()
+                        .is_none_or(|status| matches!(status, "pending" | "waiting"))
+                },
+                |r| r.status == "pending",
+            );
+            if !is_pending {
+                continue;
+            }
+            let options = if item.options.is_empty() {
+                default_approval_options()
+            } else {
+                item.options.clone()
+            };
+            return Some(PendingApproval {
+                request_id: request_id.to_owned(),
+                kind: item
+                    .request_kind
+                    .clone()
+                    .or_else(|| req.map(|r| r.kind.clone()))
+                    .unwrap_or_else(|| "permission".into()),
+                prompt: item.prompt.clone().or_else(|| item.title.clone()).or_else(|| item.text.clone()),
+                reason: item.reason.clone(),
+                app_name: item.app_name.clone(),
+                options,
+            });
+        }
+        // Fallback: if runtime_requests has a pending approval without a projected turn item yet
+        let mut reqs: Vec<_> = self
+            .runtime_requests
+            .values()
+            .filter(|r| {
+                r.status == "pending"
+                    && matches!(
+                        r.kind.as_str(),
+                        "command" | "file-read" | "file-change" | "mcp-elicitation" | "permission"
+                    )
+            })
+            .collect();
+        reqs.sort_by(|a, b| a.id.cmp(&b.id));
+        reqs.into_iter().next().map(|r| PendingApproval {
+            request_id: r.id.clone(),
+            kind: r.kind.clone(),
+            prompt: None,
+            reason: None,
+            app_name: None,
+            options: default_approval_options(),
+        })
+    }
+
+    pub fn active_approval_popup(&self) -> Option<PendingApproval> {
+        let pending = self.pending_approval()?;
+        if self.approval_dismissed_id.as_deref() == Some(pending.request_id.as_str()) {
+            return None;
+        }
+        Some(pending)
+    }
+
+    pub fn confirm_approval(&mut self) {
+        let Some(thread_id) = self.selected_thread_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(pending) = self.active_approval_popup() else {
+            return;
+        };
+        if self.approval_pending.is_some() {
+            return;
+        }
+        let index = self
+            .approval_highlight
+            .min(pending.options.len().saturating_sub(1));
+        let Some(option) = pending.options.get(index) else {
+            return;
+        };
+        let request = crate::t3::ApprovalResponse {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            thread_id,
+            request_id: pending.request_id,
+            decision: option.decision.clone(),
+        };
+        self.approval_error = None;
+        self.approval_pending = Some(request.clone());
+        self.approval_requested = Some(request);
+    }
+
+    pub fn apply_approval_response(
+        &mut self,
+        request: crate::t3::ApprovalResponse,
+        result: Result<(), String>,
+    ) {
+        if self
+            .approval_pending
+            .as_ref()
+            .is_some_and(|pending| pending.command_id == request.command_id)
+        {
+            self.approval_pending = None;
+        }
+        match result {
+            Ok(()) => {
+                if let Some(entry) = self.runtime_requests.get_mut(&request.request_id) {
+                    entry.status = "resolved".into();
+                    entry.decision = Some(request.decision);
+                }
+                self.approval_error = None;
+                self.approval_highlight = 0;
+            }
+            Err(error) => {
+                self.approval_error = Some(error);
+            }
+        }
+    }
+
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Projects => Focus::Chat,
             Focus::Chat => Focus::Composer,
             Focus::Composer => Focus::Model,
-            Focus::Model => Focus::SessionUsage,
+            Focus::Model => Focus::Access,
+            Focus::Access => Focus::SessionUsage,
             Focus::SessionUsage => Focus::WeeklyUsage,
             Focus::WeeklyUsage => Focus::WorkspaceTabs,
             Focus::WorkspaceTabs => Focus::Workspace,
@@ -1733,12 +2042,38 @@ impl App {
             Focus::Chat => Focus::Projects,
             Focus::Composer => Focus::Chat,
             Focus::Model => Focus::Composer,
-            Focus::SessionUsage => Focus::Model,
+            Focus::Access => Focus::Model,
+            Focus::SessionUsage => Focus::Access,
             Focus::WeeklyUsage => Focus::SessionUsage,
             Focus::Workspace => Focus::WorkspaceTabs,
             Focus::WorkspaceTabs => Focus::WeeklyUsage,
         };
     }
+}
+
+fn default_approval_options() -> Vec<crate::history::ApprovalOption> {
+    vec![
+        crate::history::ApprovalOption {
+            decision: "accept".into(),
+            label: "Approve once".into(),
+            warning: None,
+        },
+        crate::history::ApprovalOption {
+            decision: "acceptForSession".into(),
+            label: "Approve for session".into(),
+            warning: None,
+        },
+        crate::history::ApprovalOption {
+            decision: "decline".into(),
+            label: "Decline".into(),
+            warning: None,
+        },
+        crate::history::ApprovalOption {
+            decision: "cancel".into(),
+            label: "Cancel".into(),
+            warning: None,
+        },
+    ]
 }
 
 fn normalize_draft_text(text: &str) -> String {

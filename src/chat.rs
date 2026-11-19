@@ -145,6 +145,7 @@ pub fn conversation(
     runs: &std::collections::HashMap<String, crate::history::Run>,
     working: Option<std::time::Duration>,
     diffs: &std::collections::HashMap<String, crate::history::FileCounts>,
+    runtime_requests: &std::collections::HashMap<String, crate::history::RuntimeRequest>,
 ) -> Text<'static> {
     let messages = history.messages();
     if messages.is_empty() && working.is_none() {
@@ -168,92 +169,22 @@ pub fn conversation(
                     .is_some_and(|run| run.active()))
     });
     for (index, entry) in messages.iter().enumerate() {
-        let item = &entry.item;
-        let queued = item.kind == "user_message"
-            && (matches!(item.status.as_deref(), Some("pending" | "queued"))
-                || item
-                    .run_id
-                    .as_ref()
-                    .and_then(|id| runs.get(id))
-                    .is_some_and(|run| run.status == "queued"));
-        let steered = matches!(
-            item.input_intent.as_deref(),
-            Some("steer" | "promoted_queued_to_steer")
+        if is_queued_user_message(&entry.item, runs) {
+            continue;
+        }
+        render_message_entry(
+            &mut lines,
+            history,
+            runs,
+            diffs,
+            working,
+            &last_by_run,
+            working_message,
+            index,
+            entry,
+            false,
+            runtime_requests,
         );
-        let (label, accent, body) = match item.kind.as_str() {
-            "user_message" => (
-                if queued && steered {
-                    "YOU · steer · queued"
-                } else if queued {
-                    "YOU · queued"
-                } else if steered {
-                    "YOU · steer"
-                } else {
-                    "YOU"
-                },
-                Color::Cyan,
-                Color::Rgb(190, 225, 235),
-            ),
-            "assistant_message" => ("AGENT", Color::Green, Color::Rgb(225, 228, 235)),
-            _ => ("SYSTEM", Color::Yellow, Color::Gray),
-        };
-        let mut header = vec![Span::styled(
-            format!("╭─ {label} "),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        )];
-        if working_message == Some(index)
-            && let Some(duration) = working
-        {
-            lines.push(Line::styled(
-                format!("Working for {}s", duration.as_secs()),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        if item.kind == "assistant_message"
-            && last_by_run.get(&item.run_id.as_deref()) == Some(&index)
-            && let Some(run) = item.run_id.as_ref().and_then(|id| runs.get(id))
-            && !run.active()
-            && let Some(duration) = run.duration()
-        {
-            lines.push(Line::styled(
-                format!("Worked for {}s", duration.as_secs()),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        if item.streaming {
-            header.push(Span::styled(
-                "· responding…",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        lines.push(Line::from(header));
-        // Preserve whitespace and code indentation; wrapping remains the viewport's job.
-        for line in item.text.as_deref().unwrap_or_default().split('\n') {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(accent)),
-                Span::styled(line.to_owned(), Style::default().fg(body)),
-            ]));
-        }
-        if !item.attachments.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(accent)),
-                Span::styled(
-                    format!(
-                        "[{} attachment(s); preview unavailable]",
-                        item.attachments.len()
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-        if item.kind == "assistant_message"
-            && let Some(run_id) = item.run_id.as_deref()
-            && last_by_run.get(&Some(run_id)) == Some(&index)
-        {
-            changed_files(&mut lines, history, run_id, diffs.get(run_id));
-        }
-        lines.push(Line::styled("╰─", Style::default().fg(accent)));
-        lines.push(Line::default());
     }
     if working_message.is_none()
         && let Some(duration) = working
@@ -269,7 +200,217 @@ pub fn conversation(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    for (index, entry) in messages.iter().enumerate() {
+        if !is_queued_user_message(&entry.item, runs) {
+            continue;
+        }
+        render_message_entry(
+            &mut lines,
+            history,
+            runs,
+            diffs,
+            working,
+            &last_by_run,
+            working_message,
+            index,
+            entry,
+            true,
+            runtime_requests,
+        );
+    }
     Text::from(lines)
+}
+
+fn is_queued_user_message(
+    item: &crate::history::Item,
+    runs: &std::collections::HashMap<String, crate::history::Run>,
+) -> bool {
+    item.kind == "user_message"
+        && (matches!(item.status.as_deref(), Some("pending" | "queued"))
+            || item
+                .run_id
+                .as_ref()
+                .and_then(|id| runs.get(id))
+                .is_some_and(|run| run.status == "queued"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_message_entry(
+    lines: &mut Vec<Line<'static>>,
+    history: &Transcript,
+    runs: &std::collections::HashMap<String, crate::history::Run>,
+    diffs: &std::collections::HashMap<String, crate::history::FileCounts>,
+    working: Option<std::time::Duration>,
+    last_by_run: &std::collections::HashMap<Option<&str>, usize>,
+    working_message: Option<usize>,
+    index: usize,
+    entry: &crate::history::ProjectedItem,
+    queued: bool,
+    runtime_requests: &std::collections::HashMap<String, crate::history::RuntimeRequest>,
+) {
+    let item = &entry.item;
+    if item.kind == "approval_request" {
+        let req = item
+            .request_id
+            .as_deref()
+            .or(item.id.as_deref())
+            .and_then(|id| runtime_requests.get(id));
+        let status = req
+            .map(|r| r.status.as_str())
+            .or(item.status.as_deref())
+            .unwrap_or("pending");
+        let pending = matches!(status, "pending" | "waiting");
+        let accent = if pending {
+            Color::Magenta
+        } else {
+            Color::DarkGray
+        };
+        let status_label = if pending {
+            "waiting for response".to_owned()
+        } else if let Some(decision) = req.and_then(|r| r.decision.as_deref()) {
+            match decision {
+                "accept" => "approved once".to_owned(),
+                "acceptForSession" => "approved for session".to_owned(),
+                "acceptAlways" => "always approved".to_owned(),
+                "decline" => "declined".to_owned(),
+                "cancel" => "cancelled".to_owned(),
+                other => other.to_owned(),
+            }
+        } else {
+            status.to_owned()
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!("╭─ APPROVAL · {status_label} "),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )]));
+        let kind = item
+            .request_kind
+            .as_deref()
+            .or_else(|| req.map(|r| r.kind.as_str()))
+            .unwrap_or("permission");
+        let mut kind_line = format!("Type: {kind}");
+        if let Some(app_name) = &item.app_name {
+            kind_line.push_str(&format!(" ({app_name})"));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(accent)),
+            Span::styled(kind_line, Style::default().fg(Color::Gray)),
+        ]));
+        if let Some(prompt) = item
+            .prompt
+            .as_deref()
+            .or(item.title.as_deref())
+            .or(item.text.as_deref())
+        {
+            for line in prompt.split('\n') {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(accent)),
+                    Span::styled(line.to_owned(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        if let Some(reason) = &item.reason {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(accent)),
+                Span::styled(reason.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if pending {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(accent)),
+                Span::styled(
+                    "Respond in the approval popup (press a or Enter in Chat if minimized).",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+        lines.push(Line::styled("╰─", Style::default().fg(accent)));
+        lines.push(Line::default());
+        return;
+    }
+    let item = &entry.item;
+    let steered = matches!(
+        item.input_intent.as_deref(),
+        Some("steer" | "promoted_queued_to_steer")
+    );
+    let (label, accent, body) = match item.kind.as_str() {
+        "user_message" => (
+            if queued && steered {
+                "YOU · steer · queued"
+            } else if queued {
+                "YOU · queued"
+            } else if steered {
+                "YOU · steer"
+            } else {
+                "YOU"
+            },
+            if queued { Color::Yellow } else { Color::Cyan },
+            if queued {
+                Color::Rgb(235, 215, 155)
+            } else {
+                Color::Rgb(190, 225, 235)
+            },
+        ),
+        "assistant_message" => ("AGENT", Color::Green, Color::Rgb(225, 228, 235)),
+        _ => ("SYSTEM", Color::Yellow, Color::Gray),
+    };
+    let mut header = vec![Span::styled(
+        format!("╭─ {label} "),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+    if working_message == Some(index)
+        && let Some(duration) = working
+    {
+        lines.push(Line::styled(
+            format!("Working for {}s", duration.as_secs()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if item.kind == "assistant_message"
+        && last_by_run.get(&item.run_id.as_deref()) == Some(&index)
+        && let Some(run) = item.run_id.as_ref().and_then(|id| runs.get(id))
+        && !run.active()
+        && let Some(duration) = run.duration()
+    {
+        lines.push(Line::styled(
+            format!("Worked for {}s", duration.as_secs()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if item.streaming {
+        header.push(Span::styled(
+            "· responding…",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::from(header));
+    // Preserve whitespace and code indentation; wrapping remains the viewport's job.
+    for line in item.text.as_deref().unwrap_or_default().split('\n') {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(accent)),
+            Span::styled(line.to_owned(), Style::default().fg(body)),
+        ]));
+    }
+    if !item.attachments.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(accent)),
+            Span::styled(
+                format!(
+                    "[{} attachment(s); preview unavailable]",
+                    item.attachments.len()
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if item.kind == "assistant_message"
+        && let Some(run_id) = item.run_id.as_deref()
+        && last_by_run.get(&Some(run_id)) == Some(&index)
+    {
+        changed_files(lines, history, run_id, diffs.get(run_id));
+    }
+    lines.push(Line::styled("╰─", Style::default().fg(accent)));
+    lines.push(Line::default());
 }
 
 fn changed_files(
@@ -388,8 +529,14 @@ mod tests {
                 {"position": 1, "item": {"type": "user_message", "text": "Next question", "inputIntent": "turn_start"}}
             ]
         })).unwrap();
-        let text = super::conversation(&history, &Default::default(), None, &Default::default())
-            .to_string();
+        let text = super::conversation(
+            &history,
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+        )
+        .to_string();
         assert!(text.contains("YOU · steer"));
         assert_eq!(text.matches("YOU · steer").count(), 1);
         assert_eq!(text.matches("╭─ YOU").count(), 2);
@@ -399,15 +546,38 @@ mod tests {
     fn queued_user_message_has_a_waiting_label() {
         let history = serde_json::from_value(serde_json::json!({
             "threadId": "t1", "title": "Chat", "items": [
-                {"position": 0, "item": {"type": "user_message", "text": "Next", "runId": "r2"}}
+                {"position": 0, "item": {"type": "user_message", "text": "First", "runId": "r1"}},
+                {"position": 1, "item": {"type": "user_message", "text": "Queued next", "runId": "r2"}},
+                {"position": 2, "item": {"type": "assistant_message", "text": "Working on first", "runId": "r1", "streaming": true}}
             ]
         }))
         .unwrap();
-        let run: crate::history::Run =
+        let run1: crate::history::Run =
+            serde_json::from_value(serde_json::json!({"id": "r1", "status": "running"})).unwrap();
+        let run2: crate::history::Run =
             serde_json::from_value(serde_json::json!({"id": "r2", "status": "queued"})).unwrap();
-        let runs = [(run.id.clone(), run)].into_iter().collect();
-        let text = super::conversation(&history, &runs, None, &Default::default()).to_string();
+        let runs = [(run1.id.clone(), run1), (run2.id.clone(), run2)]
+            .into_iter()
+            .collect();
+        let rendered = super::conversation(
+            &history,
+            &runs,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        let text = rendered.to_string();
         assert!(text.contains("YOU · queued"));
+        assert!(text.find("Working on first").unwrap() < text.find("Queued next").unwrap());
+        let queued_header = rendered
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("YOU · queued"))
+            .unwrap();
+        assert_eq!(
+            queued_header.spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
     }
 
     #[test]
@@ -481,7 +651,14 @@ mod tests {
             .into(),
         )]
         .into();
-        let text = super::conversation(&history, &Default::default(), None, &counts).to_string();
+        let text = super::conversation(
+            &history,
+            &Default::default(),
+            None,
+            &counts,
+            &Default::default(),
+        )
+        .to_string();
         assert!(text.contains("2 changed files  +9  -1"));
         assert!(text.contains("src/main.rs  +2  -1"));
         assert!(text.contains("generated.rs  +7  -0"));
@@ -506,11 +683,61 @@ mod tests {
             &[("r1".into(), run)].into(),
             None,
             &Default::default(),
+            &Default::default(),
         );
         assert!(
             text.lines
                 .iter()
                 .any(|line| line.to_string().contains("Worked for 42s"))
         );
+    }
+
+    #[test]
+    fn approval_request_renders_pending_and_resolved_states_in_chat() {
+        let history = serde_json::from_value(serde_json::json!({
+            "threadId": "t1", "title": "Chat", "items": [
+                {"position": 0, "item": {
+                    "type": "approval_request",
+                    "requestId": "req-1",
+                    "requestKind": "command",
+                    "prompt": "Run cargo test",
+                    "reason": "Verify changes"
+                }}
+            ]
+        }))
+        .unwrap();
+        let pending = super::conversation(
+            &history,
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+        )
+        .to_string();
+        assert!(pending.contains("APPROVAL · waiting for response"));
+        assert!(pending.contains("Run cargo test"));
+        assert!(pending.contains("Verify changes"));
+
+        let resolved_requests = [(
+            "req-1".into(),
+            crate::history::RuntimeRequest {
+                id: "req-1".into(),
+                kind: "command".into(),
+                status: "resolved".into(),
+                decision: Some("acceptForSession".into()),
+                feedback: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let resolved = super::conversation(
+            &history,
+            &Default::default(),
+            None,
+            &Default::default(),
+            &resolved_requests,
+        )
+        .to_string();
+        assert!(resolved.contains("APPROVAL · approved for session"));
     }
 }
