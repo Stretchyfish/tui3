@@ -315,7 +315,10 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         } else {
             app.editing
                 || (app.focus == Focus::Workspace && app.workspace_tab == 3 && app.git.editing)
-                || (app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing)
+                || (app.focus == Focus::Workspace
+                    && app.workspace_tab == 0
+                    && !app.editor.tree_focus
+                    && app.editor.open_file.is_some())
                 || (app.focus == Focus::Workspace
                     && app.workspace_tab == 2
                     && app.local_terminal.tab_typing)
@@ -412,6 +415,18 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
     if key.code != KeyCode::Esc {
         app.last_escape = None;
     }
+    if app.focus == Focus::Workspace
+        && app.workspace_tab == 0
+        && !app.editor.tree_focus
+        && app.editor.open_file.is_some()
+        && app.quit_dialog.is_none()
+        && !app.startup.open
+        && !app.settings_open
+        && !app.models.open
+    {
+        crate::editor::key(app, key);
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && key.code == KeyCode::Char('c')
         && app.focus == Focus::Composer
@@ -430,17 +445,6 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         && (app.selected_draft().is_some() || app.selected_screen().is_some())
     {
         copy_selection(app);
-        return;
-    }
-    if app.focus == Focus::Workspace
-        && app.workspace_tab == 0
-        && app.editor.editing
-        && app.quit_dialog.is_none()
-        && !app.startup.open
-        && !app.settings_open
-        && !app.models.open
-    {
-        crate::editor::key(app, key);
         return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
@@ -584,7 +588,9 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
                 if app.settings_row == 3 =>
             {
-                app.layout_highlight = app.layout_highlight.toggle();
+                app.layout_highlight = app
+                    .layout_highlight
+                    .cycle(matches!(key.code, KeyCode::Right | KeyCode::Char('l')));
             }
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 3 => {
                 app.apply_layout_preset(app.layout_highlight);
@@ -2281,6 +2287,22 @@ mod tests {
             handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(app.settings_row, 3);
+        assert_eq!(
+            app.layout_preset,
+            crate::preferences::LayoutPreset::Balanced
+        );
+        assert_eq!(app.workspace_width, 40);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_highlight,
+            crate::preferences::LayoutPreset::Default
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_highlight,
+            crate::preferences::LayoutPreset::Balanced
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(
             app.layout_highlight,
@@ -2431,5 +2453,44 @@ mod terminal_overlay_tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
         );
         assert!(!app.terminal_overlay_open);
+    }
+
+    #[test]
+    fn file_editor_isolates_from_global_hotkeys_while_explorer_allows_them() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            workspace_tab: 0,
+            ..Default::default()
+        };
+        app.editor.open_file = Some("main.rs".into());
+        app.editor.lines = vec!["fn main() {}".into()];
+        app.editor.tree_focus = false;
+
+        // In Regular file editor, 'q', 's', and Ctrl+J must not trigger global hotkeys.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(app.quit_dialog.is_none());
+        assert!(!app.settings_open);
+        assert!(!app.terminal_overlay_open);
+        assert_eq!(app.editor.lines, vec!["qsfn main() {}"]);
+
+        // Returning to explorer (tree_focus = true) allows global hotkeys again.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.editor.tree_focus);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert!(app.settings_open);
     }
 }

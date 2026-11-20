@@ -34,6 +34,7 @@ impl TypingStyle {
 #[serde(rename_all = "kebab-case")]
 pub enum LayoutPreset {
     #[default]
+    Balanced,
     Default,
     EditorFocused,
 }
@@ -41,22 +42,25 @@ pub enum LayoutPreset {
 impl LayoutPreset {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Default => "Default",
+            Self::Balanced => "Balanced",
+            Self::Default => "Chat-focused",
             Self::EditorFocused => "Editor-focused",
         }
     }
 
     pub fn workspace_width(self) -> u16 {
         match self {
+            Self::Balanced => 40,
             Self::Default => 32,
             Self::EditorFocused => 50,
         }
     }
 
-    pub fn toggle(self) -> Self {
-        match self {
-            Self::Default => Self::EditorFocused,
-            Self::EditorFocused => Self::Default,
+    pub fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Balanced, true) | (Self::EditorFocused, false) => Self::Default,
+            (Self::Default, true) | (Self::Balanced, false) => Self::EditorFocused,
+            _ => Self::Balanced,
         }
     }
 }
@@ -223,6 +227,21 @@ impl ResumeStore {
 mod tests {
     use super::*;
     use crate::{app::App, catalog::Selection};
+
+    #[test]
+    fn balanced_is_default_and_saved_older_layouts_remain_valid() {
+        let defaults: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.layout_preset, LayoutPreset::Balanced);
+        for (saved, expected) in [
+            ("default", LayoutPreset::Default),
+            ("editor-focused", LayoutPreset::EditorFocused),
+            ("balanced", LayoutPreset::Balanced),
+        ] {
+            let preferences: Preferences =
+                serde_json::from_value(serde_json::json!({"layout_preset": saved})).unwrap();
+            assert_eq!(preferences.layout_preset, expected);
+        }
+    }
 
     #[test]
     fn auto_start_defaults_on_for_new_and_old_preferences_and_saves_off_without_server() {

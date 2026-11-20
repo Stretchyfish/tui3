@@ -23,6 +23,12 @@
 
 ## Chat improvements before code editing
 
+- [x] Read T3 snapshot messages and message.updated events, join queued runs through userMessageId, and resolve deduplicated bodies so queued previews appear even before a visible turn item exists.
+
+- [x] Show queued message bodies directly beneath the yellow queue notice, with muted text and explicit not-active labels; restore normal conversation presentation when a queued run starts.
+
+- [x] Add a Balanced layout with equal conversation/workspace widths (20/40/40), make it the fresh default and first Settings option, and preserve saved layout choices.
+
 - [x] Render workspace shortcut hints in blue on the bottom border; use the full Editor area for browsing files and restore the split view with code on the left and explorer on the right when a file opens.
 
 - [x] Polish the Editor explorer with full-row selection, compact paths/filenames, aligned open/modified markers, folder counts and status; preserve selections across refresh/folder navigation and support stable scrolling, mouse wheel, Home/End, and PageUp/PageDown.

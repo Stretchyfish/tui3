@@ -200,6 +200,17 @@ pub fn conversation(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    let queued_count = messages
+        .iter()
+        .filter(|entry| is_queued_user_message(&entry.item, runs))
+        .count();
+    if queued_count > 0 {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            format!("{queued_count} message(s) queued · waiting for the active run"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     for (index, entry) in messages.iter().enumerate() {
         if !is_queued_user_message(&entry.item, runs) {
             continue;
@@ -221,7 +232,7 @@ pub fn conversation(
     Text::from(lines)
 }
 
-fn is_queued_user_message(
+pub(crate) fn is_queued_user_message(
     item: &crate::history::Item,
     runs: &std::collections::HashMap<String, crate::history::Run>,
 ) -> bool {
@@ -336,9 +347,9 @@ fn render_message_entry(
     let (label, accent, body) = match item.kind.as_str() {
         "user_message" => (
             if queued && steered {
-                "YOU · steer · queued"
+                "YOU · steer · queued · not active"
             } else if queued {
-                "YOU · queued"
+                "YOU · queued · not active"
             } else if steered {
                 "YOU · steer"
             } else {
@@ -346,7 +357,7 @@ fn render_message_entry(
             },
             if queued { Color::Yellow } else { Color::Cyan },
             if queued {
-                Color::Rgb(235, 215, 155)
+                Color::DarkGray
             } else {
                 Color::Rgb(190, 225, 235)
             },
@@ -556,9 +567,10 @@ mod tests {
             serde_json::from_value(serde_json::json!({"id": "r1", "status": "running"})).unwrap();
         let run2: crate::history::Run =
             serde_json::from_value(serde_json::json!({"id": "r2", "status": "queued"})).unwrap();
-        let runs = [(run1.id.clone(), run1), (run2.id.clone(), run2)]
-            .into_iter()
-            .collect();
+        let mut runs: std::collections::HashMap<_, _> =
+            [(run1.id.clone(), run1), (run2.id.clone(), run2)]
+                .into_iter()
+                .collect();
         let rendered = super::conversation(
             &history,
             &runs,
@@ -567,17 +579,43 @@ mod tests {
             &Default::default(),
         );
         let text = rendered.to_string();
-        assert!(text.contains("YOU · queued"));
+        assert!(text.contains("YOU · queued · not active"));
         assert!(text.find("Working on first").unwrap() < text.find("Queued next").unwrap());
         let queued_header = rendered
             .lines
             .iter()
-            .find(|line| line.to_string().contains("YOU · queued"))
+            .find(|line| line.to_string().contains("YOU · queued · not active"))
             .unwrap();
         assert_eq!(
             queued_header.spans[0].style.fg,
             Some(ratatui::style::Color::Yellow)
         );
+        assert!(
+            text.find("queued · waiting for the active run").unwrap()
+                < text.find("Queued next").unwrap()
+        );
+        assert_eq!(text.matches("Queued next").count(), 1);
+        let body = rendered
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("Queued next"))
+            .unwrap();
+        assert_eq!(
+            body.spans[1].style.fg,
+            Some(ratatui::style::Color::DarkGray)
+        );
+        runs.get_mut("r2").unwrap().status = "running".into();
+        let active = super::conversation(
+            &history,
+            &runs,
+            None,
+            &Default::default(),
+            &Default::default(),
+        )
+        .to_string();
+        assert!(!active.contains("queued · waiting"));
+        assert!(!active.contains("not active"));
+        assert_eq!(active.matches("Queued next").count(), 1);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Clear, Paragraph, Wrap},
 };
 use serde::Deserialize;
@@ -400,18 +400,51 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         git.cwd
             .clone()
             .unwrap_or("Select a project or thread.".into()),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(if git.cwd.is_some() {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        }),
     )];
     if let Some(snapshot) = &git.snapshot {
         if !snapshot.status.is_repo {
-            lines.push(Line::from("Not a Git repository."));
+            lines.push(Line::styled(
+                "Not a Git repository.",
+                Style::default().fg(Color::Yellow),
+            ));
         } else {
-            lines.push(Line::from(format!(
-                "↑{} ahead · ↓{} behind · {} changed files",
-                snapshot.status.ahead_count,
-                snapshot.status.behind_count,
-                snapshot.status.working_tree.files.len()
-            )));
+            let ahead_color = if snapshot.status.ahead_count > 0 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            let behind_color = if snapshot.status.behind_count > 0 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            let changed_count = snapshot.status.working_tree.files.len();
+            let changed_color = if changed_count > 0 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("↑{} ahead", snapshot.status.ahead_count),
+                    Style::default().fg(ahead_color),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("↓{} behind", snapshot.status.behind_count),
+                    Style::default().fg(behind_color),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{changed_count} changed files"),
+                    Style::default().fg(changed_color),
+                ),
+            ]));
             for file in snapshot
                 .status
                 .working_tree
@@ -419,25 +452,37 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .take(details.height.saturating_sub(5) as usize)
             {
-                lines.push(Line::from(format!(
-                    "{} +{} -{}",
-                    file.path, file.insertions, file.deletions
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(file.path.clone(), Style::default().fg(Color::White)),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("+{}", file.insertions),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("-{}", file.deletions),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
             }
         }
     }
     if let Some(error) = &git.error {
         lines.push(Line::styled(
             error.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if !git.notice.is_empty() {
+        lines.push(Line::styled(
+            git.notice.clone(),
+            Style::default().fg(Color::Cyan),
         ));
     }
     lines.push(Line::styled(
-        git.notice.clone(),
-        Style::default().fg(Color::Cyan),
-    ));
-    lines.push(Line::from(
         "↑↓/jk: select · Enter/Space: open · g: generate · r: refresh",
+        Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),

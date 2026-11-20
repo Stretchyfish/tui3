@@ -107,12 +107,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let items = app.rows.iter().map(|row| {
             let mut line = match &row.selection {
                 crate::catalog::Selection::Thread(id)
-                    if app.thread_needs_approval(id) || app.is_thread_running(id) =>
+                    if app.thread_needs_approval(id)
+                        || app.is_thread_running(id)
+                        || app.thread_finished(id) =>
                 {
                     let (icon, color) = if app.thread_needs_approval(id) {
                         ("🔒", Color::Yellow)
-                    } else {
+                    } else if app.is_thread_running(id) {
                         ("●", Color::Green)
+                    } else {
+                        ("✓", Color::Green)
                     };
                     if let Some(rest) = row.label.strip_prefix("  · ") {
                         Line::from(vec![
@@ -173,6 +177,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|error| format!("\n\nRefresh failed: {error}\nShowing the last loaded list."))
         .unwrap_or_default();
+    let display_transcript = app.display_transcript();
     let (title, mut content) = if app.history_thread.is_some() {
         let title = app
             .transcript
@@ -189,7 +194,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 )
             })
             .unwrap_or_else(|| " Chat ".into());
-        let content = match (&app.transcript, &app.history_error) {
+        let content = match (&display_transcript, &app.history_error) {
             (Some(history), error) => {
                 let elapsed = app.thinking_since.map(|start| start.elapsed());
                 let tick = elapsed.map(|duration| duration.as_secs());
@@ -260,7 +265,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         title
     };
-    if queued_runs > 0 {
+    if queued_runs > 0
+        && !display_transcript.as_ref().is_some_and(|history| {
+            history
+                .items
+                .iter()
+                .any(|entry| crate::chat::is_queued_user_message(&entry.item, &app.runs))
+        })
+    {
         crate::chat::notice(
             &mut content,
             format!("{queued_runs} message(s) queued · waiting for the active run"),
@@ -396,6 +408,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Color::Red
         } else {
             Color::Yellow
+        };
+        let indicator = if composer.width < 76 {
+            indicator
+                .split(" · ")
+                .next()
+                .unwrap_or(&indicator)
+                .to_owned()
+        } else {
+            indicator
         };
         composer_block.title_top(
             Line::from(indicator)
@@ -1332,13 +1353,17 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         );
     }
     frame.render_widget(Paragraph::new("Layout preset"), layout_heading);
-    let layout_options = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+    let layout_options = Layout::horizontal([Constraint::Ratio(1, 3); 3])
         .spacing(1)
         .split(layout_selector);
     use crate::preferences::LayoutPreset;
-    for (preset, option) in [LayoutPreset::Default, LayoutPreset::EditorFocused]
-        .into_iter()
-        .zip(layout_options.iter())
+    for (preset, option) in [
+        LayoutPreset::Balanced,
+        LayoutPreset::Default,
+        LayoutPreset::EditorFocused,
+    ]
+    .into_iter()
+    .zip(layout_options.iter())
     {
         selector_box(
             frame,
@@ -1993,7 +2018,7 @@ mod tests {
         app.context_report_thread = Some("t1".into());
         app.chat_revision = app.chat_revision.wrapping_add(1);
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let visible = (0..buffer.area.height)
@@ -2101,6 +2126,46 @@ mod tests {
     }
 
     #[test]
+    fn balanced_layout_has_equal_main_widths_and_is_first_in_settings() {
+        let mut app = App::default();
+        app.workspace_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let pane_width = |focus| {
+            app.click_targets
+                .iter()
+                .find_map(|(area, target)| {
+                    matches!(target, crate::app::ClickTarget::Pane(found) if *found == focus)
+                        .then_some(area.width)
+                })
+                .unwrap()
+        };
+        assert_eq!(pane_width(Focus::Chat), 64);
+        assert_eq!(pane_width(Focus::Workspace), 64);
+        app.settings_open = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let choices: Vec<_> = app
+            .click_targets
+            .iter()
+            .filter_map(|(_, target)| {
+                if let crate::app::ClickTarget::LayoutPreset(preset) = target {
+                    Some(*preset)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            choices,
+            vec![
+                crate::preferences::LayoutPreset::Balanced,
+                crate::preferences::LayoutPreset::Default,
+                crate::preferences::LayoutPreset::EditorFocused
+            ]
+        );
+    }
+
+    #[test]
     fn workspace_shortcuts_render_inside_workspace() {
         let mut app = App::default();
         app.focus = Focus::Workspace;
@@ -2191,6 +2256,74 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(visible.contains("Available · clipboard read access works"));
+    }
+
+    #[test]
+    fn server_message_records_supply_queued_text_and_live_updates_without_duplicates() {
+        let mut app = App::default();
+        app.history_thread = Some("t1".into());
+        let snapshot = serde_json::json!({"kind":"snapshot","snapshotSequence":1,"projection":{
+            "thread":{"id":"t1","title":"Chat"},
+            "runs":[{"id":"r2","status":"queued","userMessageId":"m2","queuePosition":1}],
+            "messages":[{"id":"m2","role":"user","text":"Please do this next","runId":null}],
+            "visibleTurnItems":[]
+        }});
+        app.apply_live("t1", Ok(serde_json::from_value(snapshot).unwrap()));
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let visible = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let text = visible(&terminal);
+        assert!(
+            text.find("queued · waiting for the active run").unwrap()
+                < text.find("Please do this next").unwrap()
+        );
+        assert!(text.contains("queued · not active"));
+        assert_eq!(text.matches("Please do this next").count(), 1);
+        app.apply_live(
+            "t1",
+            Ok(serde_json::from_value(serde_json::json!({
+                "kind":"event","sequence":2,"event":{"type":"message.updated","payload":{
+                    "id":"m2","role":"user","text":"Updated queued request","runId":"r2"
+                }}
+            }))
+            .unwrap()),
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(visible(&terminal).contains("Updated queued request"));
+        assert!(!visible(&terminal).contains("Please do this next"));
+        // T3 may subsequently publish a turn item whose body is deduplicated.
+        app.apply_live("t1", Ok(serde_json::from_value(serde_json::json!({
+            "kind":"event","sequence":3,"event":{"type":"turn-item.updated","payload":{
+                "id":"u2","messageId":"m2","type":"user_message","runId":"r2","text":"","textOmitted":true
+            }}
+        })).unwrap()));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            visible(&terminal).matches("Updated queued request").count(),
+            1
+        );
+        app.apply_live(
+            "t1",
+            Ok(serde_json::from_value(serde_json::json!({
+                "kind":"event","sequence":4,"event":{"type":"run.updated","payload":{
+                    "id":"r2","status":"running","userMessageId":"m2"
+                }}
+            }))
+            .unwrap()),
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = visible(&terminal);
+        assert!(text.contains("Updated queued request"));
+        assert!(!text.contains("not active"));
+        assert!(!text.contains("queued · waiting"));
     }
 
     #[test]
@@ -2434,6 +2567,71 @@ mod tests {
             }
         }
         assert!(found_green_dot);
+    }
+
+    #[test]
+    fn finished_threads_show_checkmark_until_selected() {
+        let mut catalog1 = crate::catalog::tests::snapshot();
+        let mut bg = catalog1.threads[0].clone();
+        bg.id = "t-bg".into();
+        bg.title = "Background task".into();
+        bg.status = "running".into();
+        catalog1.threads.push(bg);
+
+        let mut app = App::default();
+        app.authenticated = true;
+        app.update_catalog(catalog1);
+        // Select the first thread ("Conversation"), not "Background task".
+        app.sidebar_state.select(Some(1));
+        app.sync_history_selection();
+
+        // Background task finishes.
+        let mut catalog2 = crate::catalog::tests::snapshot();
+        let mut bg2 = catalog2.threads[0].clone();
+        bg2.id = "t-bg".into();
+        bg2.title = "Background task".into();
+        bg2.status = "completed".into();
+        catalog2.threads.push(bg2);
+        app.update_catalog(catalog2);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let visible = render(&mut terminal, &mut app);
+        assert!(
+            visible
+                .lines()
+                .any(|l| l.contains("Background task") && l.contains('✓'))
+        );
+
+        // Selecting/viewing "Background task" clears the checkmark.
+        let bg_index = app
+            .rows
+            .iter()
+            .position(
+                |r| matches!(&r.selection, crate::catalog::Selection::Thread(id) if id == "t-bg"),
+            )
+            .unwrap();
+        app.sidebar_state.select(Some(bg_index));
+        app.sync_history_selection();
+
+        let visible_after = render(&mut terminal, &mut app);
+        assert!(
+            visible_after
+                .lines()
+                .any(|l| l.contains("Background task") && !l.contains('✓'))
+        );
     }
 
     #[test]

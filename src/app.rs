@@ -203,6 +203,7 @@ pub struct App {
     pub focus: Focus,
     pub models: crate::models::ModelPicker,
     pub usage: crate::usage::UsageState,
+    pub conversation_messages: HashMap<String, crate::history::ConversationMessage>,
     pub pointer: Option<ratatui::layout::Position>,
     pub live_model: Option<crate::models::ModelSelection>,
     pub live_runtime_mode: Option<String>,
@@ -244,6 +245,8 @@ pub struct App {
     pub sidebar_menu_anchor: (u16, u16),
     pub thread_action_requested: Option<crate::t3::ThreadAction>,
     pub fresh_context_threads: std::collections::HashSet<String>,
+    pub known_running_threads: std::collections::HashSet<String>,
+    pub finished_threads: std::collections::HashSet<String>,
     pub slash_highlight: usize,
     pub slash_dismissed: bool,
     pub connection: String,
@@ -320,7 +323,7 @@ impl Default for App {
             workspace_tab: 0,
             workspace_highlight: 0,
             workspace_visible: true,
-            workspace_width: 32,
+            workspace_width: crate::preferences::LayoutPreset::default().workspace_width(),
             layout_preset: crate::preferences::LayoutPreset::default(),
             layout_highlight: crate::preferences::LayoutPreset::default(),
             diff_wrap_highlight: true,
@@ -335,6 +338,7 @@ impl Default for App {
             focus: Focus::default(),
             models: crate::models::ModelPicker::default(),
             usage: crate::usage::UsageState::default(),
+            conversation_messages: HashMap::new(),
             pointer: None,
             live_model: None,
             live_runtime_mode: None,
@@ -376,6 +380,8 @@ impl Default for App {
             sidebar_menu_anchor: (0, 0),
             thread_action_requested: None,
             fresh_context_threads: std::collections::HashSet::new(),
+            known_running_threads: std::collections::HashSet::new(),
+            finished_threads: std::collections::HashSet::new(),
             slash_highlight: 0,
             slash_dismissed: false,
             connection: "Connecting to T3…".into(),
@@ -1413,6 +1419,9 @@ impl App {
             Some(Selection::Thread(id)) => Some(id.clone()),
             _ => None,
         };
+        if let Some(id) = &draft_thread {
+            self.finished_threads.remove(id);
+        }
         if self.draft_thread != draft_thread {
             self.screen_selection = None;
             self.screen_selection_area = None;
@@ -1429,6 +1438,9 @@ impl App {
             Some(Selection::Thread(id)) if self.authenticated => Some(id.clone()),
             _ => None,
         };
+        if let Some(id) = &selected {
+            self.finished_threads.remove(id);
+        }
         if selected == self.history_thread {
             return false;
         }
@@ -1467,6 +1479,7 @@ impl App {
         self.thinking_since = None;
         self.worked_duration = None;
         self.runs.clear();
+        self.conversation_messages.clear();
         self.transcript = None;
         self.chat_revision = self.chat_revision.wrapping_add(1);
         self.history_error = None;
@@ -1516,6 +1529,11 @@ impl App {
                 for checkpoint in projection.checkpoints {
                     self.apply_checkpoint(checkpoint);
                 }
+                self.conversation_messages = projection
+                    .messages
+                    .into_iter()
+                    .map(|message| (message.id.clone(), message))
+                    .collect();
                 self.runs = projection
                     .runs
                     .into_iter()
@@ -1575,6 +1593,15 @@ impl App {
                     "checkpoint.captured" => {
                         if let Ok(checkpoint) = serde_json::from_value(event.payload) {
                             self.apply_checkpoint(checkpoint);
+                        }
+                    }
+                    "message.updated" => {
+                        if let Ok(message) = serde_json::from_value::<
+                            crate::history::ConversationMessage,
+                        >(event.payload)
+                        {
+                            self.conversation_messages
+                                .insert(message.id.clone(), message);
                         }
                     }
                     "turn-item.updated" => {
@@ -1684,6 +1711,81 @@ impl App {
         }
     }
 
+    /// Resolve deduplicated text and queued messages from T3's message records.
+    pub fn display_transcript(&self) -> Option<crate::history::Transcript> {
+        let mut history = self.transcript.clone()?;
+        for entry in &mut history.items {
+            if let Some(message) = entry
+                .item
+                .message_id
+                .as_ref()
+                .and_then(|id| self.conversation_messages.get(id))
+            {
+                if entry.item.text.as_deref().is_none_or(str::is_empty) {
+                    entry.item.text = Some(message.text.clone());
+                }
+                if entry.item.run_id.is_none() {
+                    entry.item.run_id = message.run_id.clone().or_else(|| {
+                        self.runs
+                            .values()
+                            .find(|run| run.user_message_id.as_deref() == Some(message.id.as_str()))
+                            .map(|run| run.id.clone())
+                    });
+                }
+            }
+        }
+        let mut queued: Vec<_> = self
+            .runs
+            .values()
+            .filter(|run| run.status == "queued")
+            .collect();
+        queued.sort_by_key(|run| {
+            (
+                run.queue_position.or(run.ordinal).unwrap_or(u64::MAX),
+                run.id.clone(),
+            )
+        });
+        let mut position = history
+            .items
+            .iter()
+            .map(|entry| entry.position)
+            .max()
+            .unwrap_or(0);
+        for run in queued {
+            let Some(message) = run
+                .user_message_id
+                .as_ref()
+                .and_then(|id| self.conversation_messages.get(id))
+                .or_else(|| {
+                    self.conversation_messages.values().find(|message| {
+                        message.role == "user" && message.run_id.as_deref() == Some(run.id.as_str())
+                    })
+                })
+            else {
+                continue;
+            };
+            if history.items.iter().any(|entry| {
+                entry.item.kind == "user_message"
+                    && (entry.item.message_id.as_deref() == Some(message.id.as_str())
+                        || entry.item.run_id.as_deref() == Some(run.id.as_str()))
+            }) {
+                continue;
+            }
+            position = position.saturating_add(1);
+            let item = serde_json::from_value(serde_json::json!({
+                "id": message.id, "messageId": message.id, "type":"user_message",
+                "runId":run.id, "text":message.text, "attachments":message.attachments
+            }))
+            .expect("valid message projection");
+            history.items.push(crate::history::ProjectedItem {
+                position,
+                source_item_id: None,
+                item,
+            });
+        }
+        Some(history)
+    }
+
     pub fn apply_history(
         &mut self,
         thread_id: &str,
@@ -1776,6 +1878,17 @@ impl App {
                 (!self.rows.is_empty()).then_some(old_index.min(self.rows.len().saturating_sub(1)))
             });
         self.sidebar_state.select(index);
+        let selected_id = self.selected_thread_id().map(str::to_owned);
+        for thread in &catalog.threads {
+            if thread.is_running() {
+                self.known_running_threads.insert(thread.id.clone());
+                self.finished_threads.remove(&thread.id);
+            } else if self.known_running_threads.remove(&thread.id)
+                && selected_id.as_deref() != Some(thread.id.as_str())
+            {
+                self.finished_threads.insert(thread.id.clone());
+            }
+        }
         self.catalog = Some(catalog);
         self.catalog_error = None;
     }
@@ -1947,6 +2060,7 @@ impl App {
                             self.history_thread = None;
                             self.transcript = None;
                             self.runs.clear();
+                            self.conversation_messages.clear();
                             self.activity.clear();
                             self.history_error = None;
                             self.history_sequence = None;
@@ -1989,6 +2103,10 @@ impl App {
         self.shutdown_server_on_quit
             .then_some(self.local_server_pid)
             .flatten()
+    }
+
+    pub fn thread_finished(&self, thread_id: &str) -> bool {
+        self.finished_threads.contains(thread_id)
     }
 
     pub fn is_selected_thread_working(&self) -> bool {

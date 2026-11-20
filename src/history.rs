@@ -36,6 +36,8 @@ pub struct RuntimeRequest {
 
 #[derive(Clone, Deserialize)]
 pub struct Item {
+    #[serde(rename = "messageId")]
+    pub message_id: Option<String>,
     #[serde(rename = "fileName")]
     pub file_name: Option<String>,
     #[serde(rename = "runId")]
@@ -169,6 +171,8 @@ pub enum LiveUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct Projection {
     #[serde(default)]
+    pub messages: Vec<ConversationMessage>,
+    #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
     pub runs: Vec<Run>,
@@ -201,7 +205,20 @@ pub struct CheckpointFile {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConversationMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Run {
+    pub user_message_id: Option<String>,
+    pub queue_position: Option<u64>,
     pub ordinal: Option<u64>,
     pub id: String,
     pub status: String,
