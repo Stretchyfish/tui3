@@ -13,6 +13,8 @@ fn copy_selection(app: &mut App) {
 pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     use crate::app::ClickTarget;
     use crossterm::event::{MouseButton, MouseEventKind};
+    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+    app.pointer = Some(position);
     if app.terminal_overlay_open {
         if let Some(session) = &app.local_terminal.session {
             match mouse.kind {
@@ -120,6 +122,10 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 app.diff_view
                     .scroll(mouse.kind == MouseEventKind::ScrollDown, 3);
             }
+        }
+        if matches!(target, Some(ClickTarget::EditorEntry(_))) && app.workspace_tab == 0 {
+            app.editor
+                .move_tree(mouse.kind == MouseEventKind::ScrollDown, 3);
         }
         if matches!(target, Some(ClickTarget::DiffFile(_))) {
             app.diff_view
@@ -2299,7 +2305,10 @@ mod tests {
         assert!(!app.local_terminal.tab_typing);
 
         // Navigation mode: Up moves to WorkspaceTabs, Space/Enter enters typing mode.
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
         assert!(app.local_terminal.tab_typing);
 
         // In typing mode, conflicting hotkeys are ignored and not handled by TUI.

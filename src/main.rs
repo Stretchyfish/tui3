@@ -23,8 +23,7 @@ mod usage;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::supports_keyboard_enhancement,
@@ -51,11 +50,11 @@ fn main() -> io::Result<()> {
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
         }
-        // Track drags for text selection without reporting idle pointer motion.
+        // Track pointer motion for usage tooltips as well as selection drags.
         #[cfg(not(windows))]
         execute!(
             terminal.backend_mut(),
-            crossterm::style::Print("\x1b[?1003l\x1b[?1002h\x1b[?1000h")
+            crossterm::style::Print("\x1b[?1003h\x1b[?1002h\x1b[?1000h")
         )?;
         run(&mut terminal, backend, &mut resume, startup)
     });
@@ -635,7 +634,11 @@ fn run(
             // the full transcript for each queued pointer event.
             let mut next = event::read()?;
             let mut ignored = 0;
-            while !useful_input(&next) && ignored < 256 && event::poll(Duration::ZERO)? {
+            while (!useful_input(&next)
+                || matches!(&next, Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Moved))
+                && ignored < 256
+                && event::poll(Duration::ZERO)?
+            {
                 next = event::read()?;
                 ignored += 1;
             }
@@ -671,7 +674,8 @@ fn useful_input(event: &Event) -> bool {
     match event {
         Event::Mouse(mouse) => matches!(
             mouse.kind,
-            MouseEventKind::Down(MouseButton::Left)
+            MouseEventKind::Moved
+                | MouseEventKind::Down(MouseButton::Left)
                 | MouseEventKind::Down(MouseButton::Right)
                 | MouseEventKind::Drag(MouseButton::Left)
                 | MouseEventKind::Up(MouseButton::Left)

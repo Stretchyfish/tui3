@@ -13,6 +13,9 @@ use ratatui::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone)]
 pub enum Operation {
@@ -87,6 +90,8 @@ pub struct EditorState {
     pub entries: Vec<Entry>,
     pub entries_truncated: bool,
     pub selected_entry: usize,
+    pub tree_offset: usize,
+    tree_selections: HashMap<Option<String>, String>,
     pub tree_focus: bool,
     pub open_file: Option<String>,
     pub file_truncated: bool,
@@ -111,6 +116,8 @@ impl Default for EditorState {
             entries: Vec::new(),
             entries_truncated: false,
             selected_entry: 0,
+            tree_offset: 0,
+            tree_selections: HashMap::new(),
             tree_focus: true,
             open_file: None,
             file_truncated: false,
@@ -171,10 +178,29 @@ impl EditorState {
                         .cmp(&a.is_dir())
                         .then_with(|| a.display_name().cmp(b.display_name()))
                 });
+                if let Some(entry) = self.entry_at(self.selected_entry) {
+                    self.tree_selections
+                        .insert(self.directory.clone(), entry.path.clone());
+                }
+                let changed_directory = self.directory != directory;
+                let returning_from = self.directory.as_ref().filter(|current| {
+                    current
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent.to_owned())
+                        == directory
+                });
+                let preferred = returning_from.or_else(|| self.tree_selections.get(&directory));
+                let selected =
+                    preferred.and_then(|path| entries.iter().position(|entry| &entry.path == path));
+                self.selected_entry = selected
+                    .map(|index| index + usize::from(directory.is_some()))
+                    .unwrap_or(0);
+                if changed_directory {
+                    self.tree_offset = 0;
+                }
                 self.directory = directory;
                 self.entries = entries;
                 self.entries_truncated = truncated;
-                self.selected_entry = 0;
                 self.notice.clear();
             }
             Ok(Response::File {
@@ -221,6 +247,22 @@ impl EditorState {
 
     pub fn entry_count(&self) -> usize {
         usize::from(self.directory.is_some()) + self.entries.len()
+    }
+
+    fn entry_at(&self, index: usize) -> Option<&Entry> {
+        index
+            .checked_sub(usize::from(self.directory.is_some()))
+            .and_then(|index| self.entries.get(index))
+    }
+
+    pub fn move_tree(&mut self, down: bool, amount: usize) {
+        self.selected_entry = if down {
+            self.selected_entry
+                .saturating_add(amount)
+                .min(self.entry_count().saturating_sub(1))
+        } else {
+            self.selected_entry.saturating_sub(amount)
+        };
     }
 
     pub fn activate_entry(&mut self, index: usize) {
@@ -433,19 +475,21 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
                     editor.selected_entry += 1;
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
                 editor.activate_entry(editor.selected_entry);
             }
-            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h')
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
                 if editor.directory.is_some() =>
             {
                 editor.go_up();
             }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab | KeyCode::BackTab
-                if editor.open_file.is_some() =>
-            {
+            KeyCode::Tab | KeyCode::BackTab if editor.open_file.is_some() => {
                 editor.tree_focus = false;
             }
+            KeyCode::Home => editor.selected_entry = 0,
+            KeyCode::End => editor.selected_entry = count.saturating_sub(1),
+            KeyCode::PageDown => editor.move_tree(true, 10),
+            KeyCode::PageUp => editor.move_tree(false, 10),
             KeyCode::Char('r') => {
                 editor.queue(Operation::ListEntries(editor.directory.clone()));
             }
@@ -538,9 +582,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    if area.width >= 56 {
-        let [tree_area, code_area] =
-            Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+    if app.editor.tree_focus || app.editor.open_file.is_none() {
+        draw_tree(frame, app, area);
+    } else if area.width >= 56 {
+        let [code_area, tree_area] =
+            Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
                 .areas(area);
         draw_tree(frame, app, tree_area);
         draw_code(frame, app, code_area);
@@ -551,131 +597,231 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Truncate in the middle so long filenames retain their extension.
+fn compact_name(name: &str, width: usize) -> String {
+    if name.width() <= width {
+        return name.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let graphemes: Vec<_> = name.graphemes(true).collect();
+    let suffix_budget = (width - 1) / 3;
+    let mut suffix = String::new();
+    for grapheme in graphemes.iter().rev() {
+        if suffix.width() + grapheme.width() > suffix_budget {
+            break;
+        }
+        suffix.insert_str(0, grapheme);
+    }
+    let mut prefix = String::new();
+    for grapheme in graphemes {
+        if prefix.width() + grapheme.width() + suffix.width() + 1 > width {
+            break;
+        }
+        prefix.push_str(grapheme);
+    }
+    format!("{prefix}…{suffix}")
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Workspace && app.editor.tree_focus;
-    let border_color = if focused { Color::Blue } else { Color::DarkGray };
+    let border_color = if focused {
+        Color::Blue
+    } else {
+        Color::DarkGray
+    };
     let outer = Block::default()
-        .borders(Borders::RIGHT)
+        .borders(if app.editor.tree_focus || app.editor.open_file.is_none() {
+            Borders::RIGHT
+        } else {
+            Borders::LEFT
+        })
         .border_style(Style::default().fg(border_color));
-    let outer_inner = outer.inner(area);
+    let inner = outer.inner(area);
     frame.render_widget(outer, area);
-    if outer_inner.height < 3 || outer_inner.width == 0 {
+    if inner.height < 3 || inner.width == 0 {
         return;
     }
-
-    let [header_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(outer_inner);
-    let header_title = match app.editor.directory.as_deref() {
-        Some(dir) => format!(" Files / {dir}"),
-        None => " Files".into(),
-    };
-    let header_block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(border_color));
-    let header_inner = header_block.inner(header_area);
-    frame.render_widget(header_block, header_area);
+    let [header, list, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let root_name = app
+        .editor
+        .cwd
+        .as_deref()
+        .and_then(|cwd| cwd.rsplit('/').find(|s| !s.is_empty()))
+        .unwrap_or("Workspace");
+    let path = app.editor.directory.as_deref().unwrap_or("./");
     frame.render_widget(
-        Paragraph::new(header_title).style(
-            Style::default()
-                .fg(if focused { Color::Cyan } else { Color::White })
-                .add_modifier(Modifier::BOLD),
+        Paragraph::new(vec![
+            Line::styled(
+                format!(
+                    " Files · {}",
+                    compact_name(root_name, inner.width.saturating_sub(10) as usize)
+                ),
+                Style::default()
+                    .fg(if focused { Color::Cyan } else { Color::White })
+                    .bold(),
+            ),
+            Line::styled(
+                format!(
+                    " {}",
+                    compact_name(path, inner.width.saturating_sub(2) as usize)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(border_color)),
         ),
-        header_inner,
+        header,
+    );
+
+    let folders = app
+        .editor
+        .entries
+        .iter()
+        .filter(|entry| entry.is_dir())
+        .count();
+    let status = app
+        .editor
+        .error
+        .clone()
+        .or_else(|| {
+            app.editor
+                .pending
+                .as_ref()
+                .map(|_| app.editor.notice.clone())
+        })
+        .unwrap_or_else(|| {
+            if app.editor.entries.is_empty() {
+                "Empty folder".into()
+            } else {
+                format!(
+                    "{folders} folders · {} files{}",
+                    app.editor.entries.len() - folders,
+                    if app.editor.entries_truncated {
+                        " · partial"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        });
+    frame.render_widget(
+        Paragraph::new(format!(" {status}")).style(Style::default().fg(
+            if app.editor.error.is_some() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            },
+        )),
+        footer,
     );
 
     let count = app.editor.entry_count();
-    if count == 0 {
-        let message = app
-            .editor
-            .error
-            .as_deref()
-            .unwrap_or(if app.editor.pending.is_some() {
-                " Loading files…"
-            } else {
-                " Empty directory."
-            });
-        frame.render_widget(
-            Paragraph::new(message)
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: false }),
-            list_area,
-        );
+    let visible = list.height as usize;
+    if visible == 0 || count == 0 {
         return;
     }
-
+    app.editor.selected_entry = app.editor.selected_entry.min(count - 1);
+    let selected = app.editor.selected_entry;
+    let offset = app.editor.tree_offset.min(count.saturating_sub(visible));
+    let offset = if selected < offset {
+        selected
+    } else if selected >= offset + visible {
+        selected + 1 - visible
+    } else {
+        offset
+    };
+    app.editor.tree_offset = offset;
     let changed_files = app
         .git
         .snapshot
         .as_ref()
         .map(|snapshot| snapshot.status.working_tree.files.as_slice())
         .unwrap_or(&[]);
-    let visible = list_area.height as usize;
-    let offset = app.editor.selected_entry.saturating_sub(visible / 2);
-    let mut rows = Vec::new();
     for index in offset..(offset + visible).min(count) {
-        let (label, is_dir, is_changed, is_open) = if app.editor.directory.is_some() {
-            if index == 0 {
-                (" ↩ ..".to_owned(), true, false, false)
+        let entry = app.editor.entry_at(index);
+        let is_parent = entry.is_none();
+        let is_dir = entry.is_some_and(Entry::is_dir);
+        let open =
+            entry.is_some_and(|entry| app.editor.open_file.as_deref() == Some(entry.path.as_str()));
+        let changed = entry.is_some_and(|entry| is_entry_changed(entry, changed_files))
+            || entry.is_some_and(|entry| {
+                open && app.editor.dirty
+                    && app.editor.open_file.as_deref() == Some(entry.path.as_str())
+            });
+        let selected = index == selected;
+        let row_style = if selected {
+            Style::default().bg(if focused {
+                Color::Rgb(30, 53, 65)
             } else {
-                let entry = &app.editor.entries[index - 1];
-                let dir = entry.is_dir();
-                let changed = is_entry_changed(entry, changed_files);
-                let open = app.editor.open_file.as_deref() == Some(entry.path.as_str());
-                let name = if dir {
-                    format!(" ▸ {}/", entry.display_name())
-                } else if open {
-                    format!(" • {}", entry.display_name())
+                Color::Rgb(32, 35, 40)
+            })
+        } else {
+            Style::default()
+        };
+        let color = if is_parent {
+            Color::DarkGray
+        } else if is_dir || open {
+            Color::Cyan
+        } else if entry.is_some_and(|entry| entry.ignored == Some(true)) {
+            Color::DarkGray
+        } else {
+            Color::Gray
+        };
+        let name = if is_parent {
+            "..".into()
+        } else {
+            let entry = entry.unwrap();
+            format!("{}{}", entry.display_name(), if is_dir { "/" } else { "" })
+        };
+        let name = compact_name(&name, list.width.saturating_sub(7) as usize);
+        let padding = list
+            .width
+            .saturating_sub(7)
+            .saturating_sub(name.width() as u16) as usize;
+        let line = Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                row_style.fg(if focused { Color::Cyan } else { Color::Gray }),
+            ),
+            Span::styled(
+                if is_parent {
+                    "↑ "
+                } else if is_dir {
+                    "▸ "
                 } else {
-                    format!("   {}", entry.display_name())
-                };
-                (name, dir, changed, open)
-            }
-        } else {
-            let entry = &app.editor.entries[index];
-            let dir = entry.is_dir();
-            let changed = is_entry_changed(entry, changed_files);
-            let open = app.editor.open_file.as_deref() == Some(entry.path.as_str());
-            let name = if dir {
-                format!(" ▸ {}/", entry.display_name())
-            } else if open {
-                format!(" • {}", entry.display_name())
-            } else {
-                format!("   {}", entry.display_name())
-            };
-            (name, dir, changed, open)
-        };
-        let selected = index == app.editor.selected_entry;
-        let style = if selected && focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else if selected && is_changed {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else if is_changed {
-            Style::default().fg(Color::Yellow)
-        } else if is_open {
-            Style::default().fg(Color::Cyan)
-        } else if is_dir {
-            Style::default().fg(Color::Blue)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let mut line_spans = vec![Span::styled(label, style)];
-        if is_changed && !(selected && focused) {
-            line_spans.push(Span::styled(" M", Style::default().fg(Color::Yellow)));
-        }
-        rows.push(Line::from(line_spans));
-        let row_y = list_area.y + (index - offset) as u16;
-        app.click_targets.push((
-            Rect::new(list_area.x, row_y, list_area.width, 1),
-            ClickTarget::EditorEntry(index),
-        ));
+                    "· "
+                },
+                row_style.fg(color),
+            ),
+            Span::styled(
+                format!("{name}{}", " ".repeat(padding)),
+                if is_dir || open {
+                    row_style.fg(color).bold()
+                } else {
+                    row_style.fg(color)
+                },
+            ),
+            Span::styled(if open { "●" } else { " " }, row_style.fg(Color::Cyan)),
+            Span::styled(
+                if changed { " M" } else { "  " },
+                row_style.fg(Color::Yellow),
+            ),
+        ]);
+        let row = Rect::new(list.x, list.y + (index - offset) as u16, list.width, 1);
+        frame.render_widget(Paragraph::new(line).style(row_style), row);
+        app.click_targets
+            .push((row, ClickTarget::EditorEntry(index)));
     }
-    frame.render_widget(Paragraph::new(Text::from(rows)), list_area);
 }
 
 fn is_entry_changed(entry: &Entry, changed_files: &[crate::git::File]) -> bool {
@@ -758,10 +904,7 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             Line::from(spans)
         }
-        None => Line::styled(
-            " No file open",
-            Style::default().fg(Color::DarkGray),
-        ),
+        None => Line::styled(" No file open", Style::default().fg(Color::DarkGray)),
     };
     frame.render_widget(Paragraph::new(header_line), header_inner);
 
@@ -805,9 +948,7 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
                 .take(code_width.max(1))
                 .collect();
             let mut spans = vec![Span::styled(num, Style::default().fg(Color::DarkGray))];
-            if line_idx == editor.cursor_line
-                && !editor.tree_focus
-                && app.focus == Focus::Workspace
+            if line_idx == editor.cursor_line && !editor.tree_focus && app.focus == Focus::Workspace
             {
                 let rel_col = editor.cursor_col.saturating_sub(editor.scroll_x);
                 let chars: Vec<char> = slice.chars().collect();
@@ -835,9 +976,7 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
         .as_deref()
         .map(|err| (err.to_owned(), Color::Yellow))
         .filter(|(s, _)| !s.is_empty())
-        .or_else(|| {
-            (!editor.notice.is_empty()).then(|| (editor.notice.clone(), Color::Cyan))
-        })
+        .or_else(|| (!editor.notice.is_empty()).then(|| (editor.notice.clone(), Color::Cyan)))
         .unwrap_or_else(|| {
             (
                 format!(
@@ -971,6 +1110,346 @@ mod tests {
     }
 
     #[test]
+    fn tree_navigation_uses_arrows_and_hjkl_even_with_an_open_file() {
+        for (right, left, down, up) in [
+            (KeyCode::Right, KeyCode::Left, KeyCode::Down, KeyCode::Up),
+            (
+                KeyCode::Char('l'),
+                KeyCode::Char('h'),
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+            ),
+            (
+                KeyCode::Enter,
+                KeyCode::Backspace,
+                KeyCode::Down,
+                KeyCode::Up,
+            ),
+            (
+                KeyCode::Char(' '),
+                KeyCode::Backspace,
+                KeyCode::Down,
+                KeyCode::Up,
+            ),
+        ] {
+            let mut app = App::default();
+            app.editor.cwd = Some("/repo".into());
+            app.editor.open_file = Some("existing.rs".into());
+            app.editor.entries = vec![
+                Entry {
+                    path: "src".into(),
+                    kind: "directory".into(),
+                    ignored: None,
+                },
+                Entry {
+                    path: "Cargo.toml".into(),
+                    kind: "file".into(),
+                    ignored: None,
+                },
+            ];
+            let press = |app: &mut App, code| key(app, KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(press(&mut app, down));
+            assert_eq!(app.editor.selected_entry, 1);
+            assert!(press(&mut app, up));
+            assert_eq!(app.editor.selected_entry, 0);
+            assert!(press(&mut app, right));
+            let request = app.editor.request.take().unwrap();
+            assert!(
+                matches!(&request.operation, Operation::ListEntries(Some(path)) if path == "src")
+            );
+            assert!(app.editor.tree_focus);
+            app.editor.finish(
+                &request,
+                Ok(Response::Entries {
+                    directory: Some("src".into()),
+                    entries: vec![Entry {
+                        path: "src/main.rs".into(),
+                        kind: "file".into(),
+                        ignored: None,
+                    }],
+                    truncated: false,
+                }),
+            );
+            assert!(app.editor.pending.is_none());
+            assert!(press(&mut app, left));
+            let request = app.editor.request.take().unwrap();
+            assert!(matches!(request.operation, Operation::ListEntries(None)));
+            app.editor.finish(
+                &request,
+                Ok(Response::Entries {
+                    directory: None,
+                    entries: vec![Entry {
+                        path: "Cargo.toml".into(),
+                        kind: "file".into(),
+                        ignored: None,
+                    }],
+                    truncated: false,
+                }),
+            );
+            assert!(press(&mut app, right));
+            let request = app.editor.request.take().unwrap();
+            assert!(
+                matches!(&request.operation, Operation::ReadFile(path) if path == "Cargo.toml")
+            );
+            app.editor.finish(
+                &request,
+                Ok(Response::File {
+                    relative_path: "Cargo.toml".into(),
+                    contents: "[package]".into(),
+                    truncated: false,
+                    exists: true,
+                }),
+            );
+            assert!(!app.editor.tree_focus);
+        }
+    }
+
+    #[test]
+    fn enter_and_space_open_selected_files_in_code_pane() {
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            for nested in [false, true] {
+                let mut app = App {
+                    focus: Focus::Workspace,
+                    workspace_tab: 0,
+                    ..Default::default()
+                };
+                app.editor.cwd = Some("/repo".into());
+                app.editor.directory = nested.then(|| "src".into());
+                let path = if nested { "src/main.rs" } else { "main.rs" };
+                app.editor.entries = vec![Entry {
+                    path: path.into(),
+                    kind: "file".into(),
+                    ignored: None,
+                }];
+                app.editor.selected_entry = usize::from(nested);
+                crate::input::handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
+                let request = app.editor.request.take().unwrap();
+                assert!(matches!(&request.operation, Operation::ReadFile(file) if file == path));
+                app.editor.finish(
+                    &request,
+                    Ok(Response::File {
+                        relative_path: path.into(),
+                        contents: "fn main() {}".into(),
+                        truncated: false,
+                        exists: true,
+                    }),
+                );
+                assert!(!app.editor.tree_focus);
+                assert!(!app.editor.editing);
+                assert_eq!(app.editor.open_file.as_deref(), Some(path));
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_and_parent_navigation_restore_selection_by_path() {
+        let entry = |path: &str, kind: &str| Entry {
+            path: path.into(),
+            kind: kind.into(),
+            ignored: None,
+        };
+        let mut state = EditorState {
+            cwd: Some("/repo".into()),
+            ..Default::default()
+        };
+        state.entries = vec![entry("docs", "directory"), entry("src", "directory")];
+        state.selected_entry = 1;
+        state.activate_entry(1);
+        let request = state.request.take().unwrap();
+        state.finish(
+            &request,
+            Ok(Response::Entries {
+                directory: Some("src".into()),
+                entries: vec![entry("src/main.rs", "file")],
+                truncated: false,
+            }),
+        );
+        state.selected_entry = 1;
+        state.queue(Operation::ListEntries(Some("src".into())));
+        let request = state.request.take().unwrap();
+        state.finish(
+            &request,
+            Ok(Response::Entries {
+                directory: Some("src".into()),
+                entries: vec![entry("src/lib.rs", "file"), entry("src/main.rs", "file")],
+                truncated: false,
+            }),
+        );
+        assert_eq!(
+            state.entry_at(state.selected_entry).unwrap().path,
+            "src/main.rs"
+        );
+        state.go_up();
+        let request = state.request.take().unwrap();
+        state.finish(
+            &request,
+            Ok(Response::Entries {
+                directory: None,
+                entries: vec![entry("src", "directory"), entry("docs", "directory")],
+                truncated: false,
+            }),
+        );
+        assert_eq!(state.entry_at(state.selected_entry).unwrap().path, "src");
+        state.activate_entry(state.selected_entry);
+        let request = state.request.take().unwrap();
+        state.finish(
+            &request,
+            Ok(Response::Entries {
+                directory: Some("src".into()),
+                entries: vec![entry("src/lib.rs", "file"), entry("src/main.rs", "file")],
+                truncated: false,
+            }),
+        );
+        assert_eq!(
+            state.entry_at(state.selected_entry).unwrap().path,
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn explorer_scrolls_at_edges_and_keeps_mouse_targets_aligned() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App {
+            focus: Focus::Workspace,
+            ..Default::default()
+        };
+        app.editor.cwd = Some("/repo".into());
+        app.editor.entries = (0..40)
+            .map(|index| Entry {
+                path: format!("file-{index:02}.rs"),
+                kind: "file".into(),
+                ignored: None,
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(32, 12)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            app.click_targets.clear();
+            terminal
+                .draw(|frame| draw_tree(frame, app, frame.area()))
+                .unwrap();
+        };
+        render(&mut terminal, &mut app);
+        app.editor.selected_entry = 2;
+        render(&mut terminal, &mut app);
+        assert_eq!(app.editor.tree_offset, 0);
+        let (row, _) = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| matches!(target, ClickTarget::EditorEntry(2)))
+            .unwrap();
+        let row = *row;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(row.x, row.y)].bg,
+            buffer[(row.right() - 1, row.y)].bg
+        );
+        crate::input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: row.x + 2,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.editor.selected_entry, 5);
+        key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        render(&mut terminal, &mut app);
+        assert!(app.editor.tree_offset > 0);
+        let (row, _) = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| matches!(target, ClickTarget::EditorEntry(39)))
+            .unwrap();
+        let text = (row.x..row.right())
+            .map(|x| terminal.backend().buffer()[(x, row.y)].symbol())
+            .collect::<String>();
+        assert!(text.contains("file-39.rs"));
+        app.editor.entries[39].path = "very-long-unicode-文件名-with-extension.rs".into();
+        app.editor.open_file = Some(app.editor.entries[39].path.clone());
+        app.editor.dirty = true;
+        render(&mut terminal, &mut app);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains('…'));
+        assert!(text.contains("● M"));
+    }
+
+    #[test]
+    fn explorer_fills_editor_until_file_opens_and_tab_restores_browser() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App {
+            authenticated: true,
+            focus: Focus::Workspace,
+            ..Default::default()
+        };
+        app.editor.cwd = Some("/repo".into());
+        app.editor.entries = vec![Entry {
+            path: "main.rs".into(),
+            kind: "file".into(),
+            ignored: None,
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            app.click_targets.clear();
+            terminal
+                .draw(|frame| draw(frame, app, frame.area()))
+                .unwrap();
+        };
+        let entry_width = |app: &App| {
+            app.click_targets
+                .iter()
+                .find_map(|(area, target)| {
+                    matches!(target, ClickTarget::EditorEntry(0)).then_some(area.width)
+                })
+                .unwrap()
+        };
+        render(&mut terminal, &mut app);
+        assert_eq!(entry_width(&app), 89);
+        key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let request = app.editor.request.take().unwrap();
+        app.editor.finish(
+            &request,
+            Ok(Response::File {
+                relative_path: "main.rs".into(),
+                contents: "fn main() {}".into(),
+                truncated: false,
+                exists: true,
+            }),
+        );
+        render(&mut terminal, &mut app);
+        assert!(entry_width(&app) < 45);
+        let explorer = app
+            .click_targets
+            .iter()
+            .find_map(|(area, target)| {
+                matches!(target, ClickTarget::EditorEntry(0)).then_some(*area)
+            })
+            .unwrap();
+        assert!(
+            explorer.x > 45,
+            "Explorer should be to the right of the code"
+        );
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("fn main()"));
+        key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        render(&mut terminal, &mut app);
+        assert_eq!(entry_width(&app), 89);
+    }
+
+    #[test]
     fn tab_toggles_between_file_tree_and_code_view() {
         let mut app = App {
             focus: Focus::Workspace,
@@ -981,10 +1460,16 @@ mod tests {
         app.editor.lines = vec!["[package]".into()];
         app.editor.tree_focus = true;
 
-        assert!(key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        ));
         assert!(!app.editor.tree_focus);
 
-        assert!(key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        ));
         assert!(app.editor.tree_focus);
     }
 }

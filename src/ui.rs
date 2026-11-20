@@ -9,6 +9,8 @@ use ratatui::{
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_targets.clear();
+    let footer_text = global_shortcuts(app);
+    let footer_widget = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -89,9 +91,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             "Waiting for T3 sign-in.\n\nPress p to pair with the local server.".into()
         };
         frame.render_widget(
-            Paragraph::new(message)
-                .wrap(Wrap { trim: false })
-                .block(panel(title, app.focus == Focus::Projects)),
+            Paragraph::new(message).wrap(Wrap { trim: false }).block(
+                panel(title, app.focus == Focus::Projects).title_bottom(
+                    if panel_help_visible(app, Focus::Projects, project_list) {
+                        " ↑↓/jk: select · Enter: menu "
+                    } else {
+                        ""
+                    },
+                ),
+            ),
             project_list,
         );
     } else {
@@ -129,7 +137,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         });
         frame.render_stateful_widget(
             List::new(items)
-                .block(panel(title, app.focus == Focus::Projects))
+                .block(panel(title, app.focus == Focus::Projects).title_bottom(
+                    if panel_help_visible(app, Focus::Projects, project_list) {
+                        " ↑↓/jk: select · Enter: menu "
+                    } else {
+                        ""
+                    },
+                ))
                 .highlight_symbol("› ")
                 .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan)),
             project_list,
@@ -295,7 +309,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         render_context_usage(&mut content, app.context_usage.as_ref());
     }
-    let block = panel(&title, app.focus == Focus::Chat);
+    let block = panel(&title, app.focus == Focus::Chat).title_bottom(
+        if panel_help_visible(app, Focus::Chat, chat) {
+            " Shift+↑↓ / PgUp/PgDn: scroll · Ctrl+C: copy · r: retry "
+        } else {
+            ""
+        },
+    );
     let chat_inner = block.inner(chat);
     let image_count = app
         .draft_thread
@@ -367,13 +387,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             String::new()
         },
-        if app.editing {
-            " (typing)"
-        } else if app.focus == Focus::Composer {
-            " (Enter/Space or i to type · Shift+D: dictate)"
-        } else {
-            ""
-        }
+        if app.editing { " (typing)" } else { "" }
     );
     let composer_block = panel(&composer_title, app.focus == Focus::Composer);
     let composer_block = if let Some(indicator) = app.dictation.indicator(std::time::Instant::now())
@@ -393,6 +407,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let composer_block = if let Some(status) = status {
         composer_block.title_bottom(status)
+    } else if panel_help_visible(app, Focus::Composer, composer) {
+        let hint = if app.editing {
+            if app.is_selected_thread_working() {
+                " Enter: queue · Ctrl/Alt+Enter: steer "
+            } else {
+                " Enter: send "
+            }
+        } else {
+            " Enter/Space/i: type · Shift+D: dictate "
+        };
+        composer_block.title_bottom(Line::styled(hint, Style::default().fg(Color::Blue)))
     } else {
         composer_block
     };
@@ -468,7 +493,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if image_count > 0 {
         let attachments_block = Block::bordered()
             .title(format!(" Unsent attachments ({image_count}) "))
-            .title_bottom(" Click × to remove · Ctrl+Backspace: clear ")
+            .title_bottom(if panel_help_visible(app, Focus::Chat, chat) {
+                " Click × to remove · Ctrl+Backspace: clear "
+            } else {
+                ""
+            })
             .border_style(Style::default().fg(Color::Cyan));
         let rows = attachments_block.inner(attachment_area);
         frame.render_widget(attachments_block, attachment_area);
@@ -528,7 +557,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         None
     };
     let model_block = panel(
-        if app.focus == Focus::Model {
+        if panel_help_visible(app, Focus::Model, model) {
             " Model (Enter/Space: change) "
         } else {
             " Model "
@@ -555,7 +584,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         "Default".to_owned()
     };
     let access_block = panel(
-        if app.focus == Focus::Access {
+        if panel_help_visible(app, Focus::Access, access) {
             " Access (Enter/Space: change) "
         } else {
             " Access "
@@ -574,61 +603,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .push((session, crate::app::ClickTarget::Pane(Focus::SessionUsage)));
     app.click_targets
         .push((weekly, crate::app::ClickTarget::Pane(Focus::WeeklyUsage)));
-    let (mode_label, mode_color, _) = mode_badge(app);
-    let footer_hint = if app.terminal_overlay_open {
-        " Ctrl+J: hide | Shift+PgUp/PgDn: scroll "
-    } else if app.settings_open {
-        " Esc/s: close | Ctrl+Q: quit "
-    } else if app.editing {
-        " Enter: queue | Ctrl/Alt+Enter: steer | Ctrl+C/V: copy/paste | Shift+Enter: newline | Shift+arrows: select | Ctrl+Shift+←→: words "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing {
-        " Ctrl+S: save | Esc: stop editing "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.tree_focus {
-        " ↑↓/jk: file | Enter: open | ←/Backspace: up | Tab/l: code | r: refresh "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 {
-        " Enter/i: edit | ↑↓←→/hjkl: move | Tab/Esc: files | Ctrl+S: save "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 && app.local_terminal.tab_typing {
-        " Esc: stop typing | Shift+PgUp/PgDn: scroll "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 {
-        " Enter/Space/i: type | PgUp/PgDn: scroll | ↑/k: tools | ←/h: chat "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
-        " ↑↓/jk: action | Enter/Space: open | g: generate | r: refresh "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 1 && app.diff_view.file_focus {
-        " ↑↓/jk: file | ←/h/Enter: patch | [/]: run "
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 1 {
-        " w: toggle wrap | PgUp/PgDn: scroll | Shift+←→: pan when unwrapped | ↑: tools "
-    } else if app.focus == Focus::Workspace {
-        " →/l: editor | PgUp/PgDn: scroll | [/]: run | Shift+←→: pan | ↑: tools "
-    } else if app.focus == Focus::WorkspaceTabs {
-        " ←→/hl: tabs | Enter/Space: activate | ↓/j: panel "
-    } else if app.focus == Focus::Projects {
-        " ↑↓/jk: select | →/l: chat | Enter/Space: menu | s: settings | o: setup "
-    } else if app.focus == Focus::Chat {
-        " ↓/j or m: Message | Shift+j/k/↑↓: scroll | s: settings "
-    } else if app.focus == Focus::Model {
-        " Enter/Space: choose model | l/→: access | k/↑: prompt | s: settings "
-    } else if app.focus == Focus::Access {
-        " Enter/Space: access level | h/←: model | l/→: usage | k/↑: prompt "
-    } else {
-        " ↓/j: model | ↑/k: chat | Enter/Space/i: type | Shift+D: dictate | m: Message | s: settings "
-    };
-    let [hint_area, shortcut_area] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(footer.width.min(72))])
-            .areas(footer);
-    let hint_line = Line::from(vec![
-        Span::styled(
-            mode_label,
-            Style::default().fg(Color::Black).bg(mode_color).bold(),
-        ),
-        Span::styled(footer_hint, Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(hint_line), hint_area);
-    frame.render_widget(
-        Paragraph::new("Shift+D Dictate | Ctrl+J / Shift+T Terminal | w Panel { } Resize | q Quit")
-            .right_aligned()
-            .style(Style::default().fg(Color::DarkGray)),
-        shortcut_area,
-    );
+    frame.render_widget(footer_widget, footer);
     if app.settings_open {
         app.click_targets.clear();
         settings_panel(frame, app);
@@ -1036,10 +1011,7 @@ fn draw_local_terminal_body(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(session) = &mut app.local_terminal.session {
         session.resize(area.height, area.width);
         let parser = session.parser.lock().unwrap();
-        frame.render_widget(
-            tui_term::widget::PseudoTerminal::new(parser.screen()),
-            area,
-        );
+        frame.render_widget(tui_term::widget::PseudoTerminal::new(parser.screen()), area);
     } else {
         frame.render_widget(
             Paragraph::new(
@@ -1068,6 +1040,30 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
         .border_style(Style::default().fg(border));
+    let help = match active_tab {
+        0 if app.editor.editing => "Ctrl+S: save · Esc: stop editing",
+        0 if app.editor.tree_focus && app.editor.open_file.is_none() => "r: refresh",
+        0 if app.editor.tree_focus => "Tab: code · r: refresh",
+        0 => "Enter/i: edit · Tab/Esc: files · Ctrl+S: save",
+        1 if app.diff_view.file_focus => "↑↓/jk: file · ←/h/Enter: patch · [/]: run",
+        1 => "w: wrap · [/]: run · PgUp/PgDn: scroll · r: refresh",
+        2 if app.local_terminal.tab_typing => "Esc: nav mode · Shift+PgUp/PgDn: scroll",
+        2 => "Enter/i: type mode · PgUp/PgDn: scroll",
+        _ => "↑↓/jk: action · Enter/Space: open · g: generate · r: refresh",
+    };
+    let help = if app.focus == Focus::WorkspaceTabs {
+        "←→/hl: choose tab · Enter/Space/↓: open panel"
+    } else {
+        help
+    };
+    let help = if panel_help_visible(app, Focus::Workspace, area)
+        || panel_help_visible(app, Focus::WorkspaceTabs, selector)
+    {
+        help
+    } else {
+        ""
+    };
+    let block = block.title_bottom(Line::styled(help, Style::default().fg(Color::Blue)));
     let content = block.inner(body);
     frame.render_widget(block, body);
     app.click_targets
@@ -1509,33 +1505,49 @@ fn render_server_settings_row(
     }
 }
 
-fn mode_badge(app: &App) -> (&'static str, Color, &'static str) {
-    if app.terminal_overlay_open {
-        (" TERMINAL ", Color::Magenta, "Ctrl+J: hide")
-    } else if app.settings_open {
-        (" SETTINGS ", Color::Yellow, "Esc: close")
-    } else if app.models.open {
-        (" MODEL ", Color::Yellow, "Esc: close")
-    } else if app.access_open {
-        (" ACCESS ", Color::Yellow, "Esc: close")
-    } else if app.editing {
-        (" TYPING ", Color::Green, "Esc: normal")
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing {
-        (" EDITOR:EDIT ", Color::Green, "Esc: nav")
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 0 {
-        (" EDITOR ", Color::Cyan, "i/Enter: edit")
-    } else if app.focus == Focus::Workspace
-        && app.workspace_tab == 2
-        && app.local_terminal.tab_typing
+/// Hover shows help without changing keyboard focus. Modal dialogs own their help.
+pub(crate) fn panel_help_visible(app: &App, focus: Focus, area: Rect) -> bool {
+    if app.settings_open
+        || app.models.open
+        || app.access_open
+        || app.startup.open
+        || app.terminal_overlay_open
+        || app.git.has_modal()
+        || app.thread_menu.is_some()
+        || app.quit_dialog.is_some()
+        || app.active_approval_popup().is_some()
     {
-        (" TERM:TYPING ", Color::Green, "Esc: nav")
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 2 {
-        (" TERMINAL ", Color::Magenta, "i/Enter: type")
-    } else if app.focus == Focus::Workspace && app.workspace_tab == 3 {
-        (" GIT ", Color::Cyan, "←/h: chat")
-    } else {
-        (" NORMAL ", Color::Blue, "i/Enter: type")
+        return false;
     }
+    app.focus == focus || app.pointer.is_some_and(|point| area.contains(point))
+}
+
+fn global_shortcuts(app: &App) -> &'static str {
+    if app.terminal_overlay_open
+        || (app.focus == Focus::Workspace
+            && app.workspace_tab == 2
+            && app.local_terminal.tab_typing)
+    {
+        return "";
+    }
+    if app.settings_open
+        || app.models.open
+        || app.access_open
+        || app.startup.open
+        || app.git.has_modal()
+        || app.thread_menu.is_some()
+        || app.quit_dialog.is_some()
+        || app.active_approval_popup().is_some()
+    {
+        return " Ctrl+Q: quit";
+    }
+    if app.focus == Focus::Workspace && app.workspace_tab == 0 && app.editor.editing {
+        return " Ctrl+Q: quit";
+    }
+    if app.editing {
+        return " Ctrl+J: terminal · Ctrl+Q: quit";
+    }
+    " s: settings · Ctrl+J: terminal · { }: resize · w: panel · q: quit · arrows/hjkl: navigate · p/c/m: projects/chat/message · e/d/t/g: tools · o: setup"
 }
 
 fn format_tokens(count: u64) -> String {
@@ -1550,10 +1562,7 @@ fn format_tokens(count: u64) -> String {
     out.chars().rev().collect()
 }
 
-fn render_context_usage(
-    content: &mut Text<'static>,
-    usage: Option<&crate::history::ContextUsage>,
-) {
+fn render_context_usage(content: &mut Text<'static>, usage: Option<&crate::history::ContextUsage>) {
     crate::chat::notice(content, "Context window usage", Color::Cyan);
     let Some(usage) = usage else {
         crate::chat::notice(
@@ -1595,7 +1604,10 @@ fn render_context_usage(
     if let Some(threshold) = usage.auto_compact_threshold {
         crate::chat::notice(
             content,
-            format!("  Auto-compact threshold: {} tokens", format_tokens(threshold)),
+            format!(
+                "  Auto-compact threshold: {} tokens",
+                format_tokens(threshold)
+            ),
             Color::Gray,
         );
     } else if usage.compacts_automatically == Some(true) {
@@ -1631,7 +1643,11 @@ fn render_context_usage(
         extras.push(format!("Cost: {:.4} {}", cost.amount, cost.currency));
     }
     if !extras.is_empty() {
-        crate::chat::notice(content, format!("  {}", extras.join(" · ")), Color::DarkGray);
+        crate::chat::notice(
+            content,
+            format!("  {}", extras.join(" · ")),
+            Color::DarkGray,
+        );
     }
 }
 
@@ -1994,6 +2010,121 @@ mod tests {
         assert!(visible.contains("Input: 50,000"));
         assert!(visible.contains("Cached: 10,000"));
         assert!(visible.contains("Output: 4,000"));
+    }
+
+    #[test]
+    fn panel_help_appears_only_on_focus_or_hover_and_footer_stays_one_row() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = App::default();
+        app.focus = Focus::Chat;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let visible = |t: &Terminal<TestBackend>| {
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!visible(&terminal).contains("Enter: menu"));
+        assert!(!visible(&terminal).contains("Tab/l: code"));
+        let sidebar = app
+            .click_targets
+            .iter()
+            .find(|(_, target)| matches!(target, crate::app::ClickTarget::Pane(Focus::Projects)))
+            .unwrap()
+            .0;
+        let motion = |x, y| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        crate::input::handle_mouse(&mut app, motion(sidebar.x + 1, sidebar.y + 1));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(visible(&terminal).contains("Enter: menu"));
+        assert!(app.focus == Focus::Chat);
+        crate::input::handle_mouse(&mut app, motion(0, 0));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!visible(&terminal).contains("Enter: menu"));
+        app.focus = Focus::Projects;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(visible(&terminal).contains("Enter: menu"));
+        for (width, height) in [(160, 40), (80, 24), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let last = (0..width)
+                .map(|x| buffer[(x, height - 1)].symbol())
+                .collect::<String>();
+            let previous = (0..width)
+                .map(|x| buffer[(x, height - 2)].symbol())
+                .collect::<String>();
+            assert!(last.contains("s: settings"), "{width}x{height}: {last:?}");
+            assert!(!previous.contains("s: settings"));
+            assert!(!global_shortcuts(&app).contains('\n'));
+        }
+    }
+
+    #[test]
+    fn global_footer_and_panel_help_have_separate_locations() {
+        let mut app = App::default();
+        app.focus = Focus::Composer;
+        app.editing = true;
+        app.send_notice = Some("Draft status".into());
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..160)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let footer = row(39);
+        assert!(footer.contains("Ctrl+J: terminal"));
+        assert!(!footer.contains("queue"));
+        assert!(!footer.contains("TYPING"));
+        assert!(!footer.contains("NORMAL"));
+        let visible = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!visible.contains("Enter: queue"));
+        assert!(!visible.contains("Ctrl/Alt+Enter: steer"));
+        assert!(visible.contains("Draft status"));
+        assert!(!global_shortcuts(&app).contains("s: settings"));
+        app.editing = false;
+        assert!(global_shortcuts(&app).contains("s: settings"));
+        assert!(global_shortcuts(&app).contains("{ }: resize"));
+    }
+
+    #[test]
+    fn workspace_shortcuts_render_inside_workspace() {
+        let mut app = App::default();
+        app.focus = Focus::Workspace;
+        app.workspace_visible = true;
+        app.workspace_tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let visible = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(visible.contains("w: wrap"));
+        assert!(visible.contains("[/]: run"));
+        let footer = (39..40)
+            .flat_map(|y| (0..180).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(!footer.contains("w: wrap"));
+        assert!(!footer.contains("[/]: run"));
+        for (width, height) in [(60, 16), (20, 8), (1, 1)] {
+            terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
     }
 
     #[test]
@@ -2605,12 +2736,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_composer_has_no_placeholder_but_keeps_header_hint() {
+    fn empty_composer_shows_shortcuts_on_bottom_border() {
         let mut app = App {
             focus: Focus::Composer,
             ..App::default()
         };
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()
@@ -2619,7 +2750,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Enter/Space or i to type"));
+        assert!(text.contains("Message"));
+        assert!(text.contains("Enter/Space/i: type"));
+        assert!(text.contains("Shift+D: dictate"));
+        assert!(!text.contains("Ctrl+V: paste image"));
         assert!(!text.contains("Press Enter/Space or i to type"));
         assert!(!text.contains("Enter sends; Alt+Enter"));
     }
@@ -2868,6 +3002,7 @@ mod tests {
                 ignored: None,
             },
         ];
+        app.editor.tree_focus = false;
         app.editor.open_file = Some("Cargo.toml".into());
         app.editor.lines = vec!["[package]".into(), "name = \"tui3\"".into()];
         let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
@@ -2882,5 +3017,33 @@ mod tests {
         assert!(text.contains("src/"));
         assert!(text.contains("Cargo.toml"));
         assert!(text.contains("[package]"));
+    }
+
+    #[test]
+    fn composer_hints_show_steer_and_queue_only_while_working() {
+        let render = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let mut app = App::default();
+        app.focus = Focus::Composer;
+        app.editing = true;
+        let idle = render(&mut app);
+        assert!(idle.contains("Enter: send"));
+        assert!(!idle.contains("steer"));
+        assert!(!idle.contains("Enter: queue"));
+
+        app.thinking_since = Some(std::time::Instant::now());
+        let working = render(&mut app);
+        assert!(working.contains("Enter: queue · Ctrl/Alt+Enter: steer"));
+        assert!(!working.contains("Enter: send"));
     }
 }

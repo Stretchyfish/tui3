@@ -5,7 +5,7 @@
 - [x] Build a terminal UI in Rust using Ratatui.
 - [x] Add arrow-key and Vim-style pane navigation with a separate typing mode.
 - [x] Allow Down/j to highlight the prompt pane without Tab; Enter/i starts typing.
-- [x] Show the Enter/i typing hint in the message header when the prompt pane is highlighted.
+- [x] Show Message shortcuts on the bottom border while retaining typing in the title; omit routine successful-send notices and preserve errors/queue notices.
 - [x] Focus the Message composer directly with the `m` shortcut.
 - [x] Connect to a T3 server (discovery, identity, session checks, and token authentication).
 - [x] Pair with the local T3 server from the TUI and remember the session without manual tokens.
@@ -23,6 +23,16 @@
 
 ## Chat improvements before code editing
 
+- [x] Render workspace shortcut hints in blue on the bottom border; use the full Editor area for browsing files and restore the split view with code on the left and explorer on the right when a file opens.
+
+- [x] Polish the Editor explorer with full-row selection, compact paths/filenames, aligned open/modified markers, folder counts and status; preserve selections across refresh/folder navigation and support stable scrolling, mouse wheel, Home/End, and PageUp/PageDown.
+
+- [x] Use arrows/HJKL to navigate the Editor file browser (Right/L opens, Left/H goes up); also support Enter/Space to open files or folders and Backspace to go up, keep Tab for tree/code focus, and remove redundant movement hints.
+
+- [x] Keep the global footer to one row and reveal panel shortcuts only for the selected or hovered panel; verify hover dismissal and narrow layouts.
+
+- [x] Keep global navigation/app shortcuts in the footer, move contextual help into each panel, and remove the bottom-left mode indicator; verify typing help, status preservation, workspace help, and small layouts.
+
 - [x] Show unsent attachments at the bottom of chat with filename, size, and mouse removal; support Ctrl+Backspace/Ctrl+H from Chat or Message and cancel pending pastes on clear.
 
 - [x] Attach desktop clipboard images with Ctrl+V in Message, show attachment count, preserve per-thread drafts, and send images using T3’s attachment upload protocol.
@@ -39,6 +49,9 @@
 - [x] Use Left/Right to switch between model and reasoning selection, and Up/Down to choose within each.
 - [x] Place the model box in a controls row below the message box, with room for more controls.
 - [x] Remember the last selected project/thread for each T3 environment and restore it on startup.
+- [x] Inspect installed T3 usage contracts and Antigravity status; show all provider quota windows, reset times, and unavailable reasons in a scrollable usage hover overlay.
+- [x] Diagnose missing Antigravity quotas: installed Antigravity authenticates via the system keyring; T3 0.1.7's quota probe only reads a missing `acp_token.json`. Its `AGY_ACP_FORCE_FILE_STORAGE` flag is absent from the installed Antigravity binary.
+- [ ] Resolve the T3/Antigravity quota credential compatibility issue upstream, then verify live quota windows in the TUI.
 - [x] Compact the model selector and add live session/weekly usage-remaining circles beside it.
 - [x] Make Session left and Week left focusable controls that show countdowns to T3's reported reset times.
 - [x] Distinguish user and agent messages with labeled, colored message blocks and clearer spacing.

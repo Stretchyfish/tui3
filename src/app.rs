@@ -203,6 +203,7 @@ pub struct App {
     pub focus: Focus,
     pub models: crate::models::ModelPicker,
     pub usage: crate::usage::UsageState,
+    pub pointer: Option<ratatui::layout::Position>,
     pub live_model: Option<crate::models::ModelSelection>,
     pub live_runtime_mode: Option<String>,
     pub context_usage: Option<crate::history::ContextUsage>,
@@ -334,6 +335,7 @@ impl Default for App {
             focus: Focus::default(),
             models: crate::models::ModelPicker::default(),
             usage: crate::usage::UsageState::default(),
+            pointer: None,
             live_model: None,
             live_runtime_mode: None,
             context_usage: None,
@@ -1394,15 +1396,7 @@ impl App {
                     self.drafts.remove(&Some(request.thread_id.clone()));
                 }
                 self.last_attempt.remove(&request.thread_id);
-                self.send_status.insert(
-                    request.thread_id,
-                    if request.steer {
-                        "Steering message accepted by T3."
-                    } else {
-                        "Message accepted by T3."
-                    }
-                    .into(),
-                );
+                self.send_status.remove(&request.thread_id);
             }
             Err(error) => {
                 if !error.retry_same_id {
@@ -1995,6 +1989,13 @@ impl App {
         self.shutdown_server_on_quit
             .then_some(self.local_server_pid)
             .flatten()
+    }
+
+    pub fn is_selected_thread_working(&self) -> bool {
+        self.thinking_since.is_some()
+            || self
+                .selected_thread_id()
+                .is_some_and(|id| self.is_thread_running(id))
     }
 
     pub fn is_thread_running(&self, thread_id: &str) -> bool {

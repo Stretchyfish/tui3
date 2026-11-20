@@ -31,15 +31,16 @@ struct Limits {
 #[derive(Deserialize)]
 struct Unavailable {
     reason: String,
+    message: Option<String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Window {
+pub struct Window {
     id: String,
     kind: String,
-    label: String,
-    used_percent: f64,
-    resets_at: Option<String>,
+    pub label: String,
+    pub used_percent: f64,
+    pub resets_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -93,6 +94,69 @@ impl UsageState {
             .collect();
         self.loaded = true;
         self.error = None;
+    }
+
+    /// All server-reported windows, including allowances for other models.
+    pub fn windows(&self, instance: &str) -> Vec<&Window> {
+        self.providers
+            .get(instance)
+            .filter(|p| {
+                p.enabled
+                    && p.installed
+                    && p.auth.status != "unauthenticated"
+                    && p.availability.as_deref() != Some("unavailable")
+            })
+            .and_then(|p| p.usage_limits.as_ref())
+            .filter(|limits| {
+                !limits
+                    .unavailable
+                    .as_ref()
+                    .is_some_and(|u| u.reason == "unsupported")
+            })
+            .map(|limits| {
+                limits
+                    .windows
+                    .iter()
+                    .filter(|w| {
+                        w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn notice(&self, instance: &str) -> Option<&str> {
+        if let Some(error) = self.error.as_deref() {
+            return Some(error);
+        }
+        let Some(provider) = self.providers.get(instance) else {
+            return Some(if self.loaded {
+                "No usage reported by T3."
+            } else {
+                "Loading usage…"
+            });
+        };
+        if !provider.enabled
+            || !provider.installed
+            || provider.auth.status == "unauthenticated"
+            || provider.availability.as_deref() == Some("unavailable")
+        {
+            return Some("Provider unavailable or signed out.");
+        }
+        if let Some(unavailable) = provider
+            .usage_limits
+            .as_ref()
+            .and_then(|l| l.unavailable.as_ref())
+        {
+            return Some(unavailable.message.as_deref().unwrap_or(
+                match unavailable.reason.as_str() {
+                    "probeFailed" => "Usage refresh failed; displayed values may be stale.",
+                    "unsupported" => "Usage reporting is unavailable for this provider.",
+                    _ => "Usage is currently unavailable.",
+                },
+            ));
+        }
+        None
     }
 
     pub fn remaining(&self, instance: &str, model: &str, kind: &str) -> Option<Remaining> {
@@ -194,6 +258,22 @@ pub(crate) mod tests {
                 {"id":"seven_day_sonnet","kind":"weekly","label":"Weekly · Sonnet","usedPercent":95.0}
             ]}}
         ]}})
+    }
+
+    #[test]
+    fn unsupported_usage_preserves_server_explanation() {
+        let mut value = snapshot();
+        value["config"]["providers"][0]["usageLimits"] = json!({
+            "windows": [], "unavailable": {"reason":"unsupported",
+            "message":"Sign in with Google to see Antigravity limits."}
+        });
+        let mut state = UsageState::default();
+        state.apply(from_config_event(value).unwrap().unwrap());
+        assert!(state.windows("codex").is_empty());
+        assert_eq!(
+            state.notice("codex"),
+            Some("Sign in with Google to see Antigravity limits.")
+        );
     }
 
     #[test]

@@ -253,7 +253,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     .push((row, crate::app::ClickTarget::DiffFile(index)));
             }
             frame.render_widget(
-                Paragraph::new("←/h: diff").style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(
+                    if crate::ui::panel_help_visible(app, Focus::Workspace, area) {
+                        "←/h: diff"
+                    } else {
+                        ""
+                    },
+                )
+                .style(Style::default().fg(Color::DarkGray)),
                 footer,
             );
         }
@@ -269,10 +276,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(diff_inner);
         frame.render_widget(
             Paragraph::new(format!(
-                "{}\n+{} -{} · →/l: files",
+                "{}\n+{} -{}{}",
                 patch.files[app.diff_view.file].name,
                 patch.files[app.diff_view.file].added,
-                patch.files[app.diff_view.file].removed
+                patch.files[app.diff_view.file].removed,
+                if crate::ui::panel_help_visible(app, Focus::Workspace, area) {
+                    " · →/l: files"
+                } else {
+                    ""
+                }
             ))
             .style(Style::default().fg(Color::Cyan)),
             heading,
