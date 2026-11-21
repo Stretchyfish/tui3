@@ -264,6 +264,7 @@ pub struct App {
     pub server_update_status: ServerUpdateStatus,
     pub server_version_check_requested: bool,
     pub server_update_requested: bool,
+    pub tui3_update: crate::update::Status,
     pub dictation: crate::dictation::State,
     pub authenticated: bool,
     pub pairing_requested: bool,
@@ -316,6 +317,7 @@ impl Default for App {
             server_update_status: ServerUpdateStatus::Idle,
             server_version_check_requested: false,
             server_update_requested: false,
+            tui3_update: crate::update::Status::default(),
             dictation: Default::default(),
             editor: Default::default(),
             git: Default::default(),
@@ -2500,7 +2502,10 @@ impl App {
         self.layout_preset = preset;
         self.layout_highlight = preset;
         self.workspace_width = preset.workspace_width();
-        self.workspace_visible = true;
+        self.workspace_visible = preset.workspace_visible();
+        if !self.workspace_visible && matches!(self.focus, Focus::Workspace | Focus::WorkspaceTabs) {
+            self.focus = Focus::Chat;
+        }
     }
 }
 

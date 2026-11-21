@@ -2451,6 +2451,19 @@ mod tests {
             crate::preferences::LayoutPreset::EditorFocused
         );
         assert_eq!(app.workspace_width, 50);
+        assert!(app.workspace_visible);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_highlight,
+            crate::preferences::LayoutPreset::ChatOnly
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.layout_preset,
+            crate::preferences::LayoutPreset::ChatOnly
+        );
+        assert!(!app.workspace_visible);
     }
 
     #[test]

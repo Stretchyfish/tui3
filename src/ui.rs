@@ -17,14 +17,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    frame.render_widget(
-        Paragraph::new(format!(
-            " tui3 | {} | {}",
-            app.connection, app.startup.event.message
-        ))
-        .bold(),
-        header,
-    );
+    if let crate::update::Status::Available { version, .. } = &app.tui3_update {
+        let badge = format!(" Update available: tui3 v{version} (s: Settings) ");
+        let [left_header, right_header] = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(badge.chars().count() as u16),
+        ])
+        .areas(header);
+        frame.render_widget(
+            Paragraph::new(format!(
+                " tui3 | {} | {}",
+                app.connection, app.startup.event.message
+            ))
+            .bold(),
+            left_header,
+        );
+        frame.render_widget(
+            Paragraph::new(badge)
+                .style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .bold(),
+                )
+                .right_aligned(),
+            right_header,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " tui3 | {} | {}",
+                app.connection, app.startup.event.message
+            ))
+            .bold(),
+            header,
+        );
+    }
     let narrow = body.width < 100;
     let show_workspace = app.workspace_visible && !narrow;
     let (sidebar, main, workspace) = if show_workspace {
@@ -1353,7 +1381,7 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         );
     }
     frame.render_widget(Paragraph::new("Layout preset"), layout_heading);
-    let layout_options = Layout::horizontal([Constraint::Ratio(1, 3); 3])
+    let layout_options = Layout::horizontal([Constraint::Ratio(1, 4); 4])
         .spacing(1)
         .split(layout_selector);
     use crate::preferences::LayoutPreset;
@@ -1361,6 +1389,7 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         LayoutPreset::Balanced,
         LayoutPreset::Default,
         LayoutPreset::EditorFocused,
+        LayoutPreset::ChatOnly,
     ]
     .into_iter()
     .zip(layout_options.iter())
@@ -1399,9 +1428,17 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         .current_model()
         .map(|model| model.model.as_str())
         .unwrap_or("No thread selected");
+    let update_note = match &app.tui3_update {
+        crate::update::Status::Available { version, .. } => format!(
+            "\n\ntui3 update available (v{} → v{version})\n{}",
+            crate::update::CURRENT_VERSION,
+            crate::update::INSTALL_CMD
+        ),
+        _ => format!("\n\ntui3 v{}", crate::update::CURRENT_VERSION),
+    };
     let content = format!(
-        "↑↓/jk: setting · ←→/hl: highlight · Enter: apply\nBlue: highlighted; green: active. Saved automatically.\nVim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}",
-        app.connection, model,
+        "↑↓/jk: setting · ←→/hl: highlight · Enter: apply\nBlue: highlighted; green: active. Saved automatically.\nVim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}{}",
+        app.connection, model, update_note,
     );
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), details);
 }
@@ -2160,7 +2197,8 @@ mod tests {
             vec![
                 crate::preferences::LayoutPreset::Balanced,
                 crate::preferences::LayoutPreset::Default,
-                crate::preferences::LayoutPreset::EditorFocused
+                crate::preferences::LayoutPreset::EditorFocused,
+                crate::preferences::LayoutPreset::ChatOnly,
             ]
         );
     }

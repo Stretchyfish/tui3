@@ -326,6 +326,97 @@ async fn running(client: &reqwest::Client, target: &Target) -> bool {
         _ => false,
     }
 }
+fn desktop_last_started_version(state: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(state.join("desktop-last-started-version")).ok()?;
+    let trimmed = text.trim().trim_start_matches('v');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn parse_cli_version(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        let trimmed = token.trim_start_matches('v');
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        (parts.len() >= 2 && parts.iter().take(3).all(|p| p.parse::<u64>().is_ok()))
+            .then(|| trimmed.to_owned())
+    })
+}
+
+fn parse_semver_tuple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.trim().trim_start_matches('v').split('-').next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn is_older_version(installed: &str, expected: &str) -> bool {
+    match (parse_semver_tuple(installed), parse_semver_tuple(expected)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
+async fn cli_version(cli: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new(cli);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_cli_version(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+async fn sync_cli_to_desktop_version(
+    cli: &Path,
+    target: &Target,
+    updates: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    let Some(desktop_version) = desktop_last_started_version(&target.state) else {
+        return Ok(());
+    };
+    let Some(installed_version) = cli_version(cli).await else {
+        return Ok(());
+    };
+    if !is_older_version(&installed_version, &desktop_version) {
+        return Ok(());
+    }
+    let base = target.base()?;
+    let _ = updates.send(event(
+        &format!("Updating T3 CLI ({installed_version} → {desktop_version})…"),
+        "The T3 Code desktop app updated local provider/speech data to a newer version. Updating the standalone CLI so Gemini models and dictation stay compatible.",
+        Offer::None,
+        true,
+    ));
+    let mut command = tokio::process::Command::new(cli);
+    command
+        .args(["update", "--yes", "--base-dir"])
+        .arg(base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(180), command.status())
+        .await
+        .map_err(|_| format!("Timed out updating T3 CLI from {installed_version} to {desktop_version}. Run `t3 update` in a terminal."))?
+        .map_err(|_| format!("Could not run `t3 update` to match desktop v{desktop_version}."))?;
+    if !status.success() {
+        return Err(format!(
+            "T3 CLI is v{installed_version}, which is older than desktop v{desktop_version}. Run `t3 update` in a terminal so Gemini models and dictation work when the desktop app is closed."
+        ));
+    }
+    Ok(())
+}
+
 fn start_command(cli: &Path, target: &Target) -> Result<tokio::process::Command, String> {
     if target.remote || target.origin.scheme() != "http" {
         return Err("Automatic startup only supports a local HTTP server.".into());
@@ -526,8 +617,12 @@ pub fn spawn(runtime: &tokio::runtime::Runtime, auto_start: bool) -> Backend {
                     let pid = runtime_server_pid(&target);
                     return Ok(event_with_pid("T3 CLI installed", "The running server was reused. Connect to save your local pairing session.", Offer::Pair, false, pid));
                 }
-                let Some(cli) = cli else { return Ok(event("T3 CLI/server is not installed", "Install the official T3 CLI for this user, then start its local server. No system service will be installed. Download source: https://t3.codes", Offer::Install, false)); };
+                let Some(mut cli) = cli else { return Ok(event("T3 CLI/server is not installed", "Install the official T3 CLI for this user, then start its local server. No system service will be installed. Download source: https://t3.codes", Offer::Install, false)); };
                 if matches!(next, Command::Start | Command::Install) || *settings.borrow() {
+                    sync_cli_to_desktop_version(&cli, &target, &sender).await?;
+                    if let Some(updated_cli) = cli_path() {
+                        cli = updated_cli;
+                    }
                     let _ = sender.send(event("T3 is not running. Starting it…", "Launching a local, loopback-only T3 server without opening a browser.", Offer::None, true));
                     let pid = start_local(&client, &target, &cli).await?;
                     Ok(event_with_pid("T3 is ready", "Connect to save a local pairing session without copying tokens.", Offer::Pair, false, pid))
@@ -864,5 +959,14 @@ server.server_close()
             )));
         }
         assert!(app.startup.request.is_none());
+    }
+
+    #[test]
+    fn detects_cli_older_than_desktop_version() {
+        assert_eq!(parse_cli_version("t3 v0.1.7\n").as_deref(), Some("0.1.7"));
+        assert_eq!(parse_cli_version("0.1.11").as_deref(), Some("0.1.11"));
+        assert!(is_older_version("0.1.7", "0.1.11"));
+        assert!(!is_older_version("0.1.11", "0.1.11"));
+        assert!(!is_older_version("0.2.0", "0.1.11"));
     }
 }

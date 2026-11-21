@@ -37,6 +37,7 @@ pub enum LayoutPreset {
     Balanced,
     Default,
     EditorFocused,
+    ChatOnly,
 }
 
 impl LayoutPreset {
@@ -45,13 +46,18 @@ impl LayoutPreset {
             Self::Balanced => "Balanced",
             Self::Default => "Chat-focused",
             Self::EditorFocused => "Editor-focused",
+            Self::ChatOnly => "Chat only",
         }
+    }
+
+    pub fn workspace_visible(self) -> bool {
+        !matches!(self, Self::ChatOnly)
     }
 
     pub fn workspace_width(self) -> u16 {
         match self {
             Self::Balanced => 40,
-            Self::Default => 32,
+            Self::Default | Self::ChatOnly => 32,
             Self::EditorFocused => 50,
         }
     }
@@ -59,8 +65,9 @@ impl LayoutPreset {
     pub fn cycle(self, forward: bool) -> Self {
         match (self, forward) {
             (Self::Balanced, true) | (Self::EditorFocused, false) => Self::Default,
-            (Self::Default, true) | (Self::Balanced, false) => Self::EditorFocused,
-            _ => Self::Balanced,
+            (Self::Default, true) | (Self::ChatOnly, false) => Self::EditorFocused,
+            (Self::EditorFocused, true) | (Self::Balanced, false) => Self::ChatOnly,
+            (Self::ChatOnly, true) | (Self::Default, false) => Self::Balanced,
         }
     }
 }
@@ -236,6 +243,7 @@ mod tests {
             ("default", LayoutPreset::Default),
             ("editor-focused", LayoutPreset::EditorFocused),
             ("balanced", LayoutPreset::Balanced),
+            ("chat-only", LayoutPreset::ChatOnly),
         ] {
             let preferences: Preferences =
                 serde_json::from_value(serde_json::json!({"layout_preset": saved})).unwrap();

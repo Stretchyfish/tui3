@@ -18,6 +18,7 @@ mod preferences;
 mod startup;
 mod t3;
 mod ui;
+mod update;
 mod usage;
 
 use crossterm::{
@@ -35,6 +36,7 @@ fn main() -> io::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut resume = preferences::ResumeStore::load();
     let startup = startup::spawn(&runtime, resume.auto_start_t3());
+    let app_updates = update::spawn(&runtime);
     let backend = t3::start(&runtime);
     let mut terminal = ratatui::init();
     let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
@@ -56,7 +58,7 @@ fn main() -> io::Result<()> {
             terminal.backend_mut(),
             crossterm::style::Print("\x1b[?1003h\x1b[?1002h\x1b[?1000h")
         )?;
-        run(&mut terminal, backend, &mut resume, startup)
+        run(&mut terminal, backend, &mut resume, startup, app_updates)
     });
     if keyboard_enhanced {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
@@ -83,6 +85,7 @@ fn run(
     backend: t3::Backend,
     resume: &mut preferences::ResumeStore,
     startup: startup::Backend,
+    app_updates: std::sync::mpsc::Receiver<update::Status>,
 ) -> io::Result<Option<u32>> {
     let layout_preset = resume.layout_preset();
     let mut app = app::App {
@@ -90,6 +93,7 @@ fn run(
         auto_start_t3: resume.auto_start_t3(),
         layout_preset,
         layout_highlight: layout_preset,
+        workspace_visible: layout_preset.workspace_visible(),
         workspace_width: layout_preset.workspace_width(),
         check_other_instances: Some(startup::other_tui3_instances_running),
         ..app::App::default()
@@ -190,6 +194,9 @@ fn run(
                     let _ = sender.send((thread, generation, clipboard::image()));
                 });
             }
+        }
+        while let Ok(status) = app_updates.try_recv() {
+            app.tui3_update = status;
         }
         while let Ok(event) = startup.updates.try_recv() {
             if !event.busy {
