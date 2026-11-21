@@ -7,9 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,10 +47,103 @@ impl Request {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphLine {
+    pub graph: String,
+    pub hash: String,
+    pub date: String,
+    pub refs: String,
+    pub subject: String,
+}
+
+impl GraphLine {
+    pub fn is_commit(&self) -> bool {
+        !self.hash.is_empty()
+    }
+}
+
+pub fn parse_graph(output: &str) -> Vec<GraphLine> {
+    let raw: Vec<GraphLine> = output
+        .lines()
+        .map(|line| {
+            let mut parts = line.split('\x1f');
+            let graph = parts.next().unwrap_or_default().to_owned();
+            let hash = parts.next().unwrap_or_default().trim().to_owned();
+            let date = parts.next().unwrap_or_default().trim().to_owned();
+            let refs = parts.next().unwrap_or_default().trim().to_owned();
+            let subject = parts.next().unwrap_or_default().trim().to_owned();
+            GraphLine {
+                graph,
+                hash,
+                date,
+                refs,
+                subject,
+            }
+        })
+        .collect();
+    let mut spaced = Vec::with_capacity(raw.len() * 2);
+    for (idx, line) in raw.iter().enumerate() {
+        let is_commit = line.is_commit();
+        let next_is_commit = raw.get(idx + 1).is_some_and(GraphLine::is_commit);
+        spaced.push(line.clone());
+        if is_commit && next_is_commit {
+            let connector: String = line
+                .graph
+                .chars()
+                .map(|ch| if ch == '*' { '|' } else { ch })
+                .collect();
+            spaced.push(GraphLine {
+                graph: connector,
+                hash: String::new(),
+                date: String::new(),
+                refs: String::new(),
+                subject: String::new(),
+            });
+        }
+    }
+    spaced
+}
+
+pub async fn load_graph(cwd: &str) -> Vec<GraphLine> {
+    if !std::path::Path::new(cwd).exists() {
+        return Vec::new();
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args([
+            "-C",
+            cwd,
+            "log",
+            "--graph",
+            "--branches",
+            "--tags",
+            "--remotes",
+            "HEAD",
+            "--topo-order",
+            "--max-count=80",
+            "--date=short",
+            "--format=%x1f%h%x1f%ad%x1f%d%x1f%s",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(Ok(output)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_graph(&String::from_utf8_lossy(&output.stdout))
+}
+
 pub struct Snapshot {
     pub generated_message: Option<String>,
     pub status: Status,
     pub branches: Vec<String>,
+    pub graph: Vec<GraphLine>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +195,10 @@ pub struct GitState {
     pub confirm: Option<Operation>,
     pub refreshed: Option<std::time::Instant>,
     pub generator: crate::commit_message::Target,
+    pub graph_focus: bool,
+    pub graph_selected: usize,
+    pub graph_scroll: usize,
+    pub graph_area: Rect,
 }
 impl GitState {
     pub fn has_modal(&self) -> bool {
@@ -185,6 +282,73 @@ impl GitState {
         } else {
             self.message_scroll.saturating_sub(rows)
         };
+    }
+
+    pub fn scroll_graph(&mut self, down: bool, rows: usize) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if snapshot.graph.is_empty() {
+            return;
+        }
+        let max_scroll = snapshot.graph.len().saturating_sub(1);
+        self.graph_scroll = if down {
+            self.graph_scroll.saturating_add(rows).min(max_scroll)
+        } else {
+            self.graph_scroll.saturating_sub(rows)
+        };
+    }
+
+    pub fn move_graph_selection(&mut self, down: bool, steps: usize) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return false;
+        };
+        let commits: Vec<usize> = snapshot
+            .graph
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.is_commit().then_some(idx))
+            .collect();
+        if commits.is_empty() {
+            return false;
+        }
+        let current_pos = commits
+            .iter()
+            .position(|&idx| idx == self.graph_selected)
+            .unwrap_or_else(|| {
+                commits
+                    .iter()
+                    .position(|&idx| idx >= self.graph_selected)
+                    .unwrap_or(commits.len() - 1)
+            });
+        let next_pos = if down {
+            (current_pos + steps).min(commits.len() - 1)
+        } else {
+            current_pos.saturating_sub(steps)
+        };
+        let changed = commits[next_pos] != self.graph_selected;
+        self.graph_selected = commits[next_pos];
+        changed
+    }
+
+    pub fn select_first_graph_commit(&mut self) {
+        if let Some(idx) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.graph.iter().position(GraphLine::is_commit))
+        {
+            self.graph_selected = idx;
+        }
+    }
+
+    pub fn select_last_graph_commit(&mut self) {
+        if let Some(idx) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.graph.iter().rposition(GraphLine::is_commit))
+        {
+            self.graph_selected = idx;
+        }
     }
 
     pub fn queue(&mut self, operation: Operation) {
@@ -463,9 +627,46 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
     if git.pending.is_some() {
         return false;
     }
+    if git.graph_focus {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Tab | KeyCode::BackTab => {
+                git.graph_focus = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !git.move_graph_selection(false, 1) {
+                    return false;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                git.move_graph_selection(true, 1);
+            }
+            KeyCode::PageUp => {
+                git.move_graph_selection(false, 10);
+            }
+            KeyCode::PageDown => {
+                git.move_graph_selection(true, 10);
+            }
+            KeyCode::Home => git.select_first_graph_commit(),
+            KeyCode::End => git.select_last_graph_commit(),
+            KeyCode::Char('r') => git.queue(Operation::Refresh),
+            _ => return false,
+        }
+        return true;
+    }
     match key.code {
         KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
         KeyCode::Char('r') => git.queue(Operation::Refresh),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab | KeyCode::BackTab => {
+            git.graph_focus = true;
+            if git
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.graph.get(git.graph_selected))
+                .is_none_or(|line| !line.is_commit())
+            {
+                git.select_first_graph_commit();
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') if git.row > 0 => git.row -= 1,
         KeyCode::Down | KeyCode::Char('j') => git.row = 1,
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -498,21 +699,30 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (left_area, graph_area) = if area.width >= 52 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
+                .areas(area);
+        (left, right)
+    } else {
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
+        (top, bottom)
+    };
     let git = &app.git;
-    let inner = area;
     let branch = git
         .snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.status.ref_name.as_deref())
         .unwrap_or("detached / unknown");
     let [controls, details] =
-        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(inner);
+        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(left_area);
     let rows = Layout::vertical([Constraint::Length(3); 2]).split(controls);
     let labels = [branch.to_owned(), MODES[git.mode.min(2)].to_owned()];
     for (index, rect) in rows.iter().enumerate() {
         let block = crate::ui::panel(
             if index == 0 { " Branch " } else { " Mode " },
-            app.focus == Focus::Workspace && git.row == index,
+            app.focus == Focus::Workspace && !git.graph_focus && git.row == index,
         );
         let inner = block.inner(*rect);
         frame.render_widget(block, *rect);
@@ -611,6 +821,277 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         details,
     );
+    draw_graph(frame, app, graph_area, area.width >= 52);
+}
+
+fn draw_graph(frame: &mut Frame, app: &mut App, area: Rect, side_by_side: bool) {
+    if area.width == 0 || area.height < 3 {
+        return;
+    }
+    let focused = app.focus == Focus::Workspace && app.git.graph_focus;
+    let border_color = if focused { Color::Blue } else { Color::DarkGray };
+    let outer = Block::default()
+        .borders(if side_by_side {
+            Borders::LEFT
+        } else {
+            Borders::TOP
+        })
+        .border_style(Style::default().fg(border_color));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    app.git.graph_area = inner;
+    app.click_targets
+        .push((area, crate::app::ClickTarget::GitGraph));
+    if inner.height < 3 || inner.width == 0 {
+        return;
+    }
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(border_color));
+    let header_inner = header_block.inner(header_area);
+    frame.render_widget(header_block, header_area);
+    frame.render_widget(
+        Paragraph::new(" Commit tree").style(
+            Style::default()
+                .fg(if focused { Color::Cyan } else { Color::White })
+                .add_modifier(Modifier::BOLD),
+        ),
+        header_inner,
+    );
+
+    let Some(snapshot) = &app.git.snapshot else {
+        frame.render_widget(
+            Paragraph::new(" Loading history…").style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    };
+    if !snapshot.status.is_repo || snapshot.graph.is_empty() {
+        let message = if !snapshot.status.is_repo {
+            " Not a Git repository."
+        } else {
+            " No commits to display."
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let selected_commit = if focused {
+        snapshot
+            .graph
+            .get(app.git.graph_selected)
+            .filter(|line| line.is_commit())
+            .or_else(|| snapshot.graph.iter().find(|line| line.is_commit()))
+    } else {
+        None
+    };
+    let detail_height = if selected_commit.is_some() && list_area.height >= 8 {
+        5
+    } else {
+        0
+    };
+    let [tree_area, detail_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(detail_height)]).areas(list_area);
+
+    let visible = tree_area.height as usize;
+    if focused && visible > 0 {
+        if app.git.graph_selected < app.git.graph_scroll {
+            app.git.graph_scroll = app.git.graph_selected;
+        } else if app.git.graph_selected >= app.git.graph_scroll + visible {
+            app.git.graph_scroll = app.git.graph_selected + 1 - visible;
+        }
+    }
+    let max_scroll = snapshot.graph.len().saturating_sub(visible);
+    app.git.graph_scroll = app.git.graph_scroll.min(max_scroll);
+    let lanes = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Blue,
+    ];
+    let rows: Vec<Line<'static>> = snapshot
+        .graph
+        .iter()
+        .enumerate()
+        .skip(app.git.graph_scroll)
+        .take(visible)
+        .map(|(index, entry)| {
+            let is_selected = focused && entry.is_commit() && index == app.git.graph_selected;
+            let mut spans = vec![Span::styled(
+                if is_selected { " ▸ " } else { "   " },
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            let chars: Vec<char> = entry.graph.chars().collect();
+            for (col, &ch) in chars.iter().enumerate() {
+                if ch == ' ' {
+                    spans.push(Span::raw(" "));
+                } else {
+                    let color = lanes[(col / 2) % lanes.len()];
+                    let prev = col.checked_sub(1).and_then(|i| chars.get(i)).copied();
+                    let symbol = match ch {
+                        '*' if is_selected => '◉',
+                        '*' => '●',
+                        '|' => '│',
+                        '/' if prev == Some('|') => '╯',
+                        '/' => '╱',
+                        '\\' if prev == Some('|') => '╮',
+                        '\\' => '╲',
+                        '_' | '-' => '─',
+                        other => other,
+                    };
+                    let mut style = Style::default().fg(if is_selected && ch == '*' {
+                        Color::White
+                    } else {
+                        color
+                    });
+                    if ch == '*' {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    spans.push(Span::styled(symbol.to_string(), style));
+                }
+            }
+            if !entry.refs.is_empty() {
+                spans.extend(format_ref_spans(&entry.refs));
+            }
+            if !entry.subject.is_empty() {
+                let used: usize = spans
+                    .iter()
+                    .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum();
+                let budget = (tree_area.width as usize).saturating_sub(used + 2);
+                if budget >= 4 {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        preview_subject(&entry.subject, budget),
+                        Style::default().fg(if is_selected {
+                            Color::White
+                        } else {
+                            Color::Gray
+                        }),
+                    ));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(rows)), tree_area);
+
+    if let Some(commit) = selected_commit
+        && detail_area.height > 0
+    {
+        let detail_block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Blue));
+        let detail_inner = detail_block.inner(detail_area);
+        frame.render_widget(detail_block, detail_area);
+        let mut meta = vec![
+            Span::styled(" ◉ ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                commit.hash.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !commit.date.is_empty() {
+            meta.push(Span::styled(
+                format!(" · {}", commit.date),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let detail_lines = vec![
+            Line::from(meta),
+            Line::styled(
+                format!(" {}", commit.subject),
+                Style::default().fg(Color::White),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(Text::from(detail_lines)).wrap(Wrap { trim: false }),
+            detail_inner,
+        );
+    }
+}
+
+fn preview_subject(subject: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    let mut out = String::new();
+    let mut chars = subject.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ch_width = ch.width().unwrap_or(0);
+        let has_more = chars.peek().is_some();
+        if width + ch_width + usize::from(has_more) > max_width {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
+}
+
+fn format_ref_spans(raw: &str) -> Vec<Span<'static>> {
+    let trimmed = raw
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(raw.trim());
+    let mut spans = Vec::new();
+    for part in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part.ends_with("/HEAD") {
+            continue;
+        }
+        if let Some(branch) = part.strip_prefix("HEAD -> ") {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!(" {branch} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if part == "HEAD" {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                " HEAD ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(tag) = part.strip_prefix("tag: ") {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("#{tag}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if part.contains('/') {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                part.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!(" {part} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    spans
 }
 
 pub fn draw_modal(frame: &mut Frame, app: &mut App) {
@@ -904,6 +1385,7 @@ pub(crate) mod tests {
             generated_message: Some("Add word navigation to the composer".into()),
             status: serde_json::from_value(status()).unwrap(),
             branches: vec!["main".into(), "feature".into()],
+            graph: Vec::new(),
         });
         app
     }
@@ -986,6 +1468,7 @@ pub(crate) mod tests {
                 generated_message: Some("Add word navigation to the composer".into()),
                 status: serde_json::from_value(status()).unwrap(),
                 branches: vec![],
+                graph: Vec::new(),
             }),
         );
         assert_eq!(app.git.message, "Add word navigation to the composer");
@@ -999,6 +1482,7 @@ pub(crate) mod tests {
                 generated_message: Some("Add word navigation to the composer".into()),
                 status: serde_json::from_value(status()).unwrap(),
                 branches: vec![],
+                graph: Vec::new(),
             }),
         );
         assert_eq!(app.git.message, "My newer draft");
@@ -1058,6 +1542,7 @@ pub(crate) mod tests {
                 generated_message: None,
                 status: serde_json::from_value(status()).unwrap(),
                 branches: vec!["main".into()],
+                graph: Vec::new(),
             }),
         );
         assert!(!app.git.commit_modal);
@@ -1116,5 +1601,32 @@ pub(crate) mod tests {
         };
         app.git.finish(&old, Err("old error".into()));
         assert!(app.git.error.is_none());
+    }
+
+    #[test]
+    fn parse_graph_handles_commits_branches_and_merges() {
+        let raw = "* \x1fa1b2c3d\x1f2026-11-21\x1f (HEAD -> main)\x1fMerge branch 'feat'\n|\\\n| * \x1f9876543\x1f2026-11-20\x1f (feat)\x1fImplement commit tree\n|/\n* \x1f0123456\x1f2026-11-19\x1f\x1fInitial commit\n";
+        let lines = parse_graph(raw);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].graph, "* ");
+        assert_eq!(lines[0].hash, "a1b2c3d");
+        assert_eq!(lines[0].date, "2026-11-21");
+        assert_eq!(lines[0].refs, "(HEAD -> main)");
+        assert_eq!(lines[0].subject, "Merge branch 'feat'");
+        assert_eq!(lines[1].graph, "|\\");
+        assert!(!lines[1].is_commit());
+        assert_eq!(lines[2].refs, "(feat)");
+        assert_eq!(lines[4].subject, "Initial commit");
+
+        let mut app = ready();
+        app.git.snapshot.as_mut().unwrap().graph = lines;
+        app.git.graph_focus = true;
+        app.git.graph_selected = 0;
+        assert!(app.git.move_graph_selection(true, 1));
+        assert_eq!(app.git.graph_selected, 2); // skips connector row 1
+        assert!(app.git.move_graph_selection(true, 1));
+        assert_eq!(app.git.graph_selected, 4); // skips connector row 3
+        assert!(app.git.move_graph_selection(false, 1));
+        assert_eq!(app.git.graph_selected, 2);
     }
 }

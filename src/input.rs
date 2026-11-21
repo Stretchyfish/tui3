@@ -174,6 +174,10 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.diff_view
                 .scroll(mouse.kind == MouseEventKind::ScrollDown, 3);
         }
+        if matches!(target, Some(ClickTarget::GitGraph)) {
+            app.git
+                .scroll_graph(mouse.kind == MouseEventKind::ScrollDown, 3);
+        }
         return;
     }
     match target {
@@ -257,8 +261,24 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         Some(ClickTarget::GitControl(index)) => {
             app.editing = false;
             app.focus = Focus::Workspace;
+            app.git.graph_focus = false;
             app.git.row = index;
             crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        Some(ClickTarget::GitGraph) => {
+            app.editing = false;
+            app.focus = Focus::Workspace;
+            app.workspace_tab = 3;
+            app.git.graph_focus = true;
+            if app
+                .git
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.graph.get(app.git.graph_selected))
+                .is_none_or(|line| !line.is_commit())
+            {
+                app.git.select_first_graph_commit();
+            }
         }
         Some(ClickTarget::EditorEntry(index)) => {
             app.editing = false;

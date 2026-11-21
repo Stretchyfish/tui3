@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{ffi::OsStr, process::Stdio, time::Duration};
 use tokio::io::AsyncWriteExt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     Codex,
     Antigravity,
@@ -14,6 +14,27 @@ pub enum Provider {
 pub struct Target {
     pub provider: Option<Provider>,
     pub model: Option<String>,
+}
+
+pub fn antigravity_cli_model(model: &str, thought_level: Option<&str>) -> String {
+    // T3 stores the base model and thinking level separately. agy lists the
+    // thinking level as part of the model ID (for example gemini-4-neon-medium).
+    let level = thought_level
+        .filter(|level| matches!(*level, "low" | "medium" | "high" | "xhigh"))
+        .unwrap_or("medium");
+    let already_suffixed = ["low", "medium", "high", "xhigh"]
+        .iter()
+        .any(|suffix| model.ends_with(&format!("-{suffix}")));
+    match model {
+        model
+            if model.starts_with("gemini-")
+                && !model.contains("orchestrator")
+                && !already_suffixed =>
+        {
+            format!("{model}-{level}")
+        }
+        _ => model.to_owned(),
+    }
 }
 
 pub fn prompt(branch: Option<&str>, files: &[crate::git::File], patch: &str) -> String {
@@ -210,7 +231,6 @@ async fn generate_using_antigravity(
     let mut command = tokio::process::Command::new(executable);
     command
         .args([
-            "--print",
             "--output-format",
             "json",
             "--sandbox",
@@ -222,26 +242,18 @@ async fn generate_using_antigravity(
         command.arg("--model").arg(model);
     }
     command
+        .arg(format!("--print={prompt}"))
         .current_dir(directory.path())
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     scrub_t3_env(&mut command);
-    let mut child = command.spawn().map_err(|_| {
+    let child = command.spawn().map_err(|_| {
         "Cannot start Antigravity (agy). Install the agy CLI and sign in to generate commit messages."
             .to_owned()
     })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("Cannot open commit generator input.")?;
     let run = async {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|_| "Cannot send diff to commit generator.".to_owned())?;
-        drop(stdin);
         let output = child
             .wait_with_output()
             .await
@@ -296,26 +308,45 @@ output.write_text(json.dumps({'subject':'Add word navigation to the composer','b
         std::fs::write(&script, r#"#!/usr/bin/env python3
 import json, pathlib, sys
 args = sys.argv
-assert '--print' in args
+assert any(arg.startswith('--print=') and 'scroll_by_word' in arg for arg in args)
 assert args[args.index('--output-format') + 1] == 'json'
 assert '--sandbox' in args and '--disable-slash-commands' in args
-assert args[args.index('--model') + 1] == 'gemini-4-neon'
+assert args[args.index('--model') + 1] == 'gemini-4-neon-medium'
 schema = pathlib.Path(args[args.index('--json-schema') + 1]).read_text()
 assert 'subject' in schema
-assert 'scroll_by_word' in sys.stdin.read()
 print(json.dumps({'result': json.dumps({'subject': 'Support Antigravity commit generation', 'body': '- Pass active Antigravity model to agy CLI'})}))
 "#).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let message = super::generate_using_antigravity(
             "Diff: +fn scroll_by_word() {}",
             script.as_os_str(),
-            Some("gemini-4-neon"),
+            Some("gemini-4-neon-medium"),
         )
         .await
         .unwrap();
         assert_eq!(
             message,
             "Support Antigravity commit generation\n\n- Pass active Antigravity model to agy CLI"
+        );
+    }
+
+    #[test]
+    fn maps_t3_antigravity_selection_to_agy_model_id() {
+        assert_eq!(
+            super::antigravity_cli_model("gemini-4-neon", Some("medium")),
+            "gemini-4-neon-medium"
+        );
+        assert_eq!(
+            super::antigravity_cli_model("gemini-4-neon", None),
+            "gemini-4-neon-medium"
+        );
+        assert_eq!(
+            super::antigravity_cli_model("gemini-4-neon-high", Some("high")),
+            "gemini-4-neon-high"
+        );
+        assert_eq!(
+            super::antigravity_cli_model("gemini-pro-orchestrator-neon", None),
+            "gemini-pro-orchestrator-neon"
         );
     }
 

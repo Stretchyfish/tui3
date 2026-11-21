@@ -3143,6 +3143,7 @@ mod tests {
         let mut app = App {
             focus: Focus::Workspace,
             workspace_tab: 3,
+            workspace_width: 50,
             ..Default::default()
         };
         app.git.cwd = Some("/repo".into());
@@ -3150,8 +3151,11 @@ mod tests {
             generated_message: None,
             status: serde_json::from_value(crate::git::tests::status()).unwrap(),
             branches: vec!["main".into()],
+            graph: crate::git::parse_graph(
+                "* \x1fa1b2c3d\x1f2026-11-21\x1f (HEAD -> main)\x1fMerge branch 'feature'\n|\\\n| * \x1f9876543\x1f2026-11-20\x1f (feature)\x1fAdd git tree\n|/\n",
+            ),
         });
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()
@@ -3165,7 +3169,25 @@ mod tests {
         assert!(text.contains("Mode"));
         assert!(text.contains("▾"));
         assert!(text.contains("Commit & Push"));
+        assert!(text.contains("Commit tree"));
+        assert!(text.contains("●"));
+        assert!(text.contains("Add git tree"));
+        assert!(!text.contains("a1b2c3d"));
         assert!(text.contains("Push"));
+
+        app.git.graph_focus = true;
+        app.git.graph_selected = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("a1b2c3d"));
+        assert!(text.contains("2026-11-21"));
+        assert!(text.contains("Merge branch 'feature'"));
         assert!(!text.contains("Generate commit message"));
 
         app.git.commit_modal = true;

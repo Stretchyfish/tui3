@@ -119,6 +119,7 @@ pub enum ClickTarget {
     SlashCommand(usize),
     AutoStart(bool),
     GitControl(usize),
+    GitGraph,
     GitModeOption(usize),
     GitBranchOption(usize),
     GitMessage,
@@ -1236,15 +1237,11 @@ impl App {
         let Some(selection) = self.current_model() else {
             return crate::commit_message::Target::default();
         };
-        let driver = self
-            .models
-            .choices
-            .iter()
-            .find(|choice| {
-                choice.selection.instance_id == selection.instance_id
-                    && choice.selection.model == selection.model
-            })
-            .map(|choice| choice.driver.as_str());
+        let choice = self.models.choices.iter().find(|choice| {
+            choice.selection.instance_id == selection.instance_id
+                && choice.selection.model == selection.model
+        });
+        let driver = choice.map(|choice| choice.driver.as_str());
         let instance = selection.instance_id.to_ascii_lowercase();
         let model = selection.model.to_ascii_lowercase();
         let provider = if driver == Some("antigravity")
@@ -1259,7 +1256,18 @@ impl App {
         };
         crate::commit_message::Target {
             provider,
-            model: Some(selection.model.clone()),
+            model: Some(
+                if provider == Some(crate::commit_message::Provider::Antigravity) {
+                    crate::commit_message::antigravity_cli_model(
+                        &selection.model,
+                        selection
+                            .option_value("thought_level")
+                            .or_else(|| choice.and_then(|choice| choice.reasoning_value())),
+                    )
+                } else {
+                    selection.model.clone()
+                },
+            ),
         }
     }
 

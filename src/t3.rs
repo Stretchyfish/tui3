@@ -777,10 +777,16 @@ impl T3Client {
         } else {
             None
         };
+        let graph = if status.is_repo {
+            crate::git::load_graph(&request.cwd).await
+        } else {
+            Vec::new()
+        };
         Ok(crate::git::Snapshot {
             status,
             branches,
             generated_message,
+            graph,
         })
     }
 

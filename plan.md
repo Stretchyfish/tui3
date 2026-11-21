@@ -171,6 +171,7 @@ between workspace tools. Build each feature incrementally.
 - [x] Show repository status, current branch, ahead/behind counts, and changed files.
 - [x] Choose local branches and commit all changes with a message or push, with deliberate keyboard submission and asynchronous progress/error handling.
 - [x] Generate an editable AI commit subject/body from T3's actual working-tree diff using the installed Codex CLI, preserving drafts on failure.
+- [x] Generate commit messages with the signed-in Antigravity CLI using the selected Gemini model and thinking level; verify the real CLI invocation and draft parsing.
 - [ ] Revisit commit-message generation to make the flow smoother and support other providers, ideally using T3's configured source-control writer.
 - [x] Extend local pairing for filesystem reads and Git writes, with p in Git to refresh older sessions.
 - [ ] Distinguish staged and unstaged changes if supported by the chosen T3 interface.
