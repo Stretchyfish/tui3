@@ -3,7 +3,7 @@ use crate::{
     app::{App, Focus},
     catalog::Selection,
 };
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -28,6 +28,7 @@ pub struct Request {
     pub id: String,
     pub cwd: String,
     pub operation: Operation,
+    pub generator: crate::commit_message::Target,
 }
 impl Request {
     pub fn payload(&self) -> Value {
@@ -72,6 +73,8 @@ pub struct File {
     pub deletions: u64,
 }
 
+pub const MODES: [&str; 3] = ["Commit & Push", "Commit", "Push"];
+
 #[derive(Default)]
 pub struct GitState {
     pub cwd: Option<String>,
@@ -85,16 +88,105 @@ pub struct GitState {
     pub commit_push: bool,
     pub commit_row: usize,
     pub message: String,
+    pub message_scroll: usize,
+    pub message_follow_end: bool,
+    pub message_area: Rect,
     pub editing: bool,
     pub picking: bool,
+    pub picking_mode: bool,
+    pub mode: usize,
+    pub mode_index: usize,
+    pub files_scroll: usize,
+    pub files_area: Rect,
     pub branch_index: usize,
     pub confirm: Option<Operation>,
     pub refreshed: Option<std::time::Instant>,
+    pub generator: crate::commit_message::Target,
 }
 impl GitState {
     pub fn has_modal(&self) -> bool {
-        self.commit_modal || self.picking || self.confirm.is_some()
+        self.commit_modal || self.picking || self.picking_mode || self.confirm.is_some()
     }
+    pub fn select_mode(&mut self, index: usize) {
+        if index >= MODES.len() || self.pending.is_some() {
+            return;
+        }
+        self.mode = index;
+        self.picking_mode = false;
+        self.error = None;
+        if index == 2 {
+            if !self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status.has_primary_remote)
+            {
+                self.error = Some("No remote configured.".into());
+            } else {
+                self.confirm = Some(Operation::Push);
+            }
+        } else {
+            self.commit_modal = true;
+            self.commit_push = index == 0;
+            self.commit_row = 0;
+            self.message_scroll = 0;
+            self.files_scroll = 0;
+            self.message_follow_end = false;
+            self.editing = false;
+        }
+    }
+
+    fn submit_commit(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let error = if self.message.trim().is_empty() {
+            Some("Enter a commit message first.")
+        } else if !self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status.is_repo)
+        {
+            Some("Not a Git repository.")
+        } else if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status.working_tree.files.is_empty())
+        {
+            Some("No changes to commit.")
+        } else if self.commit_push
+            && !self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status.has_primary_remote)
+        {
+            Some("No remote configured.")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.error = Some(error.into());
+            return;
+        }
+        self.editing = false;
+        self.queue(if self.commit_push {
+            Operation::CommitPush(self.message.trim().into())
+        } else {
+            Operation::Commit(self.message.trim().into())
+        });
+        if self.pending.is_some() {
+            self.commit_modal = false;
+        }
+    }
+
+    pub fn scroll_message(&mut self, down: bool, rows: usize) {
+        self.message_follow_end = false;
+        self.message_scroll = if down {
+            self.message_scroll.saturating_add(rows)
+        } else {
+            self.message_scroll.saturating_sub(rows)
+        };
+    }
+
     pub fn queue(&mut self, operation: Operation) {
         if self.pending.is_some() {
             return;
@@ -113,6 +205,7 @@ impl GitState {
                 id,
                 cwd: cwd.clone(),
                 operation,
+                generator: self.generator.clone(),
             });
         } else {
             self.error =
@@ -133,6 +226,8 @@ impl GitState {
                 {
                     if let Some(message) = &snapshot.generated_message {
                         self.message = message.clone();
+                        self.message_scroll = 0;
+                        self.message_follow_end = false;
                     } else {
                         self.error = Some("No changes to describe.".into());
                     }
@@ -141,6 +236,7 @@ impl GitState {
                 {
                     self.message.clear();
                     self.commit_modal = false;
+                    self.editing = false;
                 }
                 self.notice = match request.operation {
                     Operation::Refresh => String::new(),
@@ -184,12 +280,15 @@ pub fn workspace(app: &App) -> Option<String> {
 
 pub fn sync(app: &mut App) {
     let cwd = workspace(app);
+    let generator = app.commit_generator_target();
     if app.git.cwd != cwd {
         app.git = GitState {
             cwd,
+            generator: generator.clone(),
             ..Default::default()
         };
     }
+    app.git.generator = generator;
     if matches!(app.workspace_tab, 0 | 3)
         && app.authenticated
         && app.git.pending.is_none()
@@ -206,42 +305,41 @@ pub fn sync(app: &mut App) {
 }
 
 pub fn key(app: &mut App, key: KeyEvent) -> bool {
-    if key.code == KeyCode::Char('p')
-        && !app.authenticated
-        && !app.git.has_modal()
-        && !app.git.editing
-    {
-        if !app.pairing_in_progress {
-            app.pairing_requested = true;
-        }
+    if key.kind == crossterm::event::KeyEventKind::Release {
         return true;
     }
     if key.code == KeyCode::Enter && key.kind == crossterm::event::KeyEventKind::Repeat {
         return true;
     }
-    let git = &mut app.git;
-    if git.editing {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => git.editing = false,
-            KeyCode::Backspace => {
-                use unicode_segmentation::UnicodeSegmentation;
-                if let Some((byte, _)) = git.message.grapheme_indices(true).next_back() {
-                    git.message.truncate(byte);
-                }
-            }
-            KeyCode::Char(ch) => git.message.push(ch),
-            _ => (),
+    if key.code == KeyCode::Char('p') && !app.authenticated && !app.git.has_modal() {
+        if !app.pairing_in_progress {
+            app.pairing_requested = true;
         }
         return true;
     }
-    if git.pending.is_some() {
-        return false;
-    }
+    let git = &mut app.git;
     if let Some(operation) = git.confirm.take() {
-        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+        let submit = if matches!(operation, Operation::Push) {
+            key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL)
+        } else {
+            matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+        };
+        if submit && git.pending.is_none() {
             git.queue(operation);
         } else if key.code != KeyCode::Esc {
             git.confirm = Some(operation);
+        }
+        return true;
+    }
+    if git.picking_mode {
+        match key.code {
+            KeyCode::Esc => git.picking_mode = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                git.mode_index = (git.mode_index + 1).min(MODES.len() - 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => git.mode_index = git.mode_index.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char(' ') => git.select_mode(git.mode_index),
+            _ => {}
         }
         return true;
     }
@@ -268,57 +366,108 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
                 }
                 git.picking = false;
             }
-            _ => (),
+            _ => {}
         }
         return true;
     }
-    if git.commit_modal {
+    if git.commit_modal || git.editing {
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            git.submit_commit();
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            git.queue(Operation::Generate(git.message.clone()));
+            return true;
+        }
         match key.code {
-            KeyCode::Esc => git.commit_modal = false,
-            KeyCode::Up | KeyCode::Char('k') if git.commit_row > 0 => {
-                git.commit_row = git.commit_row.saturating_sub(1);
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let down = key.code == KeyCode::PageDown;
+                if git.commit_row == 1 {
+                    git.files_scroll = if down {
+                        git.files_scroll
+                            .saturating_add(git.files_area.height.max(1) as usize)
+                    } else {
+                        git.files_scroll
+                            .saturating_sub(git.files_area.height.max(1) as usize)
+                    };
+                } else {
+                    git.scroll_message(down, git.message_area.height.max(1) as usize);
+                }
+                return true;
             }
-            KeyCode::Down | KeyCode::Char('j') if git.commit_row < 2 => {
-                git.commit_row += 1;
+            KeyCode::Tab | KeyCode::BackTab => {
+                git.commit_row = 1 - git.commit_row.min(1);
+                git.editing = false;
+                return true;
             }
-            KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
-            KeyCode::Char('i') if git.commit_row == 0 => git.editing = true,
-            KeyCode::Enter | KeyCode::Char(' ') => match git.commit_row {
-                0 => git.editing = true,
-                1 => git.queue(Operation::Generate(git.message.clone())),
-                2 if git.message.trim().is_empty() => {
-                    git.error = Some("Enter a commit message first.".into());
+            KeyCode::Home | KeyCode::End if !git.editing => {
+                let value = if key.code == KeyCode::Home {
+                    0
+                } else {
+                    usize::MAX
+                };
+                if git.commit_row == 1 {
+                    git.files_scroll = value;
+                } else {
+                    git.message_scroll = value;
+                    git.message_follow_end = false;
                 }
-                2 if git
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.status.working_tree.files.is_empty()) =>
+                return true;
+            }
+            _ => {}
+        }
+        if git.editing {
+            match key.code {
+                KeyCode::Esc => git.editing = false,
+                KeyCode::Enter => {
+                    git.message.push('\n');
+                    git.message_follow_end = true;
+                }
+                KeyCode::Backspace => {
+                    use unicode_segmentation::UnicodeSegmentation;
+                    if let Some((byte, _)) = git.message.grapheme_indices(true).next_back() {
+                        git.message.truncate(byte);
+                    }
+                    git.message_follow_end = true;
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    git.error = Some("No changes to commit.".into());
+                    git.message.push(ch);
+                    git.message_follow_end = true;
                 }
-                2 if git.commit_push
-                    && !git
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.status.has_primary_remote) =>
-                {
-                    git.error = Some("No remote configured.".into());
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => git.commit_modal = false,
+                KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
+                KeyCode::Enter | KeyCode::Char(' ' | 'i') => {
+                    git.commit_row = 0;
+                    git.editing = true;
+                    git.message_follow_end = true;
                 }
-                2 if git.commit_push => {
-                    git.confirm = Some(Operation::CommitPush(git.message.trim().into()));
+                KeyCode::Up | KeyCode::Char('k') if git.commit_row == 1 => {
+                    git.files_scroll = git.files_scroll.saturating_sub(1)
                 }
-                2 => git.confirm = Some(Operation::Commit(git.message.trim().into())),
-                _ => (),
-            },
-            _ => (),
+                KeyCode::Down | KeyCode::Char('j') if git.commit_row == 1 => {
+                    git.files_scroll = git.files_scroll.saturating_add(1)
+                }
+                _ => {}
+            }
         }
         return true;
+    }
+    if git.pending.is_some() {
+        return false;
     }
     match key.code {
         KeyCode::Char('g') => git.queue(Operation::Generate(git.message.clone())),
         KeyCode::Char('r') => git.queue(Operation::Refresh),
-        KeyCode::Up | KeyCode::Char('k') if git.row > 0 => git.row = git.row.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') if git.row < 3 => git.row += 1,
+        KeyCode::Up | KeyCode::Char('k') if git.row > 0 => git.row -= 1,
+        KeyCode::Down | KeyCode::Char('j') => git.row = 1,
         KeyCode::Enter | KeyCode::Char(' ') => {
             if !git
                 .snapshot
@@ -327,40 +476,20 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
             {
                 return true;
             }
-            match git.row {
-                0 => {
-                    git.picking = true;
-                    git.branch_index = git
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| {
-                            snapshot.branches.iter().position(|name| {
-                                Some(name.as_str()) == snapshot.status.ref_name.as_deref()
-                            })
-                        })
-                        .unwrap_or(0);
-                }
-                1 => {
-                    git.commit_modal = true;
-                    git.commit_push = false;
-                    git.commit_row = 0;
-                    git.editing = false;
-                }
-                2 => {
-                    git.commit_modal = true;
-                    git.commit_push = true;
-                    git.commit_row = 0;
-                    git.editing = false;
-                }
-                3 if !git
+            if git.row == 0 {
+                git.picking = true;
+                git.branch_index = git
                     .snapshot
                     .as_ref()
-                    .is_some_and(|snapshot| snapshot.status.has_primary_remote) =>
-                {
-                    git.error = Some("No remote configured.".into())
-                }
-                3 => git.confirm = Some(Operation::Push),
-                _ => (),
+                    .and_then(|snapshot| {
+                        snapshot.branches.iter().position(|name| {
+                            Some(name.as_str()) == snapshot.status.ref_name.as_deref()
+                        })
+                    })
+                    .unwrap_or(0);
+            } else {
+                git.picking_mode = true;
+                git.mode_index = git.mode;
             }
         }
         _ => return false,
@@ -377,21 +506,22 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|snapshot| snapshot.status.ref_name.as_deref())
         .unwrap_or("detached / unknown");
     let [controls, details] =
-        Layout::vertical([Constraint::Length(12), Constraint::Min(0)]).areas(inner);
-    let rows = Layout::vertical([Constraint::Length(3); 4]).split(controls);
-    let labels = [
-        format!("Branch: {branch}"),
-        "Commit all changes".into(),
-        "Commit & push".into(),
-        "Push".into(),
-    ];
+        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(inner);
+    let rows = Layout::vertical([Constraint::Length(3); 2]).split(controls);
+    let labels = [branch.to_owned(), MODES[git.mode.min(2)].to_owned()];
     for (index, rect) in rows.iter().enumerate() {
+        let block = crate::ui::panel(
+            if index == 0 { " Branch " } else { " Mode " },
+            app.focus == Focus::Workspace && git.row == index,
+        );
+        let inner = block.inner(*rect);
+        frame.render_widget(block, *rect);
+        let [label, arrow] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+        frame.render_widget(Paragraph::new(labels[index].as_str()), label);
         frame.render_widget(
-            Paragraph::new(labels[index].as_str()).block(crate::ui::panel(
-                "",
-                app.focus == Focus::Workspace && git.row == index,
-            )),
-            *rect,
+            Paragraph::new("▾").style(Style::default().fg(Color::Cyan)),
+            arrow,
         );
         app.click_targets
             .push((*rect, crate::app::ClickTarget::GitControl(index)));
@@ -469,10 +599,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     if let Some(error) = &git.error {
-        lines.push(Line::styled(
-            error.clone(),
-            Style::default().fg(Color::Red),
-        ));
+        lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
     }
     if !git.notice.is_empty() {
         lines.push(Line::styled(
@@ -480,31 +607,59 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::Cyan),
         ));
     }
-    lines.push(Line::styled(
-        "↑↓/jk: select · Enter/Space: open · g: generate · r: refresh",
-        Style::default().fg(Color::DarkGray),
-    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         details,
     );
 }
 
-pub fn draw_modal(frame: &mut Frame, app: &App) {
-    let git = &app.git;
+pub fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if app.git.picking_mode {
+        let bounds = frame.area();
+        let width = bounds.width.min(44);
+        let height = bounds.height.min(7);
+        let area = Rect::new(
+            bounds.x + (bounds.width - width) / 2,
+            bounds.y + (bounds.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, area);
+        let block =
+            crate::ui::panel(" Select mode ", true).title_bottom(" Enter: select · Esc: back ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        for (index, label) in MODES.iter().enumerate().take(inner.height as usize) {
+            let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new(*label).style(if app.git.mode_index == index {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                }),
+                row,
+            );
+            app.click_targets
+                .push((row, crate::app::ClickTarget::GitModeOption(index)));
+        }
+        return;
+    }
+
+    let git = &mut app.git;
+    let expanded = git.commit_modal && git.confirm.is_none() && !git.picking;
     if !git.has_modal() {
         return;
     }
     let [_, center, _] = Layout::vertical([
-        Constraint::Percentage(15),
-        Constraint::Percentage(70),
-        Constraint::Percentage(15),
+        Constraint::Percentage(if expanded { 5 } else { 15 }),
+        Constraint::Percentage(if expanded { 90 } else { 70 }),
+        Constraint::Percentage(if expanded { 5 } else { 15 }),
     ])
     .areas(frame.area());
     let [_, area, _] = Layout::horizontal([
-        Constraint::Percentage(15),
-        Constraint::Percentage(70),
-        Constraint::Percentage(15),
+        Constraint::Percentage(if expanded { 5 } else { 15 }),
+        Constraint::Percentage(if expanded { 90 } else { 70 }),
+        Constraint::Percentage(if expanded { 5 } else { 15 }),
     ])
     .areas(center);
     frame.render_widget(Clear, area);
@@ -515,7 +670,11 @@ pub fn draw_modal(frame: &mut Frame, app: &App) {
         .unwrap_or("detached / unknown");
     if let Some(operation) = &git.confirm {
         let block = crate::ui::panel(" Confirm Git action ", true)
-            .title_bottom(" Enter/Space: confirm · Esc: cancel ")
+            .title_bottom(if matches!(operation, Operation::Push) {
+                " Ctrl+Enter: push · Esc: cancel "
+            } else {
+                " Enter/Space: confirm · Esc: cancel "
+            })
             .style(Style::default().bg(Color::Black).fg(Color::White));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -569,6 +728,12 @@ pub fn draw_modal(frame: &mut Frame, app: &App) {
             })
             .collect();
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+        for index in offset..(offset + inner.height as usize).min(branches.len()) {
+            app.click_targets.push((
+                Rect::new(inner.x, inner.y + (index - offset) as u16, inner.width, 1),
+                crate::app::ClickTarget::GitBranchOption(index),
+            ));
+        }
         return;
     }
     let generating = git
@@ -584,21 +749,69 @@ pub fn draw_modal(frame: &mut Frame, app: &App) {
         },
         true,
     )
-        .title_bottom(if git.editing {
-            " Typing commit message · Esc/Enter: done "
-        } else {
-            " ↑↓/jk: field · Enter/i: edit/run · g: generate · Esc: close "
-        })
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+    .title_bottom(if git.editing {
+        " Ctrl+Enter: submit · Esc: stop typing · Ctrl+G: generate "
+    } else {
+        " Ctrl+Enter: submit · Enter/i: type · g: generate · Tab: files/message · Esc: close "
+    })
+    .style(Style::default().bg(Color::Black).fg(Color::White));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [msg_area, gen_area, commit_area, info_area] = Layout::vertical([
-        Constraint::Length(5),
+    let files_count = git
+        .snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.status.working_tree.files.len());
+    let [files_area, msg_area, info_area] = Layout::vertical([
+        Constraint::Length(
+            (files_count as u16)
+                .saturating_add(2)
+                .clamp(3, (inner.height / 3).max(3)),
+        ),
+        Constraint::Min(3),
         Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(0),
     ])
     .areas(inner);
+    let files_title = format!(" Changed files ({files_count}) · all changes ");
+    let files_block = crate::ui::panel(&files_title, git.commit_row == 1);
+    let files_inner = files_block.inner(files_area);
+    git.files_area = files_inner;
+    git.files_scroll = git
+        .files_scroll
+        .min(files_count.saturating_sub(files_inner.height as usize));
+    frame.render_widget(files_block, files_area);
+    if let Some(snapshot) = &git.snapshot {
+        for (row, file) in snapshot
+            .status
+            .working_tree
+            .files
+            .iter()
+            .skip(git.files_scroll)
+            .take(files_inner.height as usize)
+            .enumerate()
+        {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!("{} ", file.path)),
+                    Span::styled(
+                        format!("+{}", file.insertions),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!(" -{}", file.deletions),
+                        Style::default().fg(Color::Red),
+                    ),
+                ])),
+                Rect::new(
+                    files_inner.x,
+                    files_inner.y + row as u16,
+                    files_inner.width,
+                    1,
+                ),
+            );
+        }
+    }
+    app.click_targets
+        .push((files_area, crate::app::ClickTarget::GitFiles));
     let message_block = crate::ui::panel(
         if generating {
             " Commit message · Generating… "
@@ -609,32 +822,53 @@ pub fn draw_modal(frame: &mut Frame, app: &App) {
         },
         git.commit_row == 0,
     );
-    crate::composer::draw(
-        frame,
+    let message_inner = message_block.inner(msg_area);
+    git.message_area = message_inner;
+    app.click_targets
+        .push((msg_area, crate::app::ClickTarget::GitMessage));
+    let (rows, (cursor_row, cursor_column)) = crate::composer::layout(
         &git.message,
         git.message.chars().count(),
-        git.editing,
-        message_block,
-        msg_area,
+        message_inner.width as usize,
     );
-    frame.render_widget(
-        Paragraph::new(if generating {
-            "Generating commit message…"
-        } else {
-            "Generate commit message (g)"
-        })
-        .block(crate::ui::panel("", git.commit_row == 1)),
-        gen_area,
-    );
-    frame.render_widget(
-        Paragraph::new(if git.commit_push {
-            "Commit & push"
-        } else {
-            "Commit all changes"
-        })
-        .block(crate::ui::panel("", git.commit_row == 2)),
-        commit_area,
-    );
+    let max_scroll = rows.len().saturating_sub(message_inner.height as usize);
+    git.message_scroll = if git.editing && git.message_follow_end {
+        max_scroll
+    } else {
+        git.message_scroll.min(max_scroll)
+    };
+    let message_block = message_block.title_bottom(Line::styled(
+        format!(
+            " {}–{} / {} · wheel to scroll ",
+            if rows.is_empty() {
+                0
+            } else {
+                git.message_scroll + 1
+            },
+            (git.message_scroll + message_inner.height as usize).min(rows.len()),
+            rows.len()
+        ),
+        Style::default().fg(Color::Blue),
+    ));
+    frame.render_widget(message_block, msg_area);
+    let visible = rows
+        .into_iter()
+        .skip(git.message_scroll)
+        .take(message_inner.height as usize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(Paragraph::new(visible), message_inner);
+    if git.editing
+        && message_inner.width > 0
+        && message_inner.height > 0
+        && cursor_row >= git.message_scroll
+        && cursor_row < git.message_scroll + message_inner.height as usize
+    {
+        frame.set_cursor_position((
+            message_inner.x + cursor_column.min(message_inner.width as usize - 1) as u16,
+            message_inner.y + (cursor_row - git.message_scroll) as u16,
+        ));
+    }
     let mut info = vec![Line::styled(
         format!("Branch: {branch}"),
         Style::default().fg(Color::DarkGray),
@@ -675,6 +909,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn large_commit_message_scrolls_without_changing_text_or_actions() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = ready();
+        app.git.commit_modal = true;
+        app.git.message = (0..80)
+            .map(|n| format!("Line {n:02}: explain a meaningful part of the change"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let original = app.git.message.clone();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            terminal.draw(|frame| draw_modal(frame, app)).unwrap();
+        };
+        let visible = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        render(&mut terminal, &mut app);
+        assert!(app.git.message_area.height > 10);
+        assert!(app.git.message_area.width > 90);
+        assert!(visible(&terminal).contains("Line 00"));
+        assert!(!visible(&terminal).contains("Line 79"));
+        press(&mut app, KeyCode::PageDown);
+        render(&mut terminal, &mut app);
+        assert!(app.git.message_scroll > 0);
+        let area = app.git.message_area;
+        let before = app.git.message_scroll;
+        crate::input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.git.message_scroll < before);
+        press(&mut app, KeyCode::End);
+        render(&mut terminal, &mut app);
+        assert!(visible(&terminal).contains("Line 79"));
+        assert_eq!(app.git.commit_row, 0);
+        assert_eq!(app.git.message, original);
+        assert!(app.git.request.is_none());
+        press(&mut app, KeyCode::Home);
+        render(&mut terminal, &mut app);
+        assert!(visible(&terminal).contains("Line 00"));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('!'));
+        render(&mut terminal, &mut app);
+        assert!(visible(&terminal).contains("change!"));
+        assert!(app.git.message_scroll > 0);
+        for (width, height) in [(50, 18), (20, 8), (1, 1)] {
+            let mut small = Terminal::new(TestBackend::new(width, height)).unwrap();
+            render(&mut small, &mut app);
+        }
+    }
+
+    #[test]
     fn generating_a_message_only_refreshes_and_preserves_concurrent_edits() {
         let mut app = ready();
         app.git.message = "Previous draft".into();
@@ -712,56 +1010,95 @@ pub(crate) mod tests {
         );
     }
     #[test]
-    fn commit_and_push_require_deliberate_confirmation_and_never_auto_retry() {
+    fn modes_submit_only_with_ctrl_enter_and_never_auto_retry() {
         let mut app = ready();
         app.git.row = 1;
-        app.git.message = "Fix UI".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.git.picking_mode);
+        assert!(!app.git.commit_modal);
+        press(&mut app, KeyCode::Down); // Commit
         press(&mut app, KeyCode::Enter);
         assert!(app.git.commit_modal);
-        app.git.commit_row = 2;
+        assert!(!app.git.commit_push);
+        app.git.message = "Fix UI".into();
         press(&mut app, KeyCode::Enter);
+        assert!(app.git.editing);
         assert!(app.git.request.is_none());
-        assert!(app.git.confirm.is_some());
-        press(&mut app, KeyCode::Esc);
-        assert!(app.git.request.is_none());
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Enter);
+        let submit = |app: &mut App| {
+            crate::input::handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
+        };
+        submit(&mut app);
+        assert!(!app.git.commit_modal);
         let request = app.git.request.take().unwrap();
         assert_eq!(request.payload()["action"], "commit");
         assert_eq!(request.payload()["commitMessage"], "Fix UI");
         assert_eq!(request.payload()["cwd"], "/repo");
+        // A repeated key cannot dispatch again, and failure preserves the draft.
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                crossterm::event::KeyEventKind::Repeat,
+            ),
+        );
+        assert!(app.git.request.is_none());
         app.git.finish(&request, Err("connection lost".into()));
         assert_eq!(app.git.message, "Fix UI");
         assert!(app.git.request.is_none());
-        app.git.commit_modal = false;
-        app.git.row = 2;
+        app.git.select_mode(0);
         app.git.message = "Ship it".into();
-        press(&mut app, KeyCode::Enter);
-        assert!(app.git.commit_modal);
-        assert!(app.git.commit_push);
-        app.git.commit_row = 2;
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Enter);
+        submit(&mut app);
+        assert!(!app.git.commit_modal);
         let request = app.git.request.take().unwrap();
         assert_eq!(request.payload()["action"], "commit_push");
-        assert_eq!(request.payload()["commitMessage"], "Ship it");
         app.git.finish(
             &request,
             Ok(Snapshot {
                 generated_message: None,
                 status: serde_json::from_value(status()).unwrap(),
-                branches: vec!["main".into(), "feature".into()],
+                branches: vec!["main".into()],
             }),
         );
         assert!(!app.git.commit_modal);
-        app.git.row = 3;
+        app.git.select_mode(2);
+        assert!(app.git.confirm.is_some());
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Enter);
+        assert!(app.git.request.is_none());
+        submit(&mut app);
         assert!(matches!(
             app.git.request.as_ref().unwrap().operation,
             Operation::Push
         ));
     }
+
+    #[test]
+    fn commit_validation_blocks_empty_no_changes_and_missing_remote() {
+        let mut app = ready();
+        app.git.select_mode(0);
+        let submit = |app: &mut App| key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        submit(&mut app);
+        assert!(app.git.error.as_deref().unwrap().contains("message"));
+        app.git.message = "Preserve me".into();
+        app.git.snapshot.as_mut().unwrap().status.has_primary_remote = false;
+        submit(&mut app);
+        assert_eq!(app.git.error.as_deref(), Some("No remote configured."));
+        assert!(app.git.request.is_none());
+        app.git.select_mode(1);
+        app.git
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .status
+            .working_tree
+            .files
+            .clear();
+        submit(&mut app);
+        assert_eq!(app.git.error.as_deref(), Some("No changes to commit."));
+        assert_eq!(app.git.message, "Preserve me");
+        assert!(app.git.request.is_none());
+    }
+
     #[test]
     fn uses_selected_thread_worktree_and_rejects_late_results() {
         let mut app = ready();

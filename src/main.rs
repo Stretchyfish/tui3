@@ -656,7 +656,10 @@ fn run(
                         && app.focus == app::Focus::Workspace
                         && app.workspace_tab == 3 =>
                 {
-                    app.git.message.push_str(&text.replace(['\r', '\n'], " "))
+                    app.git
+                        .message
+                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    app.git.message_follow_end = true;
                 }
                 Event::Paste(text) if app.editing && !app.terminal_overlay_open => {
                     app.insert_draft(&text)

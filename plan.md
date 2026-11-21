@@ -23,6 +23,8 @@
 
 ## Chat improvements before code editing
 
+- [x] Add per-thread Message draft undo/redo (Ctrl+Z, Ctrl+Y/Ctrl+Shift+Z), preserving text/cursor/selection through edits and clearing history after successful sends.
+
 - [x] Read T3 snapshot messages and message.updated events, join queued runs through userMessageId, and resolve deduplicated bodies so queued previews appear even before a visible turn item exists.
 
 - [x] Show queued message bodies directly beneath the yellow queue notice, with muted text and explicit not-active labels; restore normal conversation presentation when a queued run starts.
@@ -161,9 +163,13 @@ between workspace tools. Build each feature incrementally.
 
 ### Git
 
+- [x] Replace Git action buttons with branch/mode dropdowns; review scrollable changed files above the commit message, generate with g/Ctrl+G, and submit Commit/Commit & Push/Push with Ctrl+Enter.
+
+- [x] Enlarge the commit dialog/message viewport and add wrapped-line scrolling via PageUp/PageDown, mouse wheel, and Home/End; follow appended text while typing and open generated messages at the beginning.
+
 - [x] Inspect T3's Git contracts and target the selected thread's worktree or project workspace.
 - [x] Show repository status, current branch, ahead/behind counts, and changed files.
-- [x] Choose local branches and commit all changes with a message or push, with confirmations and asynchronous progress/error handling.
+- [x] Choose local branches and commit all changes with a message or push, with deliberate keyboard submission and asynchronous progress/error handling.
 - [x] Generate an editable AI commit subject/body from T3's actual working-tree diff using the installed Codex CLI, preserving drafts on failure.
 - [ ] Revisit commit-message generation to make the flow smoother and support other providers, ideally using T3's configured source-control writer.
 - [x] Extend local pairing for filesystem reads and Git writes, with p in Git to refresh older sessions.

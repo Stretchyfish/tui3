@@ -647,7 +647,10 @@ impl T3Client {
                     .get("truncated")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let exists = value.get("exists").and_then(|v| v.as_bool()).unwrap_or(true);
+                let exists = value
+                    .get("exists")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 Ok(Response::File {
                     relative_path: relative_path.clone(),
                     contents,
@@ -770,7 +773,7 @@ impl T3Client {
                 &status.working_tree.files,
                 &patch,
             );
-            Some(crate::commit_message::generate(&prompt).await?)
+            Some(crate::commit_message::generate(&prompt, &request.generator).await?)
         } else {
             None
         };
@@ -2029,6 +2032,7 @@ mod tests {
             id: "read-only-check".into(),
             cwd: project.workspace_root.clone(),
             operation: crate::git::Operation::Refresh,
+            generator: Default::default(),
         };
         let (sender, _) = mpsc::channel();
         let snapshot = client.git_request(&request, &sender).await.unwrap();
@@ -2100,6 +2104,7 @@ mod tests {
             id: "test-action".into(),
             cwd: "/worktree".into(),
             operation: crate::git::Operation::Commit("Fix UI".into()),
+            generator: Default::default(),
         };
         let (updates, received) = mpsc::channel();
         let snapshot = client.git_request(&request, &updates).await.unwrap();

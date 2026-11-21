@@ -15,6 +15,45 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
     let position = ratatui::layout::Position::new(mouse.column, mouse.row);
     app.pointer = Some(position);
+    if app.git.commit_modal
+        && app.git.confirm.is_none()
+        && !app.git.picking
+        && !app.settings_open
+        && !app.terminal_overlay_open
+        && app.git.message_area.contains(position)
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.git.scroll_message(true, 3);
+                return;
+            }
+            MouseEventKind::ScrollUp => {
+                app.git.scroll_message(false, 3);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if app.git.commit_modal
+        && app.git.confirm.is_none()
+        && !app.git.picking
+        && !app.git.picking_mode
+        && !app.settings_open
+        && !app.terminal_overlay_open
+        && app.git.files_area.contains(position)
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.git.files_scroll = app.git.files_scroll.saturating_add(3);
+                return;
+            }
+            MouseEventKind::ScrollUp => {
+                app.git.files_scroll = app.git.files_scroll.saturating_sub(3);
+                return;
+            }
+            _ => {}
+        }
+    }
     if app.terminal_overlay_open {
         if let Some(session) = &app.local_terminal.session {
             match mouse.kind {
@@ -200,6 +239,20 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.settings_row = 1;
             app.auto_start_t3 = value;
             app.auto_start_highlight = value;
+        }
+        Some(ClickTarget::GitModeOption(index)) => app.git.select_mode(index),
+        Some(ClickTarget::GitBranchOption(index)) => {
+            app.git.branch_index = index;
+            crate::git::key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        Some(ClickTarget::GitMessage) => {
+            app.git.commit_row = 0;
+            app.git.editing = true;
+            app.git.message_follow_end = true;
+        }
+        Some(ClickTarget::GitFiles) => {
+            app.git.commit_row = 1;
+            app.git.editing = false;
         }
         Some(ClickTarget::GitControl(index)) => {
             app.editing = false;
@@ -402,9 +455,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         if app.last_escape.is_some_and(|previous| {
             now.duration_since(previous) <= std::time::Duration::from_millis(500)
         }) {
-            app.draft.clear();
-            app.draft_cursor = 0;
-            app.draft_selection_anchor = None;
+            app.clear_draft();
             app.send_notice = None;
             app.last_escape = None;
         } else {
@@ -425,6 +476,22 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         && !app.models.open
     {
         crate::editor::key(app, key);
+        return;
+    }
+    if app.focus == Focus::Composer
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+        && !app.access_open
+        && !app.git.has_modal()
+        && app.thread_menu.is_none()
+        && app.active_approval_popup().is_none()
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('z' | 'Z' | 'y' | 'Y'))
+    {
+        let redo = matches!(key.code, KeyCode::Char('y' | 'Y' | 'Z'))
+            || key.modifiers.contains(KeyModifiers::SHIFT);
+        app.undo_draft(redo);
         return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -460,6 +527,18 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 && !app.startup.open))
     {
         app.terminal_overlay_open = !app.terminal_overlay_open;
+        return;
+    }
+    if app.git.has_modal()
+        && !app.settings_open
+        && !app.models.open
+        && !app.startup.open
+        && !app.access_open
+        && app.active_approval_popup().is_none()
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('g'))
+    {
+        crate::git::key(app, key);
         return;
     }
     if app.editing
@@ -1203,6 +1282,44 @@ fn handle_thread_menu_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_undo_redo_shortcuts_restore_edits_without_typing_control_characters() {
+        let mut app = App {
+            focus: Focus::Composer,
+            editing: true,
+            ..Default::default()
+        };
+        app.insert_draft("A pasted message");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert!(app.draft.is_empty());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft, "A pasted message");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+        assert_eq!(app.draft, "A pasted message");
+        app.settings_open = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft, "A pasted message");
+    }
 
     #[test]
     fn space_activates_menus_and_preserves_spaces_in_text_fields() {

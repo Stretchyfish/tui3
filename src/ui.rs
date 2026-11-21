@@ -431,12 +431,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if panel_help_visible(app, Focus::Composer, composer) {
         let hint = if app.editing {
             if app.is_selected_thread_working() {
-                " Enter: queue · Ctrl/Alt+Enter: steer "
+                " Enter: queue · Ctrl/Alt+Enter: steer · Ctrl+Z/Y: undo/redo "
             } else {
                 " Enter: send "
             }
         } else {
-            " Enter/Space/i: type · Shift+D: dictate "
+            " Enter/Space/i: type · Shift+D: dictate · Ctrl+Z/Y: undo/redo "
         };
         composer_block.title_bottom(Line::styled(hint, Style::default().fg(Color::Blue)))
     } else {
@@ -1070,7 +1070,7 @@ fn workspace_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         1 => "w: wrap · [/]: run · PgUp/PgDn: scroll · r: refresh",
         2 if app.local_terminal.tab_typing => "Esc: nav mode · Shift+PgUp/PgDn: scroll",
         2 => "Enter/i: type mode · PgUp/PgDn: scroll",
-        _ => "↑↓/jk: action · Enter/Space: open · g: generate · r: refresh",
+        _ => "Enter/Space: select · r: refresh",
     };
     let help = if app.focus == Focus::WorkspaceTabs {
         "←→/hl: choose tab · Enter/Space/↓: open panel"
@@ -3139,7 +3139,7 @@ mod tests {
     }
 
     #[test]
-    fn git_panel_shows_three_actions_and_opens_commit_modal_on_top() {
+    fn git_dropdowns_open_review_with_files_message_and_keyboard_submission() {
         let mut app = App {
             focus: Focus::Workspace,
             workspace_tab: 3,
@@ -3160,8 +3160,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Branch: main"));
-        assert!(text.contains("Commit all changes"));
+        assert!(text.contains("Branch"));
+        assert!(text.contains("main"));
+        assert!(text.contains("Mode"));
+        assert!(text.contains("▾"));
+        assert!(text.contains("Commit & Push"));
         assert!(text.contains("Push"));
         assert!(!text.contains("Generate commit message"));
 
@@ -3174,7 +3177,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Generate commit message (g)"));
+        assert!(text.contains("Changed files (1)"));
+        assert!(text.contains("src/main.rs"));
+        assert!(text.contains("Ctrl+Enter: submit"));
+        assert!(text.contains("g: generate"));
+        assert!(!text.contains("Generate commit message (g)"));
         assert!(text.contains("Commit message"));
     }
 

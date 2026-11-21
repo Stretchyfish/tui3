@@ -700,8 +700,7 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
     if app.editor.tree_focus {
         return key_tree(&mut app.editor, key);
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('s' | 'S'))
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s' | 'S'))
     {
         app.editor.save();
         return true;
@@ -730,9 +729,7 @@ fn key_tree(editor: &mut EditorState, key: KeyEvent) -> bool {
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
             editor.activate_entry(editor.selected_entry);
         }
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
-            if editor.directory.is_some() =>
-        {
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace if editor.directory.is_some() => {
             editor.go_up();
         }
         KeyCode::Tab | KeyCode::BackTab if editor.open_file.is_some() => {
@@ -783,7 +780,11 @@ fn paste_text(editor: &mut EditorState, after: bool) {
         } else {
             editor.cursor_line
         };
-        let inserted: Vec<String> = text.trim_end_matches('\n').split('\n').map(str::to_owned).collect();
+        let inserted: Vec<String> = text
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(str::to_owned)
+            .collect();
         for (i, line) in inserted.into_iter().enumerate() {
             editor.lines.insert(target_line + i, line);
         }
@@ -936,8 +937,16 @@ fn key_regular(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Home => editor.move_to(editor.cursor_line, 0, shift),
-        KeyCode::End => editor.move_to(editor.cursor_line, editor.line_len(editor.cursor_line), shift),
-        KeyCode::PageUp => editor.move_to(editor.cursor_line.saturating_sub(15), editor.cursor_col, shift),
+        KeyCode::End => editor.move_to(
+            editor.cursor_line,
+            editor.line_len(editor.cursor_line),
+            shift,
+        ),
+        KeyCode::PageUp => editor.move_to(
+            editor.cursor_line.saturating_sub(15),
+            editor.cursor_col,
+            shift,
+        ),
         KeyCode::PageDown => {
             let line = (editor.cursor_line + 15).min(editor.lines.len().saturating_sub(1));
             editor.move_to(line, editor.cursor_col, shift);
@@ -954,23 +963,41 @@ fn handle_insert_mode_key(editor: &mut EditorState, key: KeyEvent) {
             editor.editing = false;
             editor.selection_anchor = None;
         }
-        KeyCode::Up => editor.move_to(editor.cursor_line.saturating_sub(1), editor.cursor_col, false),
+        KeyCode::Up => editor.move_to(
+            editor.cursor_line.saturating_sub(1),
+            editor.cursor_col,
+            false,
+        ),
         KeyCode::Down => {
             let line = (editor.cursor_line + 1).min(editor.lines.len().saturating_sub(1));
             editor.move_to(line, editor.cursor_col, false);
         }
-        KeyCode::Left => editor.move_to(editor.cursor_line, editor.cursor_col.saturating_sub(1), false),
+        KeyCode::Left => editor.move_to(
+            editor.cursor_line,
+            editor.cursor_col.saturating_sub(1),
+            false,
+        ),
         KeyCode::Right => {
             let len = editor.line_len(editor.cursor_line);
             editor.move_to(editor.cursor_line, (editor.cursor_col + 1).min(len), false);
         }
         KeyCode::Home => editor.move_to(editor.cursor_line, 0, false),
-        KeyCode::End => editor.move_to(editor.cursor_line, editor.line_len(editor.cursor_line), false),
+        KeyCode::End => editor.move_to(
+            editor.cursor_line,
+            editor.line_len(editor.cursor_line),
+            false,
+        ),
         _ => key_insert_common(editor, key),
     }
 }
 
-fn enter_insert(editor: &mut EditorState, append: bool, line_end: bool, line_start: bool, open_line: Option<bool>) {
+fn enter_insert(
+    editor: &mut EditorState,
+    append: bool,
+    line_end: bool,
+    line_start: bool,
+    open_line: Option<bool>,
+) {
     editor.selection_anchor = None;
     editor.pending_key = None;
     if let Some(below) = open_line {
@@ -1072,13 +1099,19 @@ fn key_vim(app: &mut App, key: KeyEvent) -> bool {
             app.editor.move_to(line, app.editor.cursor_col, visual);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.editor
-                .move_to(app.editor.cursor_line.saturating_sub(1), app.editor.cursor_col, visual);
+            app.editor.move_to(
+                app.editor.cursor_line.saturating_sub(1),
+                app.editor.cursor_col,
+                visual,
+            );
         }
         KeyCode::Char('l') | KeyCode::Right => {
             let len = app.editor.line_len(app.editor.cursor_line);
-            app.editor
-                .move_to(app.editor.cursor_line, (app.editor.cursor_col + 1).min(len), visual);
+            app.editor.move_to(
+                app.editor.cursor_line,
+                (app.editor.cursor_col + 1).min(len),
+                visual,
+            );
         }
         KeyCode::Char('0') | KeyCode::Home => app.editor.move_to(app.editor.cursor_line, 0, visual),
         KeyCode::Char('$') | KeyCode::End => {
@@ -1103,8 +1136,11 @@ fn key_vim(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('g') => app.editor.pending_key = Some('g'),
         KeyCode::PageUp => {
-            app.editor
-                .move_to(app.editor.cursor_line.saturating_sub(15), app.editor.cursor_col, visual);
+            app.editor.move_to(
+                app.editor.cursor_line.saturating_sub(15),
+                app.editor.cursor_col,
+                visual,
+            );
         }
         KeyCode::PageDown => {
             let line = (app.editor.cursor_line + 15).min(app.editor.lines.len().saturating_sub(1));
@@ -1114,8 +1150,12 @@ fn key_vim(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('a') if !visual => enter_insert(&mut app.editor, true, false, false, None),
         KeyCode::Char('I') if !visual => enter_insert(&mut app.editor, false, false, true, None),
         KeyCode::Char('A') if !visual => enter_insert(&mut app.editor, false, true, false, None),
-        KeyCode::Char('o') if !visual => enter_insert(&mut app.editor, false, false, false, Some(true)),
-        KeyCode::Char('O') if !visual => enter_insert(&mut app.editor, false, false, false, Some(false)),
+        KeyCode::Char('o') if !visual => {
+            enter_insert(&mut app.editor, false, false, false, Some(true))
+        }
+        KeyCode::Char('O') if !visual => {
+            enter_insert(&mut app.editor, false, false, false, Some(false))
+        }
         KeyCode::Char('x') => {
             if visual {
                 if copy_editor_selection(app, false) {
@@ -1254,32 +1294,35 @@ fn key_helix(app: &mut App, key: KeyEvent) -> bool {
             app.editor.move_to(line, app.editor.cursor_col, extend);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.editor
-                .move_to(app.editor.cursor_line.saturating_sub(1), app.editor.cursor_col, extend);
+            app.editor.move_to(
+                app.editor.cursor_line.saturating_sub(1),
+                app.editor.cursor_col,
+                extend,
+            );
         }
         KeyCode::Char('l') | KeyCode::Right => {
             let len = app.editor.line_len(app.editor.cursor_line);
-            app.editor
-                .move_to(app.editor.cursor_line, (app.editor.cursor_col + 1).min(len), extend);
+            app.editor.move_to(
+                app.editor.cursor_line,
+                (app.editor.cursor_col + 1).min(len),
+                extend,
+            );
         }
         KeyCode::Char('w') => {
             if !extend {
-                app.editor.selection_anchor =
-                    Some((app.editor.cursor_line, app.editor.cursor_col));
+                app.editor.selection_anchor = Some((app.editor.cursor_line, app.editor.cursor_col));
             }
             app.editor.move_word_forward(true);
         }
         KeyCode::Char('b') => {
             if !extend {
-                app.editor.selection_anchor =
-                    Some((app.editor.cursor_line, app.editor.cursor_col));
+                app.editor.selection_anchor = Some((app.editor.cursor_line, app.editor.cursor_col));
             }
             app.editor.move_word_backward(true);
         }
         KeyCode::Char('e') => {
             if !extend {
-                app.editor.selection_anchor =
-                    Some((app.editor.cursor_line, app.editor.cursor_col));
+                app.editor.selection_anchor = Some((app.editor.cursor_line, app.editor.cursor_col));
             }
             app.editor.move_word_end(true);
         }
@@ -1289,7 +1332,8 @@ fn key_helix(app: &mut App, key: KeyEvent) -> bool {
                 let len = app.editor.line_len(app.editor.cursor_line);
                 app.editor.move_to(app.editor.cursor_line, len, true);
             } else {
-                let next = (app.editor.cursor_line + 1).min(app.editor.lines.len().saturating_sub(1));
+                let next =
+                    (app.editor.cursor_line + 1).min(app.editor.lines.len().saturating_sub(1));
                 let len = app.editor.line_len(next);
                 app.editor.move_to(next, len, true);
             }
@@ -1308,8 +1352,11 @@ fn key_helix(app: &mut App, key: KeyEvent) -> bool {
             app.editor.move_to(app.editor.cursor_line, len, extend);
         }
         KeyCode::PageUp => {
-            app.editor
-                .move_to(app.editor.cursor_line.saturating_sub(15), app.editor.cursor_col, extend);
+            app.editor.move_to(
+                app.editor.cursor_line.saturating_sub(15),
+                app.editor.cursor_col,
+                extend,
+            );
         }
         KeyCode::PageDown => {
             let line = (app.editor.cursor_line + 15).min(app.editor.lines.len().saturating_sub(1));
@@ -1736,9 +1783,7 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
                 spans.push(Span::styled(
                     mode_label,
-                    Style::default()
-                        .fg(mode_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
                 ));
             }
             Line::from(spans)
@@ -1789,8 +1834,9 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
                 .take(code_width.max(1))
                 .collect();
             let mut spans = vec![Span::styled(num, Style::default().fg(Color::DarkGray))];
-            let is_cursor_line =
-                line_idx == editor.cursor_line && !editor.tree_focus && app.focus == Focus::Workspace;
+            let is_cursor_line = line_idx == editor.cursor_line
+                && !editor.tree_focus
+                && app.focus == Focus::Workspace;
             let rel_cursor = editor.cursor_col.saturating_sub(editor.scroll_x);
             let chars: Vec<char> = slice.chars().collect();
             let max_cols = if is_cursor_line {
@@ -2364,15 +2410,27 @@ mod tests {
         assert_eq!(app.editor.selected_text().as_deref(), Some("hel"));
 
         // Ctrl+C copies, Ctrl+A selects all, Ctrl+V replaces all with "hel"
-        key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.editor.yank_register, "hel");
-        key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.editor.selected_text().as_deref(), Some("hello world"));
-        key(&mut app, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.editor.lines, vec!["hel"]);
 
         // Ctrl+Z undoes back to "hello world"
-        key(&mut app, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
         assert_eq!(app.editor.lines, vec!["hello world"]);
     }
 
@@ -2389,23 +2447,44 @@ mod tests {
         app.editor.tree_focus = false;
 
         // 'w' moves to "two", 'i' enters insert, type "big ", Esc back to normal
-        key(&mut app, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.mode, EditorMode::Insert);
         for ch in "big ".chars() {
-            key(&mut app, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
         }
         key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.editor.mode, EditorMode::Normal);
         assert_eq!(app.editor.lines[0], "one big two");
 
         // 'dd' deletes line 0, 'p' pastes it below line "three", 'u' undoes paste
-        key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.lines, vec!["three"]);
-        key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.lines, vec!["three", "one big two"]);
-        key(&mut app, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.lines, vec!["three"]);
     }
 
@@ -2422,13 +2501,22 @@ mod tests {
         app.editor.tree_focus = false;
 
         // 'w' selects "alpha ", 'd' deletes it, 'p' pastes it
-        key(&mut app, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.selected_text().as_deref(), Some("alpha "));
-        key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.lines, vec!["beta"]);
         assert_eq!(app.editor.yank_register, "alpha ");
 
-        key(&mut app, KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
         assert_eq!(app.editor.lines, vec!["alpha beta"]);
     }
 
@@ -2477,41 +2565,92 @@ mod tests {
         app.editor.cursor_col = 4;
 
         // 'g' enters goto mode, 's' jumps to first non-whitespace (col 2)
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.pending_key, Some('g'));
-        key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.pending_key, None);
         assert_eq!((app.editor.cursor_line, app.editor.cursor_col), (10, 2));
 
         // 'gl' jumps to line end, 'gh' to line start
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_col, "  line 10".len());
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_col, 0);
 
         // 'gt', 'gc', 'gb' jump to viewport top/center/bottom
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_line, 5);
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_line, 10);
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_line, 14);
 
         // 'ge' jumps to file end, 'gg' to file start
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.cursor_line, 29);
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert_eq!((app.editor.cursor_line, app.editor.cursor_col), (0, 0));
 
         // 'g' then Esc cancels goto mode without leaving code view
-        key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
         assert_eq!(app.editor.pending_key, Some('g'));
         key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.editor.pending_key, None);

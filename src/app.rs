@@ -119,6 +119,10 @@ pub enum ClickTarget {
     SlashCommand(usize),
     AutoStart(bool),
     GitControl(usize),
+    GitModeOption(usize),
+    GitBranchOption(usize),
+    GitMessage,
+    GitFiles,
     EditorEntry(usize),
     RemoveAttachment(usize),
     SidebarRow(usize),
@@ -222,6 +226,7 @@ pub struct App {
     pub approval_error: Option<String>,
     pub draft: String,
     pub draft_cursor: usize,
+    pub(crate) draft_history: HashMap<Option<String>, crate::composer::DraftHistory>,
     pub draft_selection_anchor: Option<usize>,
     pub screen_selection: Option<((u16, u16), (u16, u16))>,
     pub screen_selection_area: Option<ratatui::layout::Rect>,
@@ -357,6 +362,7 @@ impl Default for App {
             approval_error: None,
             draft: String::new(),
             draft_cursor: 0,
+            draft_history: HashMap::new(),
             draft_selection_anchor: None,
             screen_selection: None,
             screen_selection_area: None,
@@ -755,7 +761,67 @@ impl App {
         Some(result)
     }
 
+    fn draft_snapshot(&self) -> crate::composer::DraftSnapshot {
+        crate::composer::DraftSnapshot {
+            text: self.draft.clone(),
+            cursor: self.draft_cursor,
+            anchor: self.draft_selection_anchor,
+        }
+    }
+
+    fn edit_draft<R>(&mut self, edit: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.draft_snapshot();
+        let result = edit(self);
+        if before.text != self.draft {
+            self.draft_history
+                .entry(self.draft_thread.clone())
+                .or_default()
+                .record(before);
+        }
+        result
+    }
+
+    pub fn undo_draft(&mut self, redo: bool) {
+        let current = self.draft_snapshot();
+        let history = self
+            .draft_history
+            .entry(self.draft_thread.clone())
+            .or_default();
+        let snapshot = if redo {
+            history.redo.pop()
+        } else {
+            history.undo.pop()
+        };
+        if let Some(snapshot) = snapshot {
+            if redo {
+                history.undo.push(current);
+            } else {
+                history.redo.push(current);
+            }
+            self.draft = snapshot.text;
+            self.draft_cursor = snapshot.cursor.min(self.draft.chars().count());
+            self.draft_selection_anchor = snapshot
+                .anchor
+                .map(|anchor| anchor.min(self.draft.chars().count()));
+            self.screen_selection = None;
+            self.slash_dismissed = true;
+            self.slash_highlight = 0;
+        }
+    }
+
+    pub fn clear_draft(&mut self) {
+        self.edit_draft(|app| {
+            app.draft.clear();
+            app.draft_cursor = 0;
+            app.draft_selection_anchor = None;
+        });
+    }
+
     pub fn insert_draft(&mut self, text: &str) {
+        self.edit_draft(|app| app.insert_draft_inner(text))
+    }
+
+    fn insert_draft_inner(&mut self, text: &str) {
         self.screen_selection = None;
         self.delete_draft_selection();
         let byte = self.draft_byte_cursor();
@@ -867,6 +933,21 @@ impl App {
             self.insert_draft(text);
             true
         } else {
+            let draft = self
+                .drafts
+                .get(&Some(thread.to_owned()))
+                .cloned()
+                .unwrap_or_default();
+            if !text.is_empty() {
+                self.draft_history
+                    .entry(Some(thread.to_owned()))
+                    .or_default()
+                    .record(crate::composer::DraftSnapshot {
+                        cursor: draft.chars().count(),
+                        text: draft,
+                        anchor: None,
+                    });
+            }
             self.drafts
                 .entry(Some(thread.to_owned()))
                 .or_default()
@@ -894,6 +975,10 @@ impl App {
     }
 
     pub fn backspace_draft(&mut self) {
+        self.edit_draft(|app| app.backspace_draft_inner())
+    }
+
+    fn backspace_draft_inner(&mut self) {
         self.screen_selection = None;
         if self.delete_draft_selection() {
             return;
@@ -908,6 +993,10 @@ impl App {
     }
 
     pub fn backspace_draft_word(&mut self) {
+        self.edit_draft(|app| app.backspace_draft_word_inner())
+    }
+
+    fn backspace_draft_word_inner(&mut self) {
         self.screen_selection = None;
         if self.delete_draft_selection() {
             return;
@@ -980,6 +1069,10 @@ impl App {
     }
 
     pub fn apply_slash_command(&mut self, index: usize) -> bool {
+        self.edit_draft(|app| app.apply_slash_command_inner(index))
+    }
+
+    fn apply_slash_command_inner(&mut self, index: usize) -> bool {
         let matches = self.matching_slash_commands();
         let Some((token_start, cursor_byte, _)) = self.slash_query() else {
             return false;
@@ -1029,6 +1122,10 @@ impl App {
     }
 
     pub fn delete_draft(&mut self) {
+        self.edit_draft(|app| app.delete_draft_inner())
+    }
+
+    fn delete_draft_inner(&mut self) {
         self.screen_selection = None;
         if self.delete_draft_selection() {
             return;
@@ -1133,6 +1230,37 @@ impl App {
             .find(|thread| thread.id == id)?
             .model_selection
             .as_ref()
+    }
+
+    pub fn commit_generator_target(&self) -> crate::commit_message::Target {
+        let Some(selection) = self.current_model() else {
+            return crate::commit_message::Target::default();
+        };
+        let driver = self
+            .models
+            .choices
+            .iter()
+            .find(|choice| {
+                choice.selection.instance_id == selection.instance_id
+                    && choice.selection.model == selection.model
+            })
+            .map(|choice| choice.driver.as_str());
+        let instance = selection.instance_id.to_ascii_lowercase();
+        let model = selection.model.to_ascii_lowercase();
+        let provider = if driver == Some("antigravity")
+            || instance.contains("antigravity")
+            || model.starts_with("gemini-")
+        {
+            Some(crate::commit_message::Provider::Antigravity)
+        } else if driver == Some("codex") || instance.contains("codex") {
+            Some(crate::commit_message::Provider::Codex)
+        } else {
+            None
+        };
+        crate::commit_message::Target {
+            provider,
+            model: Some(selection.model.clone()),
+        }
     }
 
     pub fn set_thread_model(&mut self, id: &str, selection: crate::models::ModelSelection) {
@@ -1401,6 +1529,7 @@ impl App {
                 } else if self.drafts.get(&Some(request.thread_id.clone())) == Some(&request.text) {
                     self.drafts.remove(&Some(request.thread_id.clone()));
                 }
+                self.draft_history.remove(&Some(request.thread_id.clone()));
                 self.last_attempt.remove(&request.thread_id);
                 self.send_status.remove(&request.thread_id);
             }
@@ -2055,6 +2184,7 @@ impl App {
                     }
                     crate::t3::ThreadAction::Delete { thread_id } => {
                         self.drafts.remove(&Some(thread_id.clone()));
+                        self.draft_history.remove(&Some(thread_id.clone()));
                         self.images.remove(&thread_id);
                         if self.history_thread.as_deref() == Some(thread_id.as_str()) {
                             self.history_thread = None;
@@ -2590,6 +2720,56 @@ mod sending_tests {
         app.sync_history_selection();
         app.draft = "Hello\n世界".into();
         app
+    }
+
+    #[test]
+    fn draft_undo_restores_unicode_cursor_selection_and_invalidates_redo_on_edit() {
+        let mut app = App::default();
+        app.insert_draft("hello 世界");
+        app.draft_cursor = 8;
+        app.draft_selection_anchor = Some(6);
+        app.insert_draft("👩‍💻\npasted");
+        let replaced = app.draft.clone();
+        app.undo_draft(false);
+        assert_eq!(app.draft, "hello 世界");
+        assert_eq!(app.draft_cursor, 8);
+        assert_eq!(app.draft_selection_anchor, Some(6));
+        app.undo_draft(true);
+        assert_eq!(app.draft, replaced);
+        app.backspace_draft_word();
+        app.undo_draft(false);
+        assert_eq!(app.draft, replaced);
+        app.insert_draft("!");
+        app.undo_draft(true);
+        assert_eq!(app.draft, format!("{replaced}!"));
+        app.clear_draft();
+        app.undo_draft(false);
+        assert_eq!(app.draft, format!("{replaced}!"));
+    }
+
+    #[test]
+    fn draft_undo_is_per_thread_and_cannot_restore_a_sent_message() {
+        let mut app = ready();
+        app.draft.clear();
+        app.draft_cursor = 0;
+        app.insert_draft("First draft");
+        app.move_selection(true);
+        app.sync_history_selection();
+        app.insert_draft("Second draft");
+        app.undo_draft(false);
+        assert!(app.draft.is_empty());
+        app.move_selection(false);
+        app.sync_history_selection();
+        assert_eq!(app.draft, "First draft");
+        app.undo_draft(false);
+        assert!(app.draft.is_empty());
+        app.undo_draft(true);
+        let request = app.prepare_send().unwrap();
+        app.finish_send(request, Ok(()));
+        app.undo_draft(false);
+        assert!(app.draft.is_empty());
+        app.undo_draft(true);
+        assert!(app.draft.is_empty());
     }
 
     #[test]

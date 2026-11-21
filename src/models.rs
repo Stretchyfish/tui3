@@ -24,6 +24,7 @@ impl ModelSelection {
 
 #[derive(Clone)]
 pub struct ModelChoice {
+    pub driver: String,
     pub selection: ModelSelection,
     pub label: String,
     pub reasoning: Option<ReasoningOption>,
@@ -126,6 +127,7 @@ pub fn choices(value: Value) -> Result<Vec<ModelChoice>, String> {
                 .zip(default)
                 .map(|(descriptor, value)| json!([{"id": descriptor.id, "value": value}]));
             choices.push(ModelChoice {
+                driver: provider.driver.clone(),
                 label: format!("{name} · {}", model.name),
                 selection: ModelSelection {
                     instance_id: provider.instance_id.clone(),

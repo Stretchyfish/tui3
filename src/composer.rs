@@ -7,6 +7,29 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Clone)]
+pub(crate) struct DraftSnapshot {
+    pub text: String,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
+}
+
+#[derive(Default)]
+pub(crate) struct DraftHistory {
+    pub undo: Vec<DraftSnapshot>,
+    pub redo: Vec<DraftSnapshot>,
+}
+
+impl DraftHistory {
+    pub fn record(&mut self, before: DraftSnapshot) {
+        self.undo.push(before);
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+}
+
 pub fn layout(text: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
     if width == 0 {
         return (vec![], (0, 0));
