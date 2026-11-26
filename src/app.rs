@@ -135,6 +135,7 @@ pub enum ClickTarget {
     TypingStyle(crate::preferences::TypingStyle),
     LayoutPreset(crate::preferences::LayoutPreset),
     ServerUpdateButton,
+    Tui3UpdateButton,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -268,6 +269,9 @@ pub struct App {
     pub server_version_check_requested: bool,
     pub server_update_requested: bool,
     pub tui3_update: crate::update::Status,
+    pub tui3_update_status: ServerUpdateStatus,
+    pub tui3_version_check_requested: bool,
+    pub tui3_update_requested: bool,
     pub dictation: crate::dictation::State,
     pub authenticated: bool,
     pub pairing_requested: bool,
@@ -323,6 +327,9 @@ impl Default for App {
             server_version_check_requested: false,
             server_update_requested: false,
             tui3_update: crate::update::Status::default(),
+            tui3_update_status: ServerUpdateStatus::Idle,
+            tui3_version_check_requested: false,
+            tui3_update_requested: false,
             dictation: Default::default(),
             editor: Default::default(),
             git: Default::default(),
@@ -560,6 +567,44 @@ impl App {
             && *tick < 72
         {
             *tick = (*tick).saturating_add(2).min(72);
+        }
+        if let ServerUpdateStatus::Downloading { tick, .. } = &mut self.tui3_update_status
+            && *tick < 72
+        {
+            *tick = (*tick).saturating_add(2).min(72);
+        }
+    }
+
+    pub fn request_tui3_version_check(&mut self) {
+        if !matches!(
+            self.tui3_update_status,
+            ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }
+        ) {
+            self.tui3_update = crate::update::Status::Checking;
+            self.tui3_version_check_requested = true;
+        }
+    }
+
+    pub fn trigger_tui3_update_action(&mut self) {
+        if matches!(
+            self.tui3_update_status,
+            ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }
+        ) {
+            return;
+        }
+        match &self.tui3_update {
+            crate::update::Status::Available { version, .. } => {
+                self.tui3_update_status = ServerUpdateStatus::Downloading {
+                    target_version: version.clone(),
+                    tick: 12,
+                };
+                self.tui3_update_requested = true;
+            }
+            crate::update::Status::Checking => (),
+            _ => {
+                self.tui3_update_status = ServerUpdateStatus::Idle;
+                self.request_tui3_version_check();
+            }
         }
     }
 

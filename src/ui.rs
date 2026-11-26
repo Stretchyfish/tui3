@@ -1300,6 +1300,10 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         app.server_version_status,
         crate::app::ServerVersionStatus::Error(_)
     );
+    let has_tui3_progress = !matches!(
+        app.tui3_update_status,
+        crate::app::ServerUpdateStatus::Idle
+    );
     let [
         heading,
         selector,
@@ -1314,6 +1318,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         server_heading,
         server_row,
         server_progress,
+        tui3_heading,
+        tui3_row,
+        tui3_progress,
         clipboard_heading,
         clipboard_result,
         details,
@@ -1331,6 +1338,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(if has_server_progress { 2 } else { 0 }),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(if has_tui3_progress { 2 } else { 0 }),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(0),
@@ -1429,6 +1439,7 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         ));
     }
     render_server_settings_row(frame, app, server_heading, server_row, server_progress);
+    render_tui3_settings_row(frame, app, tui3_heading, tui3_row, tui3_progress);
     frame.render_widget(Paragraph::new("Desktop clipboard"), clipboard_heading);
     let (status, color) = match &app.clipboard_status {
         crate::app::ClipboardStatus::Checking => {
@@ -1452,17 +1463,9 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         .current_model()
         .map(|model| model.model.as_str())
         .unwrap_or("No thread selected");
-    let update_note = match &app.tui3_update {
-        crate::update::Status::Available { version, .. } => format!(
-            "\n\ntui3 update available (v{} → v{version})\n{}",
-            crate::update::CURRENT_VERSION,
-            crate::update::INSTALL_CMD
-        ),
-        _ => format!("\n\ntui3 v{}", crate::update::CURRENT_VERSION),
-    };
     let content = format!(
-        "↑↓/jk: setting · ←→/hl: highlight · Enter: apply\nBlue: highlighted; green: active. Saved automatically.\nVim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}{}",
-        app.connection, model, update_note,
+        "↑↓/jk: setting · ←→/hl: highlight · Enter: apply\nBlue: highlighted; green: active. Saved automatically.\nVim/Helix editing behavior is planned.\n\nConnection\n{}\n\nCurrent model\n{}",
+        app.connection, model,
     );
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), details);
 }
@@ -1541,10 +1544,92 @@ fn render_server_settings_row(
         app.settings_row == 5,
     );
 
+    render_update_progress(frame, &app.server_update_status, progress_area, None);
+    if matches!(app.server_update_status, ServerUpdateStatus::Idle)
+        && let ServerVersionStatus::Error(error) = &app.server_version_status
+    {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            progress_area,
+        );
+    }
+}
+
+fn render_tui3_settings_row(
+    frame: &mut Frame,
+    app: &mut App,
+    heading_area: Rect,
+    row_area: Rect,
+    progress_area: Rect,
+) {
+    use crate::app::ServerUpdateStatus;
+    use crate::update::{CURRENT_VERSION, Status};
+    frame.render_widget(Paragraph::new("tui3"), heading_area);
+    let [status_area, button_area] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(24)])
+            .spacing(1)
+            .areas(row_area);
+
+    let (check_label, check_color) = match &app.tui3_update {
+        Status::Checking => ("Checking version…".to_owned(), Color::Yellow),
+        Status::UpToDate => ("Up to date".to_owned(), Color::Green),
+        Status::Available { version, .. } => (format!("Update available (v{version})"), Color::Yellow),
+        Status::Unavailable => ("Version check failed".to_owned(), Color::Red),
+    };
+    let status_line = Line::from(vec![
+        Span::raw(format!("v{CURRENT_VERSION} · ")),
+        Span::styled(check_label, Style::default().fg(check_color)),
+    ]);
+    let status_block =
+        Block::bordered().border_style(Style::default().fg(Color::DarkGray).bg(Color::Black));
+    frame.render_widget(
+        Paragraph::new(status_line)
+            .block(status_block)
+            .style(Style::default().bg(Color::Black)),
+        status_area,
+    );
+
+    let (button_label, button_active) = match (&app.tui3_update_status, &app.tui3_update) {
+        (ServerUpdateStatus::Downloading { .. } | ServerUpdateStatus::Installing { .. }, _) => {
+            ("Updating…".to_owned(), false)
+        }
+        (ServerUpdateStatus::Completed { .. }, _) => ("Updated".to_owned(), true),
+        (_, Status::UpToDate) => ("Up to date".to_owned(), true),
+        (_, Status::Available { version, .. }) => (format!("Update v{version}"), false),
+        (_, Status::Checking) => ("Checking…".to_owned(), false),
+        (_, Status::Unavailable) => ("Check update".to_owned(), false),
+    };
+    app.click_targets
+        .push((button_area, crate::app::ClickTarget::Tui3UpdateButton));
+    selector_box(
+        frame,
+        button_area,
+        &button_label,
+        button_active,
+        app.settings_row == 6,
+    );
+
+    render_update_progress(
+        frame,
+        &app.tui3_update_status,
+        progress_area,
+        Some("Restart tui3 to use"),
+    );
+}
+
+fn render_update_progress(
+    frame: &mut Frame,
+    status: &crate::app::ServerUpdateStatus,
+    progress_area: Rect,
+    completed_suffix: Option<&str>,
+) {
+    use crate::app::ServerUpdateStatus;
     if progress_area.height == 0 {
         return;
     }
-    match &app.server_update_status {
+    match status {
         ServerUpdateStatus::Downloading {
             target_version,
             tick,
@@ -1564,10 +1649,14 @@ fn render_server_settings_row(
             frame.render_widget(gauge, progress_area);
         }
         ServerUpdateStatus::Completed { target_version } => {
+            let label = match completed_suffix {
+                Some(suffix) => format!("Updated to v{target_version} · {suffix}"),
+                None => format!("Updated to v{target_version}"),
+            };
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
                 .ratio(1.0)
-                .label(format!("Updated to v{target_version}"));
+                .label(label);
             frame.render_widget(gauge, progress_area);
         }
         ServerUpdateStatus::Failed(error) => {
@@ -1578,16 +1667,7 @@ fn render_server_settings_row(
                 progress_area,
             );
         }
-        ServerUpdateStatus::Idle => {
-            if let ServerVersionStatus::Error(error) = &app.server_version_status {
-                frame.render_widget(
-                    Paragraph::new(error.as_str())
-                        .style(Style::default().fg(Color::Red))
-                        .wrap(Wrap { trim: false }),
-                    progress_area,
-                );
-            }
-        }
+        ServerUpdateStatus::Idle => (),
     }
 }
 
@@ -2914,6 +2994,7 @@ mod tests {
                 | ClickTarget::LayoutPreset(_)
                 | ClickTarget::Telemetry(_)
                 | ClickTarget::ServerUpdateButton
+                | ClickTarget::Tui3UpdateButton
         )));
         let area = app
             .click_targets

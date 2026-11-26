@@ -329,6 +329,10 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.settings_row = 5;
             app.trigger_server_update_action();
         }
+        Some(ClickTarget::Tui3UpdateButton) => {
+            app.settings_row = 6;
+            app.trigger_tui3_update_action();
+        }
         None => (),
     }
 }
@@ -663,11 +667,12 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 app.clipboard_status = crate::app::ClipboardStatus::Checking;
                 app.clipboard_check_requested = true;
                 app.request_server_version_check();
+                app.request_tui3_version_check();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.settings_row = app.settings_row.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(5),
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(6),
             KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
                 app.auto_start_highlight = false
             }
@@ -710,6 +715,11 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
                 if app.settings_row == 5 => {}
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 6 => {
+                app.trigger_tui3_update_action();
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if app.settings_row == 6 => {}
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
                 app.style_highlight = app.style_highlight.cycle(true);
@@ -2401,6 +2411,29 @@ mod tests {
         assert!(app.server_update_requested);
         assert!(matches!(
             app.server_update_status,
+            crate::app::ServerUpdateStatus::Downloading { .. }
+        ));
+    }
+
+    #[test]
+    fn settings_row_6_navigates_and_triggers_tui3_update_action() {
+        let mut app = App::default();
+        app.tui3_update = crate::update::Status::Available {
+            version: "0.2.0".into(),
+            url: "https://github.com/Stretchyfish/tui3/releases/tag/v0.2.0".into(),
+        };
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        for _ in 0..6 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.settings_row, 6);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.tui3_update_requested);
+        assert!(matches!(
+            app.tui3_update_status,
             crate::app::ServerUpdateStatus::Downloading { .. }
         ));
     }

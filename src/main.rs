@@ -83,7 +83,7 @@ fn run(
     backend: t3::Backend,
     resume: &mut preferences::ResumeStore,
     startup: startup::Backend,
-    app_updates: std::sync::mpsc::Receiver<update::Status>,
+    app_updates: update::Backend,
 ) -> io::Result<Option<u32>> {
     let layout_preset = resume.layout_preset();
     let telemetry_enabled = resume.telemetry_enabled();
@@ -196,8 +196,11 @@ fn run(
                 });
             }
         }
-        while let Ok(status) = app_updates.try_recv() {
-            app.tui3_update = status;
+        while let Ok(update) = app_updates.updates.try_recv() {
+            match update {
+                update::Update::Checked(status) => app.tui3_update = status,
+                update::Update::Progress(progress) => app.tui3_update_status = progress,
+            }
         }
         while let Ok(event) = startup.updates.try_recv() {
             if !event.busy {
@@ -221,7 +224,13 @@ fn run(
                 app.startup.event.detail = "Setup is already busy. Please wait.".into();
             }
         }
-        while let Ok(update) = backend.updates.try_recv() {
+        // Bound per-frame backend update processing so heavy thread streams
+        // cannot starve rendering or keyboard/mouse input.
+        let mut update_budget = 64_usize;
+        while update_budget > 0
+            && let Ok(update) = backend.updates.try_recv()
+        {
+            update_budget -= 1;
             let update = match update {
                 t3::Update::Editor { request, result } => {
                     app.editor.finish(&request, result);
@@ -606,6 +615,26 @@ fn run(
                 }
             }
         }
+        if app.tui3_version_check_requested {
+            app.tui3_version_check_requested = false;
+            if app_updates.commands.try_send(update::Command::Check).is_err() {
+                app.tui3_update = update::Status::Unavailable;
+            }
+        }
+        if app.tui3_update_requested {
+            app.tui3_update_requested = false;
+            if let update::Status::Available { version, .. } = &app.tui3_update
+                && app_updates
+                    .commands
+                    .try_send(update::Command::Update {
+                        version: version.clone(),
+                    })
+                    .is_err()
+            {
+                app.tui3_update_status =
+                    app::ServerUpdateStatus::Failed("tui3 update worker is unavailable.".into());
+            }
+        }
         app.tick_server_update();
         if app.pairing_requested {
             app.pairing_requested = false;
@@ -638,7 +667,12 @@ fn run(
         }
         resume.remember(&app);
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
-        if event::poll(Duration::from_millis(100))? {
+        let poll_timeout = if update_budget == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(poll_timeout)? {
             // Discard unused motion events in a batch instead of rendering
             // the full transcript for each queued pointer event.
             let mut next = event::read()?;
