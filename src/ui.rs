@@ -822,7 +822,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             };
             for x in area.x..row_right {
                 if (y, x) >= start && (y, x) < end {
-                    frame.buffer_mut()[(x, y)].set_bg(Color::Blue);
+                    frame.buffer_mut()[(x, y)]
+                        .set_bg(Color::Blue)
+                        .set_fg(Color::White);
                 }
             }
         }
@@ -1306,6 +1308,8 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         wrap_selector,
         layout_heading,
         layout_selector,
+        telemetry_heading,
+        telemetry_selector,
         server_heading,
         server_row,
         server_progress,
@@ -1313,6 +1317,8 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         clipboard_result,
         details,
     ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -1403,6 +1409,23 @@ fn settings_panel(frame: &mut Frame, app: &mut App) {
         );
         app.click_targets
             .push((*option, crate::app::ClickTarget::LayoutPreset(preset)));
+    }
+    frame.render_widget(Paragraph::new("Telemetry"), telemetry_heading);
+    let telemetry_options = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+        .spacing(1)
+        .split(telemetry_selector);
+    for (index, value) in [true, false].into_iter().enumerate() {
+        selector_box(
+            frame,
+            telemetry_options[index],
+            if value { "On" } else { "Off" },
+            app.telemetry_enabled == value,
+            app.settings_row == 4 && app.telemetry_highlight == value,
+        );
+        app.click_targets.push((
+            telemetry_options[index],
+            crate::app::ClickTarget::Telemetry(value),
+        ));
     }
     render_server_settings_row(frame, app, server_heading, server_row, server_progress);
     frame.render_widget(Paragraph::new("Desktop clipboard"), clipboard_heading);
@@ -1514,7 +1537,7 @@ fn render_server_settings_row(
         button_area,
         &button_label,
         button_active,
-        app.settings_row == 4,
+        app.settings_row == 5,
     );
 
     if progress_area.height == 0 {
@@ -2888,6 +2911,7 @@ mod tests {
             ClickTarget::TypingStyle(_)
                 | ClickTarget::AutoStart(_)
                 | ClickTarget::LayoutPreset(_)
+                | ClickTarget::Telemetry(_)
                 | ClickTarget::ServerUpdateButton
         )));
         let area = app

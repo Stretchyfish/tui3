@@ -14,6 +14,5 @@
 - [x] Remove the Tab hotkey for switching between panels, along with the Tab hint text in the bottom footer.
 - [x] Overhaul `README.md` to be concise (short overview + easy `curl` install instructions; discuss details when we get there).
 - [x] Overhaul the Git panel so instead of inline commit message / commit-all fields, it shows the three actions (with Push as the third), and selecting one opens a modal/overlay panel on top with the additional fields to fill out (e.g., generate commit message).
-- [ ] Add a T3 Connect button in the Settings menu (opening a browser login flow, QR code, or however T3 Connect pairs), plus a list of available providers that can be toggled on/off with an install button for relevant providers.
 - [ ] Add a notifications toggle in Settings; when enabled, send notifications for key events such as when a thread finishes a run or when an approval is needed.
-- [ ] In the project menu, show a checkmark when a thread finishes a task (replacing the green running dot) until the user selects/views that thread.
+

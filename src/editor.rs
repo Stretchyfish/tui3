@@ -21,7 +21,23 @@ use unicode_width::UnicodeWidthStr;
 pub enum Operation {
     ListEntries(Option<String>),
     ReadFile(String),
-    WriteFile { path: String, contents: String },
+    WriteFile {
+        path: String,
+        contents: String,
+    },
+    CreateFile {
+        path: String,
+        directory: Option<String>,
+    },
+    CreateFolder {
+        path: String,
+        directory: Option<String>,
+    },
+    DeleteEntry {
+        path: String,
+        is_dir: bool,
+        directory: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -43,6 +59,12 @@ impl Request {
             }
             Operation::WriteFile { path, contents } => {
                 json!({ "cwd": self.cwd, "relativePath": path, "contents": contents })
+            }
+            Operation::CreateFile { path, .. } => {
+                json!({ "cwd": self.cwd, "relativePath": path, "contents": "" })
+            }
+            Operation::CreateFolder { path, .. } | Operation::DeleteEntry { path, .. } => {
+                json!({ "cwd": self.cwd, "relativePath": path })
             }
         }
     }
@@ -82,6 +104,25 @@ pub enum Response {
     Saved {
         relative_path: String,
     },
+    Mutated {
+        directory: Option<String>,
+        entries: Vec<Entry>,
+        truncated: bool,
+        select_path: Option<String>,
+        deleted_path: Option<String>,
+        notice: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreePrompt {
+    NewFile(String),
+    NewFolder(String),
+    ConfirmDelete {
+        path: String,
+        is_dir: bool,
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +141,9 @@ pub struct EditorState {
     pub selected_entry: usize,
     pub tree_offset: usize,
     tree_selections: HashMap<Option<String>, String>,
+    pub tree_searching: bool,
+    pub tree_search: String,
+    pub tree_prompt: Option<TreePrompt>,
     pub tree_focus: bool,
     pub open_file: Option<String>,
     pub file_truncated: bool,
@@ -132,6 +176,9 @@ impl Default for EditorState {
             selected_entry: 0,
             tree_offset: 0,
             tree_selections: HashMap::new(),
+            tree_searching: false,
+            tree_search: String::new(),
+            tree_prompt: None,
             tree_focus: true,
             open_file: None,
             file_truncated: false,
@@ -172,6 +219,9 @@ impl EditorState {
             Operation::ListEntries(_) => "Loading files…".into(),
             Operation::ReadFile(path) => format!("Opening {path}…"),
             Operation::WriteFile { path, .. } => format!("Saving {path}…"),
+            Operation::CreateFile { path, .. } => format!("Creating {path}…"),
+            Operation::CreateFolder { path, .. } => format!("Creating {path}/…"),
+            Operation::DeleteEntry { path, .. } => format!("Deleting {path}…"),
         };
         self.request = Some(Request {
             id,
@@ -261,6 +311,43 @@ impl EditorState {
             Ok(Response::Saved { relative_path }) => {
                 self.dirty = false;
                 self.notice = format!("Saved {relative_path}.");
+            }
+            Ok(Response::Mutated {
+                directory,
+                mut entries,
+                truncated,
+                select_path,
+                deleted_path,
+                notice,
+            }) => {
+                entries.retain(|entry| entry.display_name() != ".git");
+                entries.sort_by(|a, b| {
+                    b.is_dir()
+                        .cmp(&a.is_dir())
+                        .then_with(|| a.display_name().cmp(b.display_name()))
+                });
+                if let Some(deleted) = &deleted_path
+                    && let Some(open) = &self.open_file
+                    && (open == deleted || open.starts_with(&format!("{deleted}/")))
+                {
+                    self.open_file = None;
+                    self.lines.clear();
+                    self.dirty = false;
+                    self.tree_focus = true;
+                }
+                let offset = usize::from(directory.is_some());
+                if let Some(target) = &select_path
+                    && let Some(pos) = entries.iter().position(|entry| &entry.path == target)
+                {
+                    self.selected_entry = pos + offset;
+                } else {
+                    let count = offset + entries.len();
+                    self.selected_entry = self.selected_entry.min(count.saturating_sub(1));
+                }
+                self.directory = directory;
+                self.entries = entries;
+                self.entries_truncated = truncated;
+                self.notice = notice;
             }
             Err(error) => {
                 self.error = Some(error);
@@ -659,6 +746,61 @@ impl EditorState {
         self.move_to(line, col, select);
     }
 
+    pub fn tree_search_matches(&self) -> Vec<usize> {
+        let query = self.tree_search.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let offset = usize::from(self.directory.is_some());
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.display_name().to_ascii_lowercase().contains(&query))
+            .map(|(idx, _)| idx + offset)
+            .collect()
+    }
+
+    fn select_first_tree_match(&mut self) {
+        if let Some(first) = self.tree_search_matches().first().copied() {
+            self.selected_entry = first;
+        }
+    }
+
+    fn cycle_tree_match(&mut self, forward: bool) {
+        let matches = self.tree_search_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let pos = matches.iter().position(|&idx| idx == self.selected_entry);
+        let next = match (pos, forward) {
+            (Some(i), true) => (i + 1) % matches.len(),
+            (Some(i), false) => (i + matches.len() - 1) % matches.len(),
+            (None, true) => 0,
+            (None, false) => matches.len() - 1,
+        };
+        self.selected_entry = matches[next];
+    }
+
+    pub fn tree_has_input(&self) -> bool {
+        self.tree_searching || self.tree_prompt.is_some()
+    }
+
+    fn join_current_dir(&self, raw_name: &str) -> Result<String, String> {
+        let name = raw_name.trim().trim_matches('/');
+        if name.is_empty() || name.contains('\0') || name.contains('\\') {
+            return Err("Enter a valid name.".into());
+        }
+        for component in name.split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                return Err("Path cannot contain empty, '.' or '..' segments.".into());
+            }
+        }
+        Ok(match &self.directory {
+            Some(dir) if !dir.is_empty() => format!("{dir}/{name}"),
+            _ => name.to_owned(),
+        })
+    }
+
     fn delete_current_line(&mut self) -> String {
         if self.lines.is_empty() {
             return String::new();
@@ -713,8 +855,140 @@ pub fn key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn key_tree(editor: &mut EditorState, key: KeyEvent) -> bool {
+    if let Some(prompt) = editor.tree_prompt.take() {
+        match prompt {
+            TreePrompt::NewFile(mut name) => match key.code {
+                KeyCode::Esc => (),
+                KeyCode::Enter => match editor.join_current_dir(&name) {
+                    Ok(path) => editor.queue(Operation::CreateFile {
+                        path,
+                        directory: editor.directory.clone(),
+                    }),
+                    Err(err) => {
+                        editor.error = Some(err);
+                        editor.tree_prompt = Some(TreePrompt::NewFile(name));
+                    }
+                },
+                KeyCode::Backspace => {
+                    name.pop();
+                    editor.tree_prompt = Some(TreePrompt::NewFile(name));
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    name.push(ch);
+                    editor.tree_prompt = Some(TreePrompt::NewFile(name));
+                }
+                _ => editor.tree_prompt = Some(TreePrompt::NewFile(name)),
+            },
+            TreePrompt::NewFolder(mut name) => match key.code {
+                KeyCode::Esc => (),
+                KeyCode::Enter => match editor.join_current_dir(&name) {
+                    Ok(path) => editor.queue(Operation::CreateFolder {
+                        path,
+                        directory: editor.directory.clone(),
+                    }),
+                    Err(err) => {
+                        editor.error = Some(err);
+                        editor.tree_prompt = Some(TreePrompt::NewFolder(name));
+                    }
+                },
+                KeyCode::Backspace => {
+                    name.pop();
+                    editor.tree_prompt = Some(TreePrompt::NewFolder(name));
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    name.push(ch);
+                    editor.tree_prompt = Some(TreePrompt::NewFolder(name));
+                }
+                _ => editor.tree_prompt = Some(TreePrompt::NewFolder(name)),
+            },
+            TreePrompt::ConfirmDelete { path, is_dir, name } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    editor.queue(Operation::DeleteEntry {
+                        path,
+                        is_dir,
+                        directory: editor.directory.clone(),
+                    });
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => (),
+                _ => editor.tree_prompt = Some(TreePrompt::ConfirmDelete { path, is_dir, name }),
+            },
+        }
+        return true;
+    }
+    if editor.tree_searching {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            editor.cycle_tree_match(true);
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            editor.cycle_tree_match(false);
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                editor.tree_searching = false;
+                editor.tree_search.clear();
+            }
+            KeyCode::Enter => {
+                let has_match =
+                    editor.tree_search.trim().is_empty() || !editor.tree_search_matches().is_empty();
+                editor.tree_searching = false;
+                editor.tree_search.clear();
+                if has_match {
+                    editor.activate_entry(editor.selected_entry);
+                }
+            }
+            KeyCode::Down => editor.cycle_tree_match(true),
+            KeyCode::Up => editor.cycle_tree_match(false),
+            KeyCode::Backspace => {
+                editor.tree_search.pop();
+                editor.select_first_tree_match();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.tree_search.push(ch);
+                editor.select_first_tree_match();
+            }
+            _ => (),
+        }
+        return true;
+    }
     let count = editor.entry_count();
     match key.code {
+        KeyCode::Char('/') => {
+            editor.tree_searching = true;
+            editor.tree_search.clear();
+        }
+        KeyCode::Char('n' | 'a') => {
+            editor.error = None;
+            editor.tree_prompt = Some(TreePrompt::NewFile(String::new()));
+        }
+        KeyCode::Char('N' | 'A') => {
+            editor.error = None;
+            editor.tree_prompt = Some(TreePrompt::NewFolder(String::new()));
+        }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if let Some(entry) = editor.entry_at(editor.selected_entry).cloned() {
+                editor.error = None;
+                let name = entry.display_name().to_owned();
+                editor.tree_prompt = Some(TreePrompt::ConfirmDelete {
+                    path: entry.path,
+                    is_dir: entry.kind == "directory",
+                    name,
+                });
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if editor.selected_entry == 0 {
                 return false;
@@ -1506,7 +1780,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let [header, list, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(if app.editor.tree_has_input() { 3 } else { 1 }),
     ])
     .areas(inner);
     let root_name = app
@@ -1543,47 +1817,113 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         header,
     );
 
-    let folders = app
-        .editor
-        .entries
-        .iter()
-        .filter(|entry| entry.is_dir())
-        .count();
-    let status = app
-        .editor
-        .error
-        .clone()
-        .or_else(|| {
-            app.editor
-                .pending
-                .as_ref()
-                .map(|_| app.editor.notice.clone())
-        })
-        .unwrap_or_else(|| {
-            if app.editor.entries.is_empty() {
-                "Empty folder".into()
-            } else {
-                format!(
-                    "{folders} folders · {} files{}",
-                    app.editor.entries.len() - folders,
-                    if app.editor.entries_truncated {
-                        " · partial"
-                    } else {
-                        ""
-                    }
-                )
-            }
-        });
-    frame.render_widget(
-        Paragraph::new(format!(" {status}")).style(Style::default().fg(
-            if app.editor.error.is_some() {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            },
-        )),
-        footer,
-    );
+    if let Some(prompt) = &app.editor.tree_prompt {
+        let (title, border, line) = match prompt {
+            TreePrompt::NewFile(name) => (
+                " New file (Enter/Esc) ",
+                Color::Green,
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(name.clone(), Style::default().fg(Color::White)),
+                    Span::styled("█", Style::default().fg(Color::Green)),
+                ]),
+            ),
+            TreePrompt::NewFolder(name) => (
+                " New folder (Enter/Esc) ",
+                Color::Cyan,
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(name.clone(), Style::default().fg(Color::White)),
+                    Span::styled("█", Style::default().fg(Color::Cyan)),
+                ]),
+            ),
+            TreePrompt::ConfirmDelete { is_dir, name, .. } => (
+                if *is_dir {
+                    " Delete folder? "
+                } else {
+                    " Delete file? "
+                },
+                Color::Red,
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {name}{} ", if *is_dir { "/" } else { "" }),
+                        Style::default().fg(Color::Yellow).bold(),
+                    ),
+                    Span::styled("(y/Enter · n/Esc)", Style::default().fg(Color::Gray)),
+                ]),
+            ),
+        };
+        let prompt_block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(border));
+        frame.render_widget(Paragraph::new(line).block(prompt_block), footer);
+    } else if app.editor.tree_searching {
+        let matches = app.editor.tree_search_matches();
+        let query_non_empty = !app.editor.tree_search.trim().is_empty();
+        let (badge, badge_color) = if !query_non_empty {
+            (String::new(), Color::DarkGray)
+        } else if matches.is_empty() {
+            (" no match".into(), Color::Red)
+        } else {
+            let pos = matches
+                .iter()
+                .position(|&idx| idx == app.editor.selected_entry)
+                .map_or(1, |i| i + 1);
+            (format!(" {pos}/{}", matches.len()), Color::Green)
+        };
+        let search_line = Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(app.editor.tree_search.clone(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+            Span::styled(badge, Style::default().fg(badge_color)),
+        ]);
+        let search_block = Block::bordered()
+            .title(" Search ")
+            .border_style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Paragraph::new(search_line).block(search_block), footer);
+    } else {
+        let folders = app
+            .editor
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir())
+            .count();
+        let status = app
+            .editor
+            .error
+            .clone()
+            .or_else(|| {
+                app.editor
+                    .pending
+                    .as_ref()
+                    .map(|_| app.editor.notice.clone())
+            })
+            .unwrap_or_else(|| {
+                if app.editor.entries.is_empty() {
+                    "Empty folder".into()
+                } else {
+                    format!(
+                        "{folders}d · {}f{} · n/N/x · /",
+                        app.editor.entries.len() - folders,
+                        if app.editor.entries_truncated {
+                            "*"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            });
+        frame.render_widget(
+            Paragraph::new(format!(" {status}")).style(Style::default().fg(
+                if app.editor.error.is_some() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                },
+            )),
+            footer,
+        );
+    }
 
     let count = app.editor.entry_count();
     let visible = list.height as usize;
@@ -2655,5 +2995,145 @@ mod tests {
         key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.editor.pending_key, None);
         assert!(!app.editor.tree_focus);
+    }
+
+    #[test]
+    fn tree_slash_search_finds_cycles_and_opens_file_in_current_folder() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            workspace_tab: 0,
+            ..Default::default()
+        };
+        app.editor.cwd = Some("/repo".into());
+        app.editor.tree_focus = true;
+        app.editor.entries = vec![
+            Entry {
+                path: "Cargo.toml".into(),
+                kind: "file".into(),
+                ignored: None,
+            },
+            Entry {
+                path: "src/main.rs".into(),
+                kind: "file".into(),
+                ignored: None,
+            },
+            Entry {
+                path: "src/markdown.rs".into(),
+                kind: "file".into(),
+                ignored: None,
+            },
+        ];
+
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.editor.tree_searching);
+
+        // Typing 'm' and 'a' selects main.rs and does not trigger global 'm' composer shortcut.
+        for ch in ['m', 'a'] {
+            crate::input::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert!(app.focus == Focus::Workspace);
+        assert_eq!(app.editor.tree_search, "ma");
+        assert_eq!(app.editor.selected_entry, 1);
+
+        // Down cycles to next match (markdown.rs).
+        crate::input::handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.editor.selected_entry, 2);
+
+        // Enter closes search and requests opening markdown.rs.
+        crate::input::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.editor.tree_searching);
+        let req = app.editor.request.take().unwrap();
+        assert_eq!(req.payload()["relativePath"], "src/markdown.rs");
+    }
+
+    #[test]
+    fn tree_hotkeys_create_file_folder_and_confirm_delete() {
+        let mut app = App {
+            focus: Focus::Workspace,
+            workspace_tab: 0,
+            ..Default::default()
+        };
+        app.editor.cwd = Some("/repo".into());
+        app.editor.directory = Some("src".into());
+        app.editor.tree_focus = true;
+        app.editor.entries = vec![Entry {
+            path: "src/main.rs".into(),
+            kind: "file".into(),
+            ignored: None,
+        }];
+        app.editor.selected_entry = 1; // index 0 is ".."
+
+        // 'n' opens New file prompt, typing 'q' does not quit, Enter queues CreateFile.
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.editor.tree_prompt, Some(TreePrompt::NewFile(String::new())));
+        for ch in "q.rs".chars() {
+            crate::input::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert!(app.quit_dialog.is_none());
+        crate::input::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let req = app.editor.request.take().unwrap();
+        app.editor.pending = None;
+        assert!(matches!(
+            req.operation,
+            Operation::CreateFile { ref path, .. } if path == "src/q.rs"
+        ));
+
+        // 'N' opens New folder prompt and queues CreateFolder.
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
+        );
+        for ch in "utils".chars() {
+            crate::input::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        crate::input::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let req = app.editor.request.take().unwrap();
+        app.editor.pending = None;
+        assert!(matches!(
+            req.operation,
+            Operation::CreateFolder { ref path, .. } if path == "src/utils"
+        ));
+
+        // 'x' on '..' does nothing; 'x' on src/main.rs prompts and deletes on 'y'.
+        app.editor.selected_entry = 0;
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(app.editor.tree_prompt.is_none());
+
+        app.editor.selected_entry = 1;
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            app.editor.tree_prompt,
+            Some(TreePrompt::ConfirmDelete { ref path, is_dir: false, .. }) if path == "src/main.rs"
+        ));
+        crate::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        let req = app.editor.request.take().unwrap();
+        assert!(matches!(
+            req.operation,
+            Operation::DeleteEntry { ref path, is_dir: false, .. } if path == "src/main.rs"
+        ));
     }
 }

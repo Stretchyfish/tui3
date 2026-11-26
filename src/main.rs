@@ -11,6 +11,7 @@ mod git;
 mod history;
 mod input;
 mod local_terminal;
+mod markdown;
 mod message;
 mod models;
 mod pairing;
@@ -52,12 +53,8 @@ fn main() -> io::Result<()> {
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
         }
-        // Track pointer motion for usage tooltips as well as selection drags.
-        #[cfg(not(windows))]
-        execute!(
-            terminal.backend_mut(),
-            crossterm::style::Print("\x1b[?1003h\x1b[?1002h\x1b[?1000h")
-        )?;
+        // EnableMouseCapture already activates 1000 -> 1002 -> 1003 -> 1015 -> 1006
+        // in the right order so drag selection and hover tooltips both fire live.
         run(&mut terminal, backend, &mut resume, startup, app_updates)
     });
     if keyboard_enhanced {
@@ -88,9 +85,12 @@ fn run(
     app_updates: std::sync::mpsc::Receiver<update::Status>,
 ) -> io::Result<Option<u32>> {
     let layout_preset = resume.layout_preset();
+    let telemetry_enabled = resume.telemetry_enabled();
     let mut app = app::App {
         typing_style: resume.typing_style(),
         auto_start_t3: resume.auto_start_t3(),
+        telemetry_enabled,
+        telemetry_highlight: telemetry_enabled,
         layout_preset,
         layout_highlight: layout_preset,
         workspace_visible: layout_preset.workspace_visible(),
@@ -642,11 +642,38 @@ fn run(
             let mut next = event::read()?;
             let mut ignored = 0;
             while (!useful_input(&next)
-                || matches!(&next, Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Moved))
+                || matches!(&next, Event::Mouse(mouse) if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Moved
+                        | crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                )))
                 && ignored < 256
                 && event::poll(Duration::ZERO)?
             {
-                next = event::read()?;
+                let queued = event::read()?;
+                let keep_drag = matches!(
+                    &next,
+                    Event::Mouse(mouse)
+                        if mouse.kind
+                            == crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left
+                            )
+                ) && !matches!(
+                    &queued,
+                    Event::Mouse(mouse)
+                        if mouse.kind
+                            == crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left
+                            )
+                );
+                if keep_drag {
+                    if let Event::Mouse(mouse) = next {
+                        input::handle_mouse(&mut app, mouse);
+                    }
+                    next = queued;
+                    break;
+                }
+                next = queued;
                 ignored += 1;
             }
             match next {

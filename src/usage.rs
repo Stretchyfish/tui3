@@ -31,6 +31,7 @@ struct Limits {
 #[derive(Deserialize)]
 struct Unavailable {
     reason: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     message: Option<String>,
 }
 #[derive(Clone, Deserialize)]
@@ -97,6 +98,7 @@ impl UsageState {
     }
 
     /// All server-reported windows, including allowances for other models.
+    #[cfg(test)]
     pub fn windows(&self, instance: &str) -> Vec<&Window> {
         self.providers
             .get(instance)
@@ -125,6 +127,7 @@ impl UsageState {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn notice(&self, instance: &str) -> Option<&str> {
         if let Some(error) = self.error.as_deref() {
             return Some(error);

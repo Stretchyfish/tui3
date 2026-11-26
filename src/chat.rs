@@ -395,13 +395,12 @@ fn render_message_entry(
         ));
     }
     lines.push(Line::from(header));
-    // Preserve whitespace and code indentation; wrapping remains the viewport's job.
-    for line in item.text.as_deref().unwrap_or_default().split('\n') {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(accent)),
-            Span::styled(line.to_owned(), Style::default().fg(body)),
-        ]));
-    }
+    // Render Markdown (headings, lists, links, inline formatting, and code blocks).
+    lines.extend(crate::markdown::render(
+        item.text.as_deref().unwrap_or_default(),
+        accent,
+        body,
+    ));
     if !item.attachments.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(accent)),

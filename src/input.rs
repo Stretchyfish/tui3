@@ -244,6 +244,11 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.auto_start_t3 = value;
             app.auto_start_highlight = value;
         }
+        Some(ClickTarget::Telemetry(value)) => {
+            app.settings_row = 4;
+            app.telemetry_enabled = value;
+            app.telemetry_highlight = value;
+        }
         Some(ClickTarget::GitModeOption(index)) => app.git.select_mode(index),
         Some(ClickTarget::GitBranchOption(index)) => {
             app.git.branch_index = index;
@@ -320,7 +325,7 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             app.apply_layout_preset(preset);
         }
         Some(ClickTarget::ServerUpdateButton) => {
-            app.settings_row = 4;
+            app.settings_row = 5;
             app.trigger_server_update_action();
         }
         None => (),
@@ -390,8 +395,8 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 || (app.focus == Focus::Workspace && app.workspace_tab == 3 && app.git.editing)
                 || (app.focus == Focus::Workspace
                     && app.workspace_tab == 0
-                    && !app.editor.tree_focus
-                    && app.editor.open_file.is_some())
+                    && ((!app.editor.tree_focus && app.editor.open_file.is_some())
+                        || (app.editor.tree_focus && app.editor.tree_has_input())))
                 || (app.focus == Focus::Workspace
                     && app.workspace_tab == 2
                     && app.local_terminal.tab_typing)
@@ -488,8 +493,8 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
     }
     if app.focus == Focus::Workspace
         && app.workspace_tab == 0
-        && !app.editor.tree_focus
-        && app.editor.open_file.is_some()
+        && ((!app.editor.tree_focus && app.editor.open_file.is_some())
+            || (app.editor.tree_focus && app.editor.tree_has_input()))
         && app.quit_dialog.is_none()
         && !app.startup.open
         && !app.settings_open
@@ -648,6 +653,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
                 app.settings_open = true;
                 app.clipboard_check_requested = true;
                 app.auto_start_highlight = app.auto_start_t3;
+                app.telemetry_highlight = app.telemetry_enabled;
                 app.style_highlight = app.typing_style;
                 app.request_server_version_check();
             }
@@ -665,7 +671,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Up | KeyCode::Char('k') => {
                 app.settings_row = app.settings_row.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(4),
+            KeyCode::Down | KeyCode::Char('j') => app.settings_row = (app.settings_row + 1).min(5),
             KeyCode::Right | KeyCode::Char('l') if app.settings_row == 1 => {
                 app.auto_start_highlight = false
             }
@@ -694,11 +700,20 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 3 => {
                 app.apply_layout_preset(app.layout_highlight);
             }
+            KeyCode::Right | KeyCode::Char('l') if app.settings_row == 4 => {
+                app.telemetry_highlight = false
+            }
+            KeyCode::Left | KeyCode::Char('h') if app.settings_row == 4 => {
+                app.telemetry_highlight = true
+            }
             KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 4 => {
+                app.telemetry_enabled = app.telemetry_highlight
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if app.settings_row == 5 => {
                 app.trigger_server_update_action();
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
-                if app.settings_row == 4 => {}
+                if app.settings_row == 5 => {}
             KeyCode::Esc | KeyCode::Char('s') => app.settings_open = false,
             KeyCode::Right | KeyCode::Char('l') => {
                 app.style_highlight = app.style_highlight.cycle(true);
@@ -1019,6 +1034,7 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         KeyCode::Char('s') => {
             app.settings_row = 0;
             app.auto_start_highlight = app.auto_start_t3;
+            app.telemetry_highlight = app.telemetry_enabled;
             app.style_highlight = app.typing_style;
             app.layout_highlight = app.layout_preset;
             app.settings_open = true;
@@ -2383,13 +2399,37 @@ mod tests {
         for _ in 0..5 {
             handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.settings_row, 4);
+        assert_eq!(app.settings_row, 5);
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.server_update_requested);
         assert!(matches!(
             app.server_update_status,
             crate::app::ServerUpdateStatus::Downloading { .. }
         ));
+    }
+
+    #[test]
+    fn settings_telemetry_toggle_updates_and_applies() {
+        let mut app = App::default();
+        assert!(!app.telemetry_enabled);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        for _ in 0..4 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.settings_row, 4);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.telemetry_highlight);
+        assert!(!app.telemetry_enabled);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.telemetry_enabled);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!app.telemetry_highlight);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.telemetry_enabled);
     }
 
     #[test]

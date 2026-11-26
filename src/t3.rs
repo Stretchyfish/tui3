@@ -235,6 +235,23 @@ fn extract_rpc_reason(exit: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn safe_local_workspace_path(cwd: &str, relative: &str) -> Result<std::path::PathBuf, String> {
+    let base = std::path::Path::new(cwd);
+    if !base.is_dir() {
+        return Err("Folder creation and deletion require a local workspace.".into());
+    }
+    let rel = std::path::Path::new(relative);
+    if rel.as_os_str().is_empty() || rel.is_absolute() {
+        return Err("Invalid relative path.".into());
+    }
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err("Path must stay inside the workspace.".into());
+        }
+    }
+    Ok(base.join(rel))
+}
+
 pub struct T3Client {
     config: Config,
     http: Client,
@@ -666,7 +683,101 @@ impl T3Client {
                     relative_path: path.clone(),
                 })
             }
+            Operation::CreateFile { path, directory } => {
+                self.rpc("projects.writeFile", request.payload())
+                    .await
+                    .map_err(|error| error.message)?;
+                let (entries, truncated) = self
+                    .list_editor_entries(&request.cwd, directory.as_deref())
+                    .await?;
+                Ok(Response::Mutated {
+                    directory: directory.clone(),
+                    entries,
+                    truncated,
+                    select_path: Some(path.clone()),
+                    deleted_path: None,
+                    notice: format!("Created {path}."),
+                })
+            }
+            Operation::CreateFolder { path, directory } => {
+                let target = safe_local_workspace_path(&request.cwd, path)?;
+                tokio::task::spawn_blocking(move || std::fs::create_dir_all(&target))
+                    .await
+                    .map_err(|_| "Folder creation task failed.".to_owned())?
+                    .map_err(|err| format!("Could not create folder: {err}"))?;
+                let (entries, truncated) = self
+                    .list_editor_entries(&request.cwd, directory.as_deref())
+                    .await?;
+                Ok(Response::Mutated {
+                    directory: directory.clone(),
+                    entries,
+                    truncated,
+                    select_path: Some(path.clone()),
+                    deleted_path: None,
+                    notice: format!("Created {path}/."),
+                })
+            }
+            Operation::DeleteEntry {
+                path,
+                is_dir,
+                directory,
+            } => {
+                let target = safe_local_workspace_path(&request.cwd, path)?;
+                let is_dir = *is_dir;
+                tokio::task::spawn_blocking(move || {
+                    if is_dir {
+                        std::fs::remove_dir_all(&target)
+                    } else {
+                        std::fs::remove_file(&target)
+                    }
+                })
+                .await
+                .map_err(|_| "Delete task failed.".to_owned())?
+                .map_err(|err| {
+                    format!(
+                        "Could not delete {}: {err}",
+                        if is_dir { "folder" } else { "file" }
+                    )
+                })?;
+                let (entries, truncated) = self
+                    .list_editor_entries(&request.cwd, directory.as_deref())
+                    .await?;
+                Ok(Response::Mutated {
+                    directory: directory.clone(),
+                    entries,
+                    truncated,
+                    select_path: None,
+                    deleted_path: Some(path.clone()),
+                    notice: format!("Deleted {path}."),
+                })
+            }
         }
+    }
+
+    async fn list_editor_entries(
+        &self,
+        cwd: &str,
+        directory: Option<&str>,
+    ) -> Result<(Vec<crate::editor::Entry>, bool), String> {
+        let payload = match directory {
+            Some(dir) => serde_json::json!({ "cwd": cwd, "directoryPath": dir }),
+            None => serde_json::json!({ "cwd": cwd }),
+        };
+        let value = self
+            .rpc("projects.listEntries", payload)
+            .await
+            .map_err(|error| error.message)?;
+        let entries = value
+            .get("entries")
+            .cloned()
+            .ok_or("Invalid T3 file list.")?;
+        let entries = serde_json::from_value::<Vec<crate::editor::Entry>>(entries)
+            .map_err(|_| "Invalid T3 file list.")?;
+        let truncated = value
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok((entries, truncated))
     }
 
     async fn git_request(

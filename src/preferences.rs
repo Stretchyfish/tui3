@@ -85,6 +85,8 @@ struct Preferences {
     #[serde(default = "enabled")]
     auto_start_t3: bool,
     #[serde(default)]
+    telemetry_enabled: bool,
+    #[serde(default)]
     typing_style: TypingStyle,
     #[serde(default)]
     layout_preset: LayoutPreset,
@@ -98,6 +100,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             auto_start_t3: true,
+            telemetry_enabled: false,
             typing_style: Default::default(),
             layout_preset: Default::default(),
             locations: Default::default(),
@@ -116,6 +119,9 @@ pub struct ResumeStore {
 impl ResumeStore {
     pub fn auto_start_t3(&self) -> bool {
         self.preferences.auto_start_t3
+    }
+    pub fn telemetry_enabled(&self) -> bool {
+        self.preferences.telemetry_enabled
     }
     pub fn typing_style(&self) -> TypingStyle {
         self.preferences.typing_style
@@ -158,6 +164,11 @@ impl ResumeStore {
     pub fn remember(&mut self, app: &crate::app::App) {
         if self.preferences.auto_start_t3 != app.auto_start_t3 {
             self.preferences.auto_start_t3 = app.auto_start_t3;
+            self.dirty = true;
+            self.flush();
+        }
+        if self.preferences.telemetry_enabled != app.telemetry_enabled {
+            self.preferences.telemetry_enabled = app.telemetry_enabled;
             self.dirty = true;
             self.flush();
         }
