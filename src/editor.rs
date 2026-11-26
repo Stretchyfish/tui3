@@ -387,6 +387,8 @@ impl EditorState {
             };
             if entry.is_dir() {
                 self.queue(Operation::ListEntries(Some(entry.path)));
+            } else if crate::imgview::is_image_path(&entry.path) {
+                self.open_image_file(entry.path);
             } else {
                 self.queue(Operation::ReadFile(entry.path));
             }
@@ -396,10 +398,31 @@ impl EditorState {
             };
             if entry.is_dir() {
                 self.queue(Operation::ListEntries(Some(entry.path)));
+            } else if crate::imgview::is_image_path(&entry.path) {
+                self.open_image_file(entry.path);
             } else {
                 self.queue(Operation::ReadFile(entry.path));
             }
         }
+    }
+
+    fn open_image_file(&mut self, path: String) {
+        self.open_file = Some(path);
+        self.file_truncated = false;
+        self.lines.clear();
+        self.dirty = false;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.scroll_y = 0;
+        self.scroll_x = 0;
+        self.editing = false;
+        self.mode = EditorMode::Normal;
+        self.selection_anchor = None;
+        self.pending_key = None;
+        self.undo_stack.clear();
+        self.tree_focus = false;
+        self.error = None;
+        self.notice.clear();
     }
 
     pub fn go_up(&mut self) {
@@ -2139,6 +2162,37 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
                 .wrap(Wrap { trim: false }),
             body_area,
         );
+    } else if let Some(rel) = editor.open_file.as_deref()
+        && crate::imgview::is_image_path(rel)
+    {
+        let resolved = crate::imgview::resolve_image_path(rel, editor.cwd.as_deref());
+        let max_cols = body_area.width.saturating_sub(2);
+        let max_rows = body_area.height.saturating_sub(1);
+        if let Some(path) = resolved
+            && let Some(rendered) = crate::imgview::render_lines(&path, max_cols, max_rows)
+        {
+            frame.render_widget(Paragraph::new(Text::from(rendered.lines)), body_area);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    " Image preview · {}×{} · Tab/Esc: files",
+                    rendered.width, rendered.height
+                ))
+                .style(Style::default().fg(Color::DarkGray)),
+                status_area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(" Could not preview image (unsupported format or remote workspace).")
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: false }),
+                body_area,
+            );
+            frame.render_widget(
+                Paragraph::new(" Tab/Esc: files").style(Style::default().fg(Color::DarkGray)),
+                status_area,
+            );
+        }
+        return;
     } else {
         let visible_rows = body_area.height as usize;
         editor.visible_rows = visible_rows;

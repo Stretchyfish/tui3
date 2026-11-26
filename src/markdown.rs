@@ -54,6 +54,56 @@ pub fn render(text: &str, accent: Color, body: Color) -> Vec<Line<'static>> {
             continue;
         }
 
+        if let Some((alt, raw_path)) = parse_image_line(trimmed) {
+            let label = if alt.is_empty() {
+                std::path::Path::new(raw_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(raw_path)
+            } else {
+                alt
+            };
+            if let Some(resolved) = crate::imgview::resolve_image_path(raw_path, None)
+                && let Some(rendered) = crate::imgview::render_lines(&resolved, 56, 14)
+            {
+                out.push(Line::from(vec![
+                    gutter(),
+                    Span::styled("🖼 ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        label.to_owned(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ({}×{})", rendered.width, rendered.height),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                for img_line in rendered.lines {
+                    let mut spans = vec![gutter()];
+                    spans.extend(img_line.spans);
+                    out.push(Line::from(spans));
+                }
+            } else {
+                out.push(Line::from(vec![
+                    gutter(),
+                    Span::styled("🖼 ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        label.to_owned(),
+                        Style::default()
+                            .fg(Color::LightBlue)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Span::styled(
+                        format!(" ({raw_path})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            continue;
+        }
+
         if is_horizontal_rule(trimmed) {
             out.push(Line::from(vec![
                 gutter(),
@@ -125,6 +175,18 @@ pub fn render(text: &str, accent: Color, body: Color) -> Vec<Line<'static>> {
         out.push(Line::from(vec![gutter(), Span::styled("", base)]));
     }
     out
+}
+
+fn parse_image_line(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("![")?;
+    let close_bracket = rest.find(']')?;
+    let alt = &rest[..close_bracket];
+    let after = rest[close_bracket + 1..].strip_prefix('(')?;
+    let url = after.strip_suffix(')')?;
+    if url.is_empty() || url.contains('\n') {
+        return None;
+    }
+    Some((alt.trim(), url.trim()))
 }
 
 fn is_horizontal_rule(trimmed: &str) -> bool {
@@ -618,5 +680,32 @@ mod tests {
             && s.style.add_modifier.contains(Modifier::UNDERLINED)));
         assert!(all_spans.iter().any(|s| s.content == "--annotate"
             && s.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn renders_markdown_image_inline_with_half_blocks_and_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        let buf = image::RgbaImage::from_pixel(6, 4, image::Rgba([0, 200, 100, 255]));
+        buf.save(&path).unwrap();
+
+        let md = format!(
+            "![Demo]({})\n![Missing](/nonexistent/missing.png)",
+            path.display()
+        );
+        let lines = render(&md, Color::Green, Color::White);
+        let plain: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plain.contains("🖼 Demo (6×4)"));
+        assert!(plain.contains('▀'));
+        assert!(plain.contains("🖼 Missing (/nonexistent/missing.png)"));
     }
 }

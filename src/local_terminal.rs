@@ -2,6 +2,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
 };
@@ -61,10 +62,70 @@ impl vt100::Callbacks for TerminalReplies {
 }
 
 #[derive(Default)]
-pub struct LocalTerminal {
+pub struct ProjectTerminal {
     pub session: Option<Session>,
     pub error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct LocalTerminal {
+    pub sessions: HashMap<Option<String>, ProjectTerminal>,
     pub tab_typing: bool,
+}
+
+impl LocalTerminal {
+    fn key_matches<'a>(key: &'a Option<String>, project: Option<&str>) -> bool {
+        key.as_deref() == project
+    }
+
+    pub fn entry_mut(&mut self, project: Option<String>) -> &mut ProjectTerminal {
+        self.sessions.entry(project).or_default()
+    }
+
+    pub fn session(&self, project: Option<&str>) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .find(|(k, _)| Self::key_matches(k, project))
+            .and_then(|(_, entry)| entry.session.as_ref())
+    }
+
+    pub fn session_mut(&mut self, project: Option<&str>) -> Option<&mut Session> {
+        self.sessions
+            .iter_mut()
+            .find(|(k, _)| Self::key_matches(k, project))
+            .and_then(|(_, entry)| entry.session.as_mut())
+    }
+
+    pub fn error(&self, project: Option<&str>) -> Option<&str> {
+        self.sessions
+            .iter()
+            .find(|(k, _)| Self::key_matches(k, project))
+            .and_then(|(_, entry)| entry.error.as_deref())
+    }
+
+    pub fn clear_error(&mut self, project: Option<&str>) {
+        if let Some((_, entry)) = self
+            .sessions
+            .iter_mut()
+            .find(|(k, _)| Self::key_matches(k, project))
+        {
+            entry.error = None;
+        }
+    }
+
+    pub fn clear_exited(&mut self, project: Option<&str>) {
+        if let Some((_, entry)) = self
+            .sessions
+            .iter_mut()
+            .find(|(k, _)| Self::key_matches(k, project))
+            && entry
+                .session
+                .as_ref()
+                .is_some_and(|s| s.status.lock().unwrap().is_some())
+        {
+            entry.session = None;
+        }
+    }
 }
 pub struct Session {
     pub parser: Arc<Mutex<vt100::Parser<TerminalReplies>>>,
@@ -395,5 +456,26 @@ mod tests {
         assert_eq!(session.parser.lock().unwrap().screen().size(), (12, 60));
         session.scroll(10);
         session.scroll(-10);
+    }
+
+    #[test]
+    fn projects_keep_independent_terminal_sessions() {
+        let mut local = LocalTerminal::default();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        local.entry_mut(Some("proj-a".into())).session =
+            Some(Session::start_shell(cwd.clone(), "/bin/sh".into()).unwrap());
+        local.entry_mut(Some("proj-b".into())).error = Some("failed to start".into());
+
+        assert!(local.session(Some("proj-a")).is_some());
+        assert!(local.session(Some("proj-b")).is_none());
+        assert_eq!(local.error(Some("proj-b")), Some("failed to start"));
+        assert!(local.error(Some("proj-a")).is_none());
+
+        local.clear_error(Some("proj-b"));
+        assert!(local.error(Some("proj-b")).is_none());
+        assert!(local.session(Some("proj-a")).is_some());
     }
 }

@@ -1991,6 +1991,10 @@ impl App {
         }
     }
 
+    pub fn selected_project_id(&self) -> Option<String> {
+        self.selected_location().map(|loc| loc.project_id)
+    }
+
     pub fn update_catalog(&mut self, catalog: Catalog) {
         let previous = self.selection().cloned();
         let old_index = self.sidebar_state.selected().unwrap_or(0);

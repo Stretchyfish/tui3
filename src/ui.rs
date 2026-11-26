@@ -793,7 +793,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         draw_local_terminal_body(frame, app, inner);
-        if let Some(session) = &app.local_terminal.session {
+        let project_id = app.selected_project_id();
+        if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
             let status = session.status.lock().unwrap();
             let title = status.as_deref().unwrap_or(&session.cwd);
             frame.render_widget(
@@ -1059,7 +1060,8 @@ fn draw_local_terminal_body(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if let Some(session) = &mut app.local_terminal.session {
+    let project_id = app.selected_project_id();
+    if let Some(session) = app.local_terminal.session_mut(project_id.as_deref()) {
         session.resize(area.height, area.width);
         let parser = session.parser.lock().unwrap();
         frame.render_widget(tui_term::widget::PseudoTerminal::new(parser.screen()), area);
@@ -1067,8 +1069,7 @@ fn draw_local_terminal_body(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(
                 app.local_terminal
-                    .error
-                    .as_deref()
+                    .error(project_id.as_deref())
                     .unwrap_or("Starting local shell…"),
             ),
             area,

@@ -402,16 +402,43 @@ fn render_message_entry(
         body,
     ));
     if !item.attachments.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(accent)),
-            Span::styled(
-                format!(
-                    "[{} attachment(s); preview unavailable]",
-                    item.attachments.len()
+        let mut unrendered = 0usize;
+        for attachment in &item.attachments {
+            if let Some((name, path)) = crate::imgview::resolve_attachment_image(attachment)
+                && let Some(rendered) = crate::imgview::render_lines(&path, 52, 12)
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(accent)),
+                    Span::styled("🖼 ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        name,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ({}×{})", rendered.width, rendered.height),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                for img_line in rendered.lines {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent))];
+                    spans.extend(img_line.spans);
+                    lines.push(Line::from(spans));
+                }
+            } else {
+                unrendered += 1;
+            }
+        }
+        if unrendered > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(accent)),
+                Span::styled(
+                    format!("[{unrendered} attachment(s); preview unavailable]"),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+            ]));
+        }
     }
     if item.kind == "assistant_message"
         && let Some(run_id) = item.run_id.as_deref()

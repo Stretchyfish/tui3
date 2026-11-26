@@ -55,7 +55,8 @@ pub fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         }
     }
     if app.terminal_overlay_open {
-        if let Some(session) = &app.local_terminal.session {
+        let project_id = app.selected_project_id();
+        if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
             match mouse.kind {
                 MouseEventKind::ScrollUp => session.scroll(3),
                 MouseEventKind::ScrollDown => session.scroll(-3),
@@ -337,18 +338,12 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         return;
     }
     if app.terminal_overlay_open {
+        let project_id = app.selected_project_id();
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
             app.terminal_overlay_open = false;
-            app.local_terminal.error = None;
-            if app
-                .local_terminal
-                .session
-                .as_ref()
-                .is_some_and(|s| s.status.lock().unwrap().is_some())
-            {
-                app.local_terminal.session = None;
-            }
-        } else if let Some(session) = &app.local_terminal.session {
+            app.local_terminal.clear_error(project_id.as_deref());
+            app.local_terminal.clear_exited(project_id.as_deref());
+        } else if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
@@ -370,9 +365,10 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         && !app.models.open
         && app.thread_menu.is_none()
     {
+        let project_id = app.selected_project_id();
         if key.code == KeyCode::Esc {
             app.local_terminal.tab_typing = false;
-        } else if let Some(session) = &app.local_terminal.session {
+        } else if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
@@ -805,19 +801,20 @@ pub fn handle_key(app: &mut App, mut key: KeyEvent) {
         return;
     }
     if app.focus == Focus::Workspace && app.workspace_tab == 2 {
+        let project_id = app.selected_project_id();
         match key.code {
             KeyCode::Enter | KeyCode::Char('i') => {
                 app.local_terminal.tab_typing = true;
                 return;
             }
             KeyCode::PageUp => {
-                if let Some(session) = &app.local_terminal.session {
+                if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
                     session.scroll(10);
                 }
                 return;
             }
             KeyCode::PageDown => {
-                if let Some(session) = &app.local_terminal.session {
+                if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
                     session.scroll(-10);
                 }
                 return;
@@ -2570,7 +2567,7 @@ mod terminal_overlay_tests {
             terminal_overlay_open: true,
             ..App::default()
         };
-        app.local_terminal.session = Some(
+        app.local_terminal.entry_mut(None).session = Some(
             crate::local_terminal::Session::start_shell("/tmp".into(), "/usr/bin/fish".into())
                 .unwrap(),
         );
@@ -2593,8 +2590,7 @@ mod terminal_overlay_tests {
         loop {
             let contents = app
                 .local_terminal
-                .session
-                .as_ref()
+                .session(None)
                 .unwrap()
                 .parser
                 .lock()
@@ -2617,7 +2613,7 @@ mod terminal_overlay_tests {
             );
         }
         assert!(app.terminal_overlay_open);
-        assert!(app.local_terminal.session.is_some());
+        assert!(app.local_terminal.session(None).is_some());
         assert!(!app.quit);
     }
     #[test]

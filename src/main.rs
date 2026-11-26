@@ -9,6 +9,7 @@ mod diff;
 mod editor;
 mod git;
 mod history;
+mod imgview;
 mod input;
 mod local_terminal;
 mod markdown;
@@ -619,19 +620,20 @@ fn run(
                 }
             }
         }
-        if (app.terminal_overlay_open || (app.workspace_visible && app.workspace_tab == 2))
-            && app.local_terminal.session.is_none()
-            && app.local_terminal.error.is_none()
-        {
+        if app.terminal_overlay_open || (app.workspace_visible && app.workspace_tab == 2) {
+            let project_id = app.selected_project_id();
             let cwd = git::workspace(&app).unwrap_or_else(|| {
                 std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned()
             });
-            match local_terminal::Session::start(cwd) {
-                Ok(session) => app.local_terminal.session = Some(session),
-                Err(error) => app.local_terminal.error = Some(error),
+            let entry = app.local_terminal.entry_mut(project_id);
+            if entry.session.is_none() && entry.error.is_none() {
+                match local_terminal::Session::start(cwd) {
+                    Ok(session) => entry.session = Some(session),
+                    Err(error) => entry.error = Some(error),
+                }
             }
         }
         resume.remember(&app);
@@ -680,7 +682,8 @@ fn run(
                 Event::Key(key) => input::handle_key(&mut app, key),
                 Event::Mouse(mouse) => input::handle_mouse(&mut app, mouse),
                 Event::Paste(text) if app.terminal_overlay_open => {
-                    if let Some(session) = &app.local_terminal.session {
+                    let project_id = app.selected_project_id();
+                    if let Some(session) = app.local_terminal.session(project_id.as_deref()) {
                         session.paste(&text);
                     }
                 }
